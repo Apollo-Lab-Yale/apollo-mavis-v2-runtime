@@ -28,6 +28,17 @@ class Runtime:
 
     # -- lifecycle (server lifespan) ------------------------------------------
     def start(self) -> None:
+        # Unclean prior shutdown: resume() + finalize() unfinalized datasets
+        # before serving (04-runtime §15). Filesystem scan only unless a
+        # repair is actually needed (lerobot stays unimported).
+        try:
+            from .recorder.episode_recorder import repair_unfinalized_datasets
+
+            repair_unfinalized_datasets(self.cfg.datasets_root)
+        except Exception:  # never block serving on repair problems
+            import logging
+
+            logging.getLogger(__name__).exception("dataset startup repair failed")
         self.manager.start_previews()
 
     def stop(self) -> None:

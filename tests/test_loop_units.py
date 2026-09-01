@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 from apollo_xarm7_core import Command, HeldState, PlanResult
 from conftest import run_ticks
@@ -100,6 +102,7 @@ def test_goto_routes_via_planner_and_completes(fake_loop):
         if not loop.plans.active("arm0") and loop.tick_count > 5:
             if np.allclose(loop._last_cmd["arm0"], goal):
                 break
+            time.sleep(0.002)  # yield to the plan-worker thread
     assert np.allclose(loop._last_cmd["arm0"], goal)
     assert loop._plan_status in ("done", None)
 
@@ -114,6 +117,7 @@ def test_held_movement_key_cancels_plan(fake_loop):
         t = run_ticks(loop, cell, 1, t)
         if loop.plans.active("arm0"):
             break
+        time.sleep(0.002)  # yield to the plan-worker thread
     assert loop.plans.active("arm0")
     bus.held_keys.put(HeldState(held=frozenset({"KeyW"}), seq=1, rx_mono=t))
     loop.supervisor.watchdog.on_keys(HeldState(frozenset({"KeyW"}), 1, t))

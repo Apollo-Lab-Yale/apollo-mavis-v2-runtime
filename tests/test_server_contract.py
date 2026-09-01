@@ -86,7 +86,7 @@ def test_session_404_then_lifecycle(client):
 def test_post_session_409_matrix(client):
     bad_kind = dict(SPEC, kind="hardware", digital_twin_scene="single_rail")
     assert client.post("/api/session", json=bad_kind).status_code == 409
-    bad_mode = dict(SPEC, mode="collect", task="t")
+    bad_mode = dict(SPEC, mode="dagger", task="t")  # collect lands in phase-07
     assert client.post("/api/session", json=bad_mode).status_code == 409
     bad_arms = dict(SPEC, arms=["arm9"], frames={})
     assert client.post("/api/session", json=bad_arms).status_code == 409

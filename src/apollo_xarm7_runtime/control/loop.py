@@ -64,6 +64,7 @@ class ControlLoop:
         planner=None,  # DigitalTwinInterface-like .plan(PlanRequest) -> PlanResult
         profile_store: ProfileStore | None = None,
         workcell_kind: str = "sim",
+        recorder=None,  # RecorderThread (collect/dagger): episode ops + status
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.workcell = workcell
@@ -76,6 +77,7 @@ class ControlLoop:
         self.planner = planner
         self.profile_store = profile_store
         self.workcell_kind = workcell_kind
+        self.recorder = recorder
         self._clock = clock
         self.dt = 1.0 / cfg.rate_hz
 
@@ -224,6 +226,11 @@ class ControlLoop:
         self._gripper_step(held, scale)
         self._expire_plan_status()
 
+        episode = None
+        if self.recorder is not None:
+            episode = self.recorder.status()
+            self.episode_state = episode.state  # joint_target nack while recording
+
         snap = StateSnapshot(  # 10
             t_mono=now,
             wallclock_ns=time.time_ns(),
@@ -234,7 +241,7 @@ class ControlLoop:
             gate=self.supervisor.merged_report(),
             clearances=self.supervisor.clearances,
             gripper_frac=dict(self._grip_frac),
-            episode=None,
+            episode=episode,
             watchdog_tripped=watchdog_tripped,
             plan_status=dict(self._plan_state),
             session_extra={"plan_status": self._plan_status, "kind": self.workcell_kind},
@@ -372,12 +379,22 @@ class ControlLoop:
             self._cancel_plans("takeover_toggle")
         return CommandResult(cmd.corr_id, False, "takeover not available in teleop")
 
-    def _nack_episode(self, cmd: Command) -> CommandResult:
-        return CommandResult(cmd.corr_id, False, "no recorder in teleop")
+    def _episode_op(self, cmd: Command, op: str) -> CommandResult:
+        """Episode ops validate/transition inline (fast); writer work runs on
+        the RecorderThread. Invalid transitions ack ``ok=false`` (§10.4)."""
+        if self.recorder is None:
+            return CommandResult(cmd.corr_id, False, "no recorder in this mode")
+        ok, detail = self.recorder.request(op)
+        return CommandResult(cmd.corr_id, ok, detail)
 
-    _op_episode_new = _nack_episode
-    _op_episode_save = _nack_episode
-    _op_episode_discard = _nack_episode
+    def _op_episode_new(self, cmd: Command) -> CommandResult:
+        return self._episode_op(cmd, "new")
+
+    def _op_episode_save(self, cmd: Command) -> CommandResult:
+        return self._episode_op(cmd, "save")
+
+    def _op_episode_discard(self, cmd: Command) -> CommandResult:
+        return self._episode_op(cmd, "discard")
 
     def _op_joint_target(self, cmd: Command) -> CommandResult:
         if self.episode_state == "recording":

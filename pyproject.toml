@@ -3,7 +3,7 @@ name = "apollo-xarm7-runtime"
 version = "0.1.0"
 description = "Session engine, control loop, and server for the apollo-xarm7 stack"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "BSD-3-Clause" }
 dependencies = [
     "apollo-xarm7-core",
@@ -14,6 +14,9 @@ dependencies = [
     "uvicorn[standard]>=0.29",
     "websockets>=12",
     "opencv-python>=4.8",
+    # LeRobot v3 dataset writer (recorder/ only; lazy-imported — 04-runtime §10).
+    # 0.6.x is the pinned minor (v3.0 format); needs Python >=3.12.
+    "lerobot[dataset]>=0.6.1,<0.7",
 ]
 
 [project.optional-dependencies]
@@ -52,7 +55,13 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "xarm".msg = "runtime talks to hardware only via apollo_xarm7_hardware"
 "torch".msg = "torch belongs to the trainer process (phase-08)"
-"lerobot".msg = "lerobot belongs to the recorder (phase-07)"
+"lerobot".msg = "lerobot is imported lazily inside apollo_xarm7_runtime.recorder only"
+
+[tool.ruff.lint.per-file-ignores]
+# The recorder package and its tests are the one sanctioned lerobot import site.
+"src/apollo_xarm7_runtime/recorder/*" = ["TID251"]
+"tests/test_recorder*.py" = ["TID251"]
+"tests/test_e2e_collect.py" = ["TID251"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

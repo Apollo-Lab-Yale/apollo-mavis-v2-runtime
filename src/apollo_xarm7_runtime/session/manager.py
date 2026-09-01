@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_UNIMPLEMENTED_MODES = {"collect": "phase-07", "dagger": "phase-08", "inference": "phase-08"}
+_UNIMPLEMENTED_MODES = {"dagger": "phase-08", "inference": "phase-08"}
 
 
 def _servo_faithful_scene(scene_id: str):
@@ -79,6 +79,7 @@ class ActiveSession:
     supervisor: SafetySupervisor
     twin: object | None
     render_service: object | None
+    recorder_thread: object | None = None  # RecorderThread (collect mode)
     streams: list[str] = field(default_factory=list)  # video ids
     sources: list[object] = field(default_factory=list)  # started FrameSources
     start_from_progress: float | None = None
@@ -227,6 +228,18 @@ class SessionManager:
             report_watchdog=ArmReportWatchdog(safety.twin_staleness_s),
             warn_clearance_m=safety.warn_clearance_m,
         )
+        session_id = uuid.uuid4().hex
+        recorder_thread = None
+        if spec.mode == "collect":
+            try:
+                recorder_thread = self._build_collect_recorder(
+                    spec, session_cfg, workcell, scene, session_id
+                )
+            except Exception:
+                workcell.stop()
+                rs.stop()
+                self.start_previews()
+                raise
         loop = ControlLoop(
             workcell,
             self.cfg.control,
@@ -238,12 +251,15 @@ class SessionManager:
             planner=twin,
             profile_store=self.profile_store,
             workcell_kind="sim",
+            recorder=recorder_thread,
         )
         loop.start()
+        if recorder_thread is not None:
+            recorder_thread.start()
 
         # Video: session cameras at session fps + reserved "sim"/"twin".
         session = ActiveSession(
-            session_id=uuid.uuid4().hex,
+            session_id=session_id,
             spec=spec,
             state=SessionState.BRINGUP,
             workcell=workcell,
@@ -251,6 +267,7 @@ class SessionManager:
             supervisor=supervisor,
             twin=twin,
             render_service=rs,
+            recorder_thread=recorder_thread,
         )
         fps = self.cfg.video.session_fps
         for cam_id, cam in workcell.cameras.items():
@@ -268,6 +285,132 @@ class SessionManager:
             session.sources.append(twin_src)
             session.streams.append("twin")
         return session
+
+    def _build_collect_recorder(
+        self, spec: SessionSpec, session_cfg: WorkcellConfig, workcell, scene, session_id: str
+    ):
+        """Collect-mode recorder stack (04-runtime §10; 10-frames §5-§9).
+
+        Heavy imports (lerobot -> torch) happen inside the recorder ctor —
+        only collect sessions ever pay them.
+        """
+        import hashlib
+
+        import numpy as np
+        from apollo_xarm7_core import parse_frame
+
+        from ..recorder.episode_recorder import LeRobotEpisodeRecorder
+        from ..recorder.features import ArmMeta, build_features, build_repo_id, build_robot_type
+        from ..recorder.frames import RecordingFrameConverter
+        from ..recorder.kinematics import RecorderKinematics
+        from ..recorder.sidecars import SidecarWriter, pose_json
+        from ..recorder.thread import RecorderThread
+
+        action_space = "delta_ee"  # canonical (10-frames §1.2); per-session later
+        arms = [ArmMeta(a, bool(scene.meta.rail[a])) for a in spec.arms]
+        frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
+        kin = RecorderKinematics(scene)
+
+        # camera:<id> recording frames need a declared camera with static T_W_C
+        # (10-frames §5.1); wrist/moving cameras are rejected here (-> 409).
+        camera_poses = {}
+        for arm_id, ref in frames.items():
+            parsed = parse_frame(ref)
+            if parsed.kind != "camera":
+                continue
+            if parsed.ident not in workcell.cameras:
+                raise SessionError(f"frames[{arm_id!r}]: unknown camera {parsed.ident!r}")
+            if not kin.camera_static(parsed.ident):
+                raise SessionError(
+                    f"frames[{arm_id!r}]: camera {parsed.ident!r} is not static in world"
+                )
+            camera_poses[parsed.ident] = kin.camera_world(parsed.ident)
+        converter = RecordingFrameConverter(frames, camera_poses)
+
+        cam_res = {cid: cam.resolution for cid, cam in workcell.cameras.items()}
+        features = build_features(arms, frames, cam_res, action_space)
+        repo_id = build_repo_id(spec.task or "task", arms, frames, action_space)
+        root = self.cfg.datasets_root / repo_id
+        recorder = LeRobotEpisodeRecorder(
+            self.cfg.recorder,
+            features,
+            root,
+            repo_id,
+            build_robot_type(len(arms), sim=True),
+            default_task=spec.task or "",
+        )
+
+        sidecars = SidecarWriter(root)
+        scene_sha = sidecars.archive_scene_xml(scene.xml)
+        sidecars.write_session(
+            session_id,
+            spec.mode,
+            spec.model_dump(mode="json"),
+            {
+                "kind": "sim",
+                "config_sha256": hashlib.sha256(
+                    session_cfg.model_dump_json().encode()
+                ).hexdigest(),
+                "arm_ids": list(spec.arms),
+                "rail": {a.arm_id: a.has_rail for a in arms},
+            },
+            session_cfg.safety.model_dump(mode="json"),
+        )
+        states = workcell.states()
+        arm_bases = {}
+        for arm in arms:
+            q0 = np.array(states[arm.arm_id].q, dtype=np.float64)
+            if arm.has_rail:
+                q0[7] = 0.0  # rail origin = base pose at zero rail travel (§2.2)
+            arm_bases[arm.arm_id] = {
+                "rail_origin_in_world": pose_json(kin.base_world(arm.arm_id, q0)),
+                "has_rail": arm.has_rail,
+            }
+        initial = self.profile_store.initial_for("sim")
+        profile_snapshot = None
+        if spec.start_from.startswith("profile:"):
+            profile_snapshot = self.profile_store.get(
+                spec.start_from.split(":", 1)[1]
+            ).model_dump(mode="json")
+        meta_base = {
+            "session_id": session_id,
+            "scene_xml_sha256": scene_sha,
+            "start_from": spec.start_from,
+            "initial_condition_profile_id": initial.profile_id if initial else None,
+            "profile_snapshot": profile_snapshot,
+            "frames": dict(frames),
+            "arm_bases": arm_bases,
+        }
+        cam_cfgs = {c.id: c for c in session_cfg.cameras}
+
+        def extrinsics_fn(arm_states):  # runs on the recorder thread (owns kin)
+            q_by_arm = {a: np.asarray(arm_states[a].q) for a in spec.arms}
+            out = {}
+            for cam_id in workcell.cameras:
+                cfg = cam_cfgs.get(cam_id)
+                out[cam_id] = {
+                    "T_W_C": pose_json(kin.camera_world(cam_id, q_by_arm)),
+                    "extrinsics_frame": "world" if kin.camera_static(cam_id) else None,
+                    "intrinsics": (
+                        cfg.intrinsics.model_dump() if cfg and cfg.intrinsics else None
+                    ),
+                    "calibration_file": None,  # sim: pose comes from the MJCF
+                    "calibration_sha256": None,
+                }
+            return out
+
+        return RecorderThread(
+            recorder,
+            self.bus,
+            workcell.cameras,
+            arms,
+            converter,
+            kin,
+            fps=self.cfg.recorder.fps,
+            sidecars=sidecars,
+            episode_meta_base=meta_base,
+            extrinsics_fn=extrinsics_fn,
+        )
 
     def _session_workcell_config(
         self, spec: SessionSpec, wc: WorkcellConfig, scene_id: str
@@ -355,6 +498,8 @@ class SessionManager:
                 return
             session.state = SessionState.TEARDOWN
             try:
+                if session.recorder_thread is not None:
+                    session.recorder_thread.stop()  # discard + finalize (§10.4)
                 session.loop.stop()
                 for sid in session.streams:
                     self.hub.remove_stream(sid)

@@ -52,6 +52,23 @@ class VideoConfig(BaseModel):
     jpeg_quality: int = 80
 
 
+class ExtrinsicsTolerance(BaseModel):
+    pos_m: float
+    rot_rad: float
+
+
+class RecorderConfig(BaseModel):
+    """Episode recorder tuning (04-runtime §10/§14; 10-frames §7.5)."""
+
+    fps: int = Field(default=25, ge=20, le=30)  # dataset fps; 20-30 band (binding)
+    vcodec: str = "auto"  # rgb encoder; "auto" -> NVENC when available, else libsvtav1
+    jpeg_quality: int = 80
+    image_writer_threads: int = 4  # PNG fallback path only
+    # Checkpoint-load extrinsics verification thresholds (10-frames §5.3; phase-08).
+    extrinsics_warn: ExtrinsicsTolerance = ExtrinsicsTolerance(pos_m=0.003, rot_rad=0.010)
+    extrinsics_max: ExtrinsicsTolerance = ExtrinsicsTolerance(pos_m=0.010, rot_rad=0.035)
+
+
 class RuntimeConfig(BaseModel):
     """Top-level runtime config; sane defaults for sim-only dev."""
 
@@ -63,6 +80,7 @@ class RuntimeConfig(BaseModel):
     datasets_root: Path = Path("~/apollo/datasets")
     checkpoints_root: Path = Path("~/apollo/checkpoints")
     control: ControlConfig = ControlConfig()
+    recorder: RecorderConfig = RecorderConfig()
     telemetry_hz: float = 25.0
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
@@ -112,6 +130,8 @@ __all__ = [
     "JogConfig",
     "WatchdogConfig",
     "ControlConfig",
+    "ExtrinsicsTolerance",
+    "RecorderConfig",
     "VideoConfig",
     "RuntimeConfig",
     "load_runtime_config",
