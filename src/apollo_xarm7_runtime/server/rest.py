@@ -58,8 +58,10 @@ def keymap() -> list[KeymapEntry]:
 
 
 @router.get("/policies")
-def policies() -> list:
-    return []  # checkpoint registry lands with phase-08
+def policies(request: Request) -> list:
+    from ..dagger.registry import scan_policies
+
+    return scan_policies(_runtime(request).cfg.checkpoints_root)
 
 
 @router.get("/episodes")

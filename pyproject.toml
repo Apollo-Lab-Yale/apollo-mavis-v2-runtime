@@ -17,6 +17,8 @@ dependencies = [
     # LeRobot v3 dataset writer (recorder/ only; lazy-imported — 04-runtime §10).
     # 0.6.x is the pinned minor (v3.0 format); needs Python >=3.12.
     "lerobot[dataset]>=0.6.1,<0.7",
+    # AsyncTrainer control channel (12-dagger §7): ZMQ REQ/REP on 127.0.0.1.
+    "pyzmq>=25",
 ]
 
 [project.optional-dependencies]
@@ -54,7 +56,7 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "xarm".msg = "runtime talks to hardware only via apollo_xarm7_hardware"
-"torch".msg = "torch belongs to the trainer process (phase-08)"
+"torch".msg = "torch is sanctioned only inside apollo_xarm7_runtime.dagger (policy + trainer)"
 "lerobot".msg = "lerobot is imported lazily inside apollo_xarm7_runtime.recorder only"
 
 [tool.ruff.lint.per-file-ignores]
@@ -62,6 +64,11 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "src/apollo_xarm7_runtime/recorder/*" = ["TID251"]
 "tests/test_recorder*.py" = ["TID251"]
 "tests/test_e2e_collect.py" = ["TID251"]
+# The dagger package owns the live Policy object (12-dagger §1) and the
+# trainer process; torch (and spool parquet reads) are sanctioned here.
+"src/apollo_xarm7_runtime/dagger/*" = ["TID251"]
+"src/apollo_xarm7_runtime/dagger/trainer/*" = ["TID251"]
+"tests/dagger/*" = ["TID251"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

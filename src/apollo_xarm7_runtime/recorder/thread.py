@@ -237,6 +237,7 @@ class RecorderThread:
                 payload["extrinsics"] = dict(self._episode_extrinsics)
                 payload["frames_dropped"] = self._frames_dropped
                 payload["success"] = None
+                payload.update(self._sidecar_extra())
                 self.sidecars.write_episode(index, payload)
             except Exception:
                 logger.exception("episode sidecar write failed")
@@ -246,6 +247,17 @@ class RecorderThread:
             self._last_saved_index = index
             self._episode_index = None
             self._pending = None
+        try:
+            self._episode_saved(index)
+        except Exception:
+            logger.exception("episode-saved hook failed")
+
+    # -- subclass hooks (DaggerRecorderThread, phase-08) ---------------------------
+    def _sidecar_extra(self) -> dict[str, Any]:
+        return {}
+
+    def _episode_saved(self, index: int) -> None:
+        pass
 
     def _do_discard(self) -> None:
         try:

@@ -38,8 +38,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_UNIMPLEMENTED_MODES = {"dagger": "phase-08", "inference": "phase-08"}
-
 
 def _servo_faithful_scene(scene_id: str):
     """Session workcell scene with hardware-grade servo fidelity.
@@ -79,7 +77,8 @@ class ActiveSession:
     supervisor: SafetySupervisor
     twin: object | None
     render_service: object | None
-    recorder_thread: object | None = None  # RecorderThread (collect mode)
+    recorder_thread: object | None = None  # RecorderThread (collect/dagger)
+    policy_session: object | None = None  # DaggerSession | InferenceSession (phase-08)
     streams: list[str] = field(default_factory=list)  # video ids
     sources: list[object] = field(default_factory=list)  # started FrameSources
     start_from_progress: float | None = None
@@ -130,10 +129,10 @@ class SessionManager:
     def _validate(self, spec: SessionSpec) -> WorkcellConfig:
         if self.session is not None:
             raise SessionError("a session already exists")
-        if spec.mode in _UNIMPLEMENTED_MODES:
-            raise SessionError(
-                f"mode {spec.mode!r} is not available yet ({_UNIMPLEMENTED_MODES[spec.mode]})"
-            )
+        if spec.mode in ("dagger", "inference"):
+            from ..dagger.registry import resolve_policy
+
+            resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)  # 409 early
         wc = self.cfg.workcell_config(spec.kind)
         if wc is None:
             raise SessionError(f"no {spec.kind!r} workcell config available")
@@ -230,32 +229,41 @@ class SessionManager:
         )
         session_id = uuid.uuid4().hex
         recorder_thread = None
-        if spec.mode == "collect":
-            try:
+        policy_session = None
+        try:
+            if spec.mode == "collect":
                 recorder_thread = self._build_collect_recorder(
                     spec, session_cfg, workcell, scene, session_id
                 )
-            except Exception:
-                workcell.stop()
-                rs.stop()
-                self.start_previews()
-                raise
-        loop = ControlLoop(
-            workcell,
-            self.cfg.control,
-            self.bus,
-            supervisor,
-            list(spec.arms),
-            ik=ik,
-            kin=kin,
-            planner=twin,
-            profile_store=self.profile_store,
-            workcell_kind="sim",
-            recorder=recorder_thread,
-        )
+            if spec.mode in ("dagger", "inference"):
+                loop, recorder_thread, policy_session = self._build_policy_stack(
+                    spec, session_cfg, workcell, scene, session_id,
+                    ik, kin, twin, supervisor,
+                )
+            else:
+                loop = ControlLoop(
+                    workcell,
+                    self.cfg.control,
+                    self.bus,
+                    supervisor,
+                    list(spec.arms),
+                    ik=ik,
+                    kin=kin,
+                    planner=twin,
+                    profile_store=self.profile_store,
+                    workcell_kind="sim",
+                    recorder=recorder_thread,
+                )
+        except Exception:
+            workcell.stop()
+            rs.stop()
+            self.start_previews()
+            raise
         loop.start()
         if recorder_thread is not None:
             recorder_thread.start()
+        if policy_session is not None:
+            policy_session.start()
 
         # Video: session cameras at session fps + reserved "sim"/"twin".
         session = ActiveSession(
@@ -268,6 +276,7 @@ class SessionManager:
             twin=twin,
             render_service=rs,
             recorder_thread=recorder_thread,
+            policy_session=policy_session,
         )
         fps = self.cfg.video.session_fps
         for cam_id, cam in workcell.cameras.items():
@@ -287,12 +296,20 @@ class SessionManager:
         return session
 
     def _build_collect_recorder(
-        self, spec: SessionSpec, session_cfg: WorkcellConfig, workcell, scene, session_id: str
+        self,
+        spec: SessionSpec,
+        session_cfg: WorkcellConfig,
+        workcell,
+        scene,
+        session_id: str,
+        dagger_ctx: dict | None = None,  # {"run_id", "gate"} -> DaggerRecorderThread
     ):
-        """Collect-mode recorder stack (04-runtime §10; 10-frames §5-§9).
+        """Collect/DAgger recorder stack (04-runtime §10; 10-frames §5-§9).
 
         Heavy imports (lerobot -> torch) happen inside the recorder ctor —
-        only collect sessions ever pay them.
+        only collect/dagger sessions ever pay them. With ``dagger_ctx`` the
+        schema gains the 12-dagger §4 columns and the repo id the
+        ``_dagger_{run_id}`` suffix (dedicated repo; seed data never mutated).
         """
         import hashlib
 
@@ -330,6 +347,11 @@ class SessionManager:
         cam_res = {cid: cam.resolution for cid, cam in workcell.cameras.items()}
         features = build_features(arms, frames, cam_res, action_space)
         repo_id = build_repo_id(spec.task or "task", arms, frames, action_space)
+        if dagger_ctx is not None:
+            from ..dagger.recorder import dagger_features
+
+            features = dagger_features(features, dagger_ctx["run_id"])
+            repo_id = f"{repo_id}_dagger_{dagger_ctx['run_id']}"
         root = self.cfg.datasets_root / repo_id
         recorder = LeRobotEpisodeRecorder(
             self.cfg.recorder,
@@ -399,6 +421,24 @@ class SessionManager:
                 }
             return out
 
+        if dagger_ctx is not None:
+            from ..dagger.recorder import DaggerRecorderThread
+
+            return DaggerRecorderThread(
+                recorder,
+                self.bus,
+                workcell.cameras,
+                arms,
+                converter,
+                kin,
+                fps=self.cfg.recorder.fps,
+                sidecars=sidecars,
+                episode_meta_base=meta_base,
+                extrinsics_fn=extrinsics_fn,
+                gate=dagger_ctx["gate"],
+                run_id=dagger_ctx["run_id"],
+                dataset_root=root,
+            )
         return RecorderThread(
             recorder,
             self.bus,
@@ -411,6 +451,120 @@ class SessionManager:
             episode_meta_base=meta_base,
             extrinsics_fn=extrinsics_fn,
         )
+
+    def _build_policy_stack(
+        self, spec: SessionSpec, session_cfg: WorkcellConfig, workcell, scene,
+        session_id: str, ik, kin, twin, supervisor,
+    ):
+        """DAgger/inference bringup (12-dagger §1): -> (loop, recorder, session)."""
+        import shutil
+
+        from apollo_xarm7_core.dagger import CheckpointInfo
+
+        from ..dagger.gate import TakeoverGateImpl
+        from ..dagger.loop import (
+            DaggerSession,
+            GatedPolicyExecutor,
+            InferenceSession,
+            make_obs_fn,
+        )
+        from ..dagger.policy_runner import ActionAnchor, PolicyRunner, SlewLimits
+        from ..dagger.registry import resolve_policy
+        from ..dagger.trainer.checkpoints import STATE_DICT, CheckpointStore, sha256_file
+        from ..recorder.features import arm_action_names, arm_state_names
+        from ..recorder.frames import RecordingFrameConverter
+        from ..recorder.kinematics import RecorderKinematics
+
+        dcfg = self.cfg.dagger
+        resolved = resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)
+        info = resolved.info
+        frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
+        if info.action_space != "delta_ee" or any(
+            f != info.action_frame for f in frames.values()
+        ):
+            raise SessionError("policy/dataset frame mismatch")
+        from ..dagger.policies import MLPPolicy, resolve_device
+
+        device = resolve_device(dcfg.policy_device)
+        try:
+            policy = MLPPolicy.from_bundle(
+                str(resolved.state_dict_path), info.version, device
+            )
+        except Exception as e:
+            raise SessionError(f"policy load failed: {e!r}") from e
+        gate = TakeoverGateImpl(list(spec.arms), dcfg.t_blend_s)
+        arms_meta = [(a, bool(scene.meta.rail[a])) for a in spec.arms]
+        policy_lock = threading.Lock()
+        runner = PolicyRunner(
+            policy,
+            make_obs_fn(self.bus, arms_meta,
+                        RecordingFrameConverter(frames, {}), RecorderKinematics(scene)),
+            rate_hz=dcfg.policy_rate_hz,
+            policy_lock=policy_lock,
+        )
+        anchor = ActionAnchor(ik, kin, SlewLimits(window_s=dcfg.slew_window_s),
+                              action_space=info.action_space)
+        common = dict(ik=ik, kin=kin, planner=twin, profile_store=self.profile_store,
+                      workcell_kind="sim")
+        if spec.mode == "inference":
+            loop = GatedPolicyExecutor(
+                workcell, self.cfg.control, self.bus, supervisor, list(spec.arms),
+                gate=gate, runner=runner, anchor=anchor, arms_meta=arms_meta,
+                session_mode="inference", version_label=resolved.policy_id,
+                recorder=None, recorder_fps=self.cfg.recorder.fps, **common,
+            )
+            return loop, None, InferenceSession(loop, runner)
+
+        # -- dagger: fresh run store; v000000 = seed (rollback target, §12) ------
+        from ..dagger.client import AsyncTrainerClientImpl, TrainerConfig
+        from ..dagger.reloader import PolicyReloaderImpl
+
+        run_id = session_id[:8]
+        store = CheckpointStore(self.cfg.checkpoints_root, run_id)
+        v0 = store.version_dir(0)
+        v0.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(resolved.state_dict_path, v0 / STATE_DICT)
+        store.write_manifest(CheckpointInfo(
+            run_id=run_id, version=0, path=str(v0), parent_version=None,
+            trained_on_frames=info.trained_on_frames, trained_on_episodes=[],
+            action_frame=info.action_frame, action_space=info.action_space,
+            sanity_ok=True, mean_loss=info.mean_loss,
+            sha256=sha256_file(v0 / STATE_DICT), created_wallclock_ns=time.time_ns(),
+        ))
+        policy.set_version(0)
+        recorder_thread = self._build_collect_recorder(
+            spec, session_cfg, workcell, scene, session_id,
+            dagger_ctx={"run_id": run_id, "gate": gate},
+        )
+        state_dim = sum(len(arm_state_names(a, r)) for a, r in arms_meta)
+        action_dim = sum(len(arm_action_names(a, r, "delta_ee")) for a, r in arms_meta)
+        tcfg = TrainerConfig(
+            run_id=run_id, checkpoints_root=str(self.cfg.checkpoints_root),
+            spool_dir=str(recorder_thread.spool_dir),
+            seed_bundle=str(v0 / STATE_DICT),
+            port=dcfg.trainer.port, device=dcfg.trainer.device,
+            cuda_visible_devices=dcfg.trainer.cuda_visible_devices,
+            action_frame=info.action_frame, action_space=info.action_space,
+            state_dim=state_dim, action_dim=action_dim,
+            min_new_labels=dcfg.trainer.min_new_labels,
+            push_period_s=dcfg.trainer.push_period_s,
+            batch_size=dcfg.trainer.batch_size, lr=dcfg.trainer.lr,
+        )
+        client = AsyncTrainerClientImpl(tcfg, workdir=store.root)
+        reloader = PolicyReloaderImpl(
+            policy, store, info.action_frame, info.action_space,
+            policy_lock=policy_lock, current_version=0,
+            on_rollback=client.notify_rollback,
+        )
+        loop = GatedPolicyExecutor(
+            workcell, self.cfg.control, self.bus, supervisor, list(spec.arms),
+            gate=gate, runner=runner, anchor=anchor, arms_meta=arms_meta,
+            session_mode="dagger", run_id=run_id, reloader=reloader,
+            trainer_client=client, recorder=recorder_thread,
+            recorder_fps=self.cfg.recorder.fps, **common,
+        )
+        recorder_thread.on_episode_saved = loop.on_episode_saved
+        return loop, recorder_thread, DaggerSession(loop, runner, reloader, client)
 
     def _session_workcell_config(
         self, spec: SessionSpec, wc: WorkcellConfig, scene_id: str
@@ -498,6 +652,8 @@ class SessionManager:
                 return
             session.state = SessionState.TEARDOWN
             try:
+                if session.policy_session is not None:
+                    session.policy_session.stop()  # trainer stop -> reloader -> runner
                 if session.recorder_thread is not None:
                     session.recorder_thread.stop()  # discard + finalize (§10.4)
                 session.loop.stop()
@@ -616,9 +772,12 @@ class SessionManager:
                     error_code=states[arm_id].error_code if arm_id in states else 0,
                     joint_limits=limits,
                 ))
+        from ..dagger.registry import scan_policies
+
         return WorkcellStatus(
             kind=kind, available_kinds=available, arms=arms,
-            cameras=self.camera_infos(), policies_available=False,
+            cameras=self.camera_infos(),
+            policies_available=bool(scan_policies(self.cfg.checkpoints_root)),
         )
 
     @staticmethod

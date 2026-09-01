@@ -189,25 +189,12 @@ class ControlLoop:
         if self.plans.active_arms and scale > 0.0 and (held & HELD_CODES):
             self._cancel_plans("movement key")
 
-        # 5-7: per-arm action resolution -> commanded q.
-        q_cmd: dict[str, np.ndarray] = {}
-        source = CommandSource.TELEOP
-        for arm_id in self.session_arms:
-            q_last = self._last_cmd[arm_id]
-            q_next: np.ndarray | None = None
-            if states[arm_id].error_code != 0:
-                q_next = None  # FAULT: hold; recovery re-seeds (§15)
-            elif self.plans.active(arm_id):
-                q_next = self.plans.step(arm_id, q_last)
-                source = CommandSource.PLANNER
-                if not self.plans.active(arm_id):  # final waypoint reached
-                    self._finish_plan(arm_id, ok=True)
-            elif self.jog.active(arm_id):
-                q_next = self._jog_step(arm_id, q_last, scale)
-                source = CommandSource.JOINT_JOG
-            elif arm_id == self.active_arm:
-                q_next = self._teleop_step(arm_id, states[arm_id], q_last, held, scale)
-            q_cmd[arm_id] = q_next if q_next is not None else q_last
+        # 5-7: per-arm action resolution -> commanded q (mode hook, phase-08).
+        resolved, source = self._resolve_arms(states, held, scale, now)
+        q_cmd: dict[str, np.ndarray] = {
+            arm_id: (q if q is not None else self._last_cmd[arm_id])
+            for arm_id, q in resolved.items()
+        }
 
         # Per-tick joint clamp (dq_max) + rail bound, before the gate.
         for arm_id, q in q_cmd.items():
@@ -218,6 +205,7 @@ class ControlLoop:
             q_cmd[arm_id] = q
 
         dec = self.supervisor.filter(q_cmd, q_meas, source)  # 8
+        self._post_filter(dec, now)
 
         for arm_id, q in dec.q_out.items():  # 9
             self._last_cmd[arm_id] = np.array(q)
@@ -244,10 +232,46 @@ class ControlLoop:
             episode=episode,
             watchdog_tripped=watchdog_tripped,
             plan_status=dict(self._plan_state),
-            session_extra={"plan_status": self._plan_status, "kind": self.workcell_kind},
+            session_extra={
+                "plan_status": self._plan_status,
+                "kind": self.workcell_kind,
+                **self._session_extra(now),
+            },
         )
         self.bus.snapshot.put(snap)
         return snap
+
+    # -- mode hooks (overridden by dagger.loop.GatedPolicyExecutor, phase-08) -------
+    def _resolve_arms(
+        self, states: dict[str, ArmState], held: frozenset[str], scale: float, now: float
+    ) -> tuple[dict[str, np.ndarray | None], CommandSource]:
+        """Per-arm action resolution; None = hold at last command."""
+        out: dict[str, np.ndarray | None] = {}
+        source = CommandSource.TELEOP
+        for arm_id in self.session_arms:
+            q_last = self._last_cmd[arm_id]
+            q_next: np.ndarray | None = None
+            if states[arm_id].error_code != 0:
+                q_next = None  # FAULT: hold; recovery re-seeds (§15)
+            elif self.plans.active(arm_id):
+                q_next = self.plans.step(arm_id, q_last)
+                source = CommandSource.PLANNER
+                if not self.plans.active(arm_id):  # final waypoint reached
+                    self._finish_plan(arm_id, ok=True)
+            elif self.jog.active(arm_id):
+                q_next = self._jog_step(arm_id, q_last, scale)
+                source = CommandSource.JOINT_JOG
+            elif arm_id == self.active_arm:
+                q_next = self._teleop_step(arm_id, states[arm_id], q_last, held, scale)
+            out[arm_id] = q_next
+        return out, source
+
+    def _post_filter(self, dec, now: float) -> None:
+        """After the safety gate; dagger uses this for block-streak anomaly."""
+
+    def _session_extra(self, now: float) -> dict:
+        """Extra session_extra entries (dagger/inference telemetry + frames)."""
+        return {}
 
     # -- per-source steps -----------------------------------------------------
     def _teleop_step(

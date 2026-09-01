@@ -69,6 +69,28 @@ class RecorderConfig(BaseModel):
     extrinsics_max: ExtrinsicsTolerance = ExtrinsicsTolerance(pos_m=0.010, rot_rad=0.035)
 
 
+class TrainerSettings(BaseModel):
+    """AsyncTrainer process knobs (12-dagger §7 defaults)."""
+
+    port: int = 5757  # ZMQ REP control endpoint, tcp://127.0.0.1
+    device: str = "cuda:1"  # GPU 1 on the target box (render/inference own GPU 0)
+    cuda_visible_devices: str | None = "1"
+    min_new_labels: int = 100
+    push_period_s: float = 5.0
+    batch_size: int = 64
+    lr: float = 1e-5
+
+
+class DaggerConfig(BaseModel):
+    """DAgger/inference session tuning (12-dagger §2/§6/§7)."""
+
+    t_blend_s: float = Field(default=0.3, ge=0.2, le=0.5)
+    policy_rate_hz: float = Field(default=15.0, ge=10.0, le=30.0)
+    policy_device: str = "cuda:0"  # runtime-side inference; falls back to cpu
+    slew_window_s: float = Field(default=0.4, ge=0.3, le=0.5)
+    trainer: TrainerSettings = TrainerSettings()
+
+
 class RuntimeConfig(BaseModel):
     """Top-level runtime config; sane defaults for sim-only dev."""
 
@@ -81,6 +103,7 @@ class RuntimeConfig(BaseModel):
     checkpoints_root: Path = Path("~/apollo/checkpoints")
     control: ControlConfig = ControlConfig()
     recorder: RecorderConfig = RecorderConfig()
+    dagger: DaggerConfig = DaggerConfig()
     telemetry_hz: float = 25.0
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
@@ -130,6 +153,8 @@ __all__ = [
     "JogConfig",
     "WatchdogConfig",
     "ControlConfig",
+    "TrainerSettings",
+    "DaggerConfig",
     "ExtrinsicsTolerance",
     "RecorderConfig",
     "VideoConfig",

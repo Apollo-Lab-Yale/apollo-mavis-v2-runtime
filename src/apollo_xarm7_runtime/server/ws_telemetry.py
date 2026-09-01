@@ -54,13 +54,18 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
             for pair, dist in (snap.clearances if snap is not None else [])
         ],
         episode=snap.episode if snap is not None else None,
-        dagger=None,
-        inference=None,
+        dagger=(dagger := snap.session_extra.get("dagger") if snap is not None else None),
+        inference=snap.session_extra.get("inference") if snap is not None else None,
         session=SessionTelemetry(
             state=runtime.manager.state.value,
             start_from_progress=session.start_from_progress if session else None,
             plan_status=(
                 snap.session_extra.get("plan_status") if snap is not None else None
+            ),
+            trainer_alive=(
+                dagger.trainer.state != "dead"
+                if dagger is not None and dagger.trainer is not None
+                else None
             ),
         ),
     )
