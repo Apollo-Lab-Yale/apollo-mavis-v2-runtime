@@ -25,6 +25,19 @@ class LeashConfig(BaseModel):
     rot_rad: float = 0.2
 
 
+class TargetRateConfig(BaseModel):
+    """Cartesian approach rate of the clutched tracker target toward the IK
+    (04-runtime §6 "Target rate limit"): per tick the target handed to IK moves
+    from the previous commanded target by at most ``v_mps·dt`` / ``w_radps·dt``.
+    Keeps the single-step QP out of joint-velocity saturation, where it would
+    trade position for orientation. Truncation is not slipped into the anchor.
+    Both rates must be > 0: ``clamp_pose_to_leash`` with a zero cap freezes the
+    clutched target and a negative cap steps AWAY from the hand."""
+
+    v_mps: float = Field(default=1.0, gt=0.0)
+    w_radps: float = Field(default=2.0, gt=0.0)
+
+
 class JogConfig(BaseModel):
     slew_rad_per_tick: float = 0.02
     rail_m_per_tick: float = 0.002
@@ -40,6 +53,7 @@ class ControlConfig(BaseModel):
     rate_hz: float = 100.0
     teleop: TeleopRates = TeleopRates()
     leash: LeashConfig = LeashConfig()
+    target_rate: TargetRateConfig = TargetRateConfig()
     dq_max_rad: float = 0.04  # per tick
     jog: JogConfig = JogConfig()
     watchdog: WatchdogConfig = WatchdogConfig()
@@ -96,52 +110,87 @@ class DaggerConfig(BaseModel):
 
 
 ControllerInput = Literal[
-    "trigger_click", "trackpad_left", "trackpad_right", "trackpad_up", "trackpad_down", "none"
+    "trigger_click",
+    "trackpad_left",
+    "trackpad_right",
+    "trackpad_up",
+    "trackpad_down",
+    "menu_click",
+    "grip_click",
+    "none",
 ]
 """Vive-controller inputs a teleop action may be bound to (13-tracker §1.1).
 
-``trigger_click`` = trigger button (id 0) pressed. ``trackpad_left`` /
-``trackpad_right`` / ``trackpad_up`` / ``trackpad_down`` = trackpad button
-(id 1) pressed, classified ONCE at the press edge from the pad position by the
-dominant axis (``|x|`` and ``|y|`` both below ``trackpad_deadzone`` => the click
-is ignored) and held until release. ``none`` = unbound. Grip / menu / system are
-deliberately not bindable (menu + system is the dongle pairing combo).
+``trigger_click`` = trigger button (id 0) pressed (held-only: it registers no
+press edge). ``trackpad_left`` / ``trackpad_right`` / ``trackpad_up`` /
+``trackpad_down`` = trackpad button (id 1) pressed, classified ONCE at the press
+edge from the pad position by the dominant axis (``|x|`` and ``|y|`` both below
+``trackpad_deadzone`` => the click is ignored) and held until release.
+``menu_click`` = menu button (id 6), ``grip_click`` = grip button (id 7).
+``none`` = unbound. The system button (id 3) is deliberately not bindable:
+menu + system is the dongle pairing combo.
 """
 
-TRACKPAD_INPUTS: frozenset[str] = frozenset(
-    {"trackpad_left", "trackpad_right", "trackpad_up", "trackpad_down"}
+HELD_ONLY_INPUTS: frozenset[str] = frozenset({"trigger_click"})  # no press edge -> never discrete
+# The controller_map actions by kind. ``devices/tracker.py`` keys its code /
+# action tables by these same names and cross-checks them at import time, and
+# ``ControllerMapConfig`` is checked below to declare exactly these fields.
+CONTROLLER_HELD_ACTIONS: tuple[str, ...] = (
+    "clutch",
+    "gripper_open",
+    "gripper_close",
+    "rail_neg",
+    "rail_pos",
 )
+CONTROLLER_DISCRETE_ACTIONS: tuple[str, ...] = ("arm_next", "arm_prev")
 
 
 class ControllerMapConfig(BaseModel):
     """Controller input per teleop action (13-tracker §1.1).
 
-    Held actions (``clutch`` / ``gripper_open`` / ``gripper_close``) inject the
-    core keymap code of ``tracker_clutch`` / ``gripper_open`` / ``gripper_close``
-    (looked up by action, never hard-coded) while the input is active. Discrete
-    actions (``arm_next`` -> ``switch_arm``, ``arm_prev`` -> ``switch_arm_prev``)
-    fire once per trackpad press edge inside the control loop, subject to the
-    same nacks as the WS actions; they accept trackpad inputs only (the trigger
-    is a held input). Every input may be bound to at most one action.
+    Held actions (``clutch`` / ``gripper_open`` / ``gripper_close`` /
+    ``rail_neg`` / ``rail_pos``) inject the core keymap code of the action of
+    the same name (``tracker_clutch`` for the clutch; looked up by action, never
+    hard-coded) while the input is active; the rail codes drive the rail at the
+    device source's scale exactly like the arrow keys. Discrete actions
+    (``arm_next`` -> ``switch_arm``, ``arm_prev`` -> ``switch_arm_prev``) fire
+    once per press edge of the bound input inside the control loop, subject to
+    the same nacks as the WS actions; they accept any input except
+    ``trigger_click`` (held-only). Every input may be bound to at most one
+    action.
     """
 
     clutch: ControllerInput = "trigger_click"
-    gripper_close: ControllerInput = "trackpad_left"
-    gripper_open: ControllerInput = "trackpad_right"
-    arm_next: ControllerInput = "trackpad_up"
-    arm_prev: ControllerInput = "trackpad_down"
+    gripper_open: ControllerInput = "trackpad_up"
+    gripper_close: ControllerInput = "trackpad_down"
+    rail_neg: ControllerInput = "trackpad_left"
+    rail_pos: ControllerInput = "trackpad_right"
+    arm_next: ControllerInput = "menu_click"
+    arm_prev: ControllerInput = "none"
 
     @model_validator(mode="after")
     def _check_bindings(self) -> ControllerMapConfig:
-        for name in ("arm_next", "arm_prev"):
+        for name in CONTROLLER_DISCRETE_ACTIONS:
             value = getattr(self, name)
-            if value != "none" and value not in TRACKPAD_INPUTS:
-                raise ValueError(f"{name} must be a trackpad_* input or none, got {value!r}")
+            if value in HELD_ONLY_INPUTS:
+                raise ValueError(
+                    f"{name} is a discrete action and cannot be bound to the held-only input "
+                    f"{value!r}; use trackpad_*, menu_click, grip_click or none"
+                )
         bound = [v for v in self.model_dump().values() if v != "none"]
         dup = sorted({v for v in bound if bound.count(v) > 1})
         if dup:
             raise ValueError(f"controller input bound to more than one action: {dup}")
         return self
+
+
+if set(ControllerMapConfig.model_fields) != set(CONTROLLER_HELD_ACTIONS) | set(
+    CONTROLLER_DISCRETE_ACTIONS
+):  # pragma: no cover - import-time invariant
+    raise RuntimeError(
+        "ControllerMapConfig fields must be exactly CONTROLLER_HELD_ACTIONS + "
+        "CONTROLLER_DISCRETE_ACTIONS (13-tracker §1.1)"
+    )
 
 
 class TrackerFilterConfig(BaseModel):
@@ -163,7 +212,8 @@ class TrackerConfig(BaseModel):
     ``yaw_deg`` / ``pos_scale`` / ``follow_rotation`` are the process-lifetime
     defaults; the ``tracker_settings`` action mutates the live values.
     ``controller_map`` / ``trackpad_deadzone`` bind the paired controller's
-    buttons to device-held key codes (13-tracker §1.1).
+    buttons to device-held key codes (clutch, gripper, rail) and to the
+    discrete arm-switch actions (13-tracker §1.1).
     """
 
     backend: Literal["none", "fake", "libsurvive"] = "none"
@@ -239,6 +289,7 @@ def load_runtime_config(path: str | Path | None = None) -> RuntimeConfig:
 __all__ = [
     "TeleopRates",
     "LeashConfig",
+    "TargetRateConfig",
     "JogConfig",
     "WatchdogConfig",
     "ControlConfig",
@@ -247,7 +298,9 @@ __all__ = [
     "ExtrinsicsTolerance",
     "RecorderConfig",
     "ControllerInput",
-    "TRACKPAD_INPUTS",
+    "HELD_ONLY_INPUTS",
+    "CONTROLLER_HELD_ACTIONS",
+    "CONTROLLER_DISCRETE_ACTIONS",
     "ControllerMapConfig",
     "TrackerFilterConfig",
     "TrackerConfig",

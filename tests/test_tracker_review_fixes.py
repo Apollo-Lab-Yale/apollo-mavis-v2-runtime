@@ -8,9 +8,10 @@ actions, over the deterministic ``Rig`` of ``test_tracker_teleop``:
   re-anchors and never moves the target;
 * One Euro filter in the provider: jitter reduced vs passthrough, reset on
   engage and after gaps, live retune / toggle via ``tracker_settings``;
-* trackpad press edges fire ``switch_arm`` / ``switch_arm_prev`` once per press
-  inside the loop, latch ``device_action`` ~1 s, and are nacked while a DAgger
-  takeover is engaged.
+* controller press edges (``edge_seq``; scripted here as trackpad clicks with an
+  explicit ``click_action`` shorthand — the loop is map-agnostic) fire ``switch_arm`` /
+  ``switch_arm_prev`` once per press inside the loop, latch ``device_action``
+  ~1 s, and are nacked while a DAgger takeover is engaged.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
 from test_tracker_teleop import CLUTCH, DT, IDENT, PoseIK, PoseKin, Rig
 
 from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.config import ControlConfig
+from apollo_xarm7_runtime.config import ControlConfig, TargetRateConfig
 from apollo_xarm7_runtime.control.loop import DEVICE_ACTION_LINGER_S
 from apollo_xarm7_runtime.control.pose_filter import PoseFilterConfig
 from apollo_xarm7_runtime.control.tracker_teleop import TrackerTeleop, align_pose
@@ -35,7 +36,7 @@ from apollo_xarm7_runtime.devices.tracker import (
     GRIPPER_OPEN_CODE,
     ControllerState,
     TrackerSettings,
-    classify_click,
+    note_edges,
 )
 from apollo_xarm7_runtime.safety.gate import NullGate
 from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
@@ -45,7 +46,7 @@ from apollo_xarm7_runtime.safety.watchdog import InputWatchdog
 def _pad_state(x: float, y: float, prev: ControllerState | None = None, click: bool = True):
     """Classified controller state (as the reader publishes it) for a pad press."""
     raw = ControllerState(trackpad_touch=True, trackpad_click=click, trackpad_x=x, trackpad_y=y)
-    return classify_click(prev, raw, 0.3)
+    return note_edges(prev, raw, 0.3)
 
 
 # -- (a) re-seed after non-teleop motion ---------------------------------------------------------
@@ -160,7 +161,8 @@ class DaggerRig:
             self.bus.tracker, self.settings, stale_s=0.2, leash_pos_m=0.025, leash_rot_rad=0.2
         )
         self.loop = GatedPolicyExecutor(
-            self.cell, ControlConfig(), self.bus, SafetySupervisor(NullGate(), InputWatchdog()),
+            self.cell, ControlConfig(target_rate=TargetRateConfig(v_mps=1e9, w_radps=1e9)),
+            self.bus, SafetySupervisor(NullGate(), InputWatchdog()),
             ["arm0", "arm1"], gate=self.gate, runner=self.runner,
             anchor=ActionAnchor(ik, kin, SlewLimits()), arms_meta=ARMS_META,
             session_mode=mode, version_label="deploy/v001", ik=ik, kin=kin,
@@ -171,7 +173,7 @@ class DaggerRig:
         self.pose = None
         self.codes: frozenset[str] = frozenset()
         self.controller = None
-        self.click_action = None
+        self.click_actions: tuple = ()
 
     def sample(self, pos, age=0.0):
         from apollo_xarm7_runtime.devices.tracker import TrackerSample
@@ -179,12 +181,14 @@ class DaggerRig:
         self.sample_seq += 1
         self.bus.tracker.put(TrackerSample(
             Pose(np.asarray(pos, float), IDENT), np.zeros(3), np.zeros(3), self.t,
-            self.t - age, self.sample_seq, True, self.controller, self.codes, self.click_action,
+            self.t - age, self.sample_seq, True, self.controller, self.codes, self.click_actions,
+            pose_rx_mono=self.t - age,
         ))
         self.pose = np.asarray(pos, float)
 
     def device(self, *codes, controller=None, click_action=None):
-        self.codes, self.controller, self.click_action = frozenset(codes), controller, click_action
+        self.codes, self.controller = frozenset(codes), controller
+        self.click_actions = () if click_action is None else ((controller.edge_seq, click_action),)
         if self.pose is not None:
             self.sample(self.pose)
 
@@ -241,10 +245,10 @@ def test_device_switch_arm_nacked_while_takeover_engaged():
     rig = DaggerRig()
     rig.tick(10)
     rig.sample([0.0, 0.0, 0.0])
-    rig.device(controller=ControllerState())  # idle controller adopted (click_seq 0)
+    rig.device(controller=ControllerState())  # idle controller adopted (edge_seq 0)
     rig.tick()
     assert rig.act("takeover_toggle").ok and rig.gate.engaged_arm() == "arm0"
-    st = _pad_state(0.0, 0.9)  # trackpad up -> switch_arm
+    st = _pad_state(0.0, 0.9)  # a press edge whose scripted action is switch_arm
     rig.device(controller=st, click_action="switch_arm")
     rig.tick()
     assert rig.loop.active_arm == "arm0"  # nacked: takeover active
@@ -254,7 +258,7 @@ def test_device_switch_arm_nacked_while_takeover_engaged():
     rig.act("takeover_toggle")  # handback
     rig.tick(50)
     st2 = _pad_state(0.0, 0.9, prev=_pad_state(0.0, 0.9, prev=st, click=False))
-    assert st2.click_seq == 2
+    assert st2.edge_seq == 2
     rig.device(controller=st2, click_action="switch_arm")
     rig.tick()
     assert rig.loop.active_arm == "arm1" and rig.extra()["device_action"] == "switch_arm"
@@ -476,11 +480,11 @@ def test_filter_retune_via_tracker_settings_and_validation():
     assert rig_fast.cmd()[0] > rig_slow.cmd()[0] + 1e-3
 
 
-# -- device discrete actions (trackpad press edges) ------------------------------------------
+# -- device discrete actions (controller press edges, scripted click_action) ------------------
 def test_device_click_fires_switch_arm_once_per_press_and_latches_device_action():
     rig = Rig()
     rig.sample([0.0, 0.0, 0.0])
-    rig.device(controller=ControllerState())  # idle controller adopted (click_seq 0)
+    rig.device(controller=ControllerState())  # idle controller adopted (edge_seq 0)
     rig.tick()
     assert rig.extra()["device_action"] is None and rig.loop.active_arm == "arm0"
     up = _pad_state(0.0, 0.9)
@@ -496,11 +500,11 @@ def test_device_click_fires_switch_arm_once_per_press_and_latches_device_action(
     rig.tick(int(DEVICE_ACTION_LINGER_S / DT))
     assert rig.extra()["device_action"] is None  # ~1 s latch expired
     down = _pad_state(0.0, -0.9, prev=released)
-    assert down.click_seq == 2
+    assert down.edge_seq == 2
     rig.device(controller=down, click_action="switch_arm_prev")
     rig.tick()
     assert rig.loop.active_arm == "arm0" and rig.extra()["device_action"] == "switch_arm_prev"
-    # A held-only click (right -> gripper_open) advances the counter but maps to no action.
+    # A held-only click (scripted as gripper_open) advances the counter but maps to no action.
     right = _pad_state(0.9, 0.0, prev=_pad_state(0.0, -0.9, prev=down, click=False))
     rig.device(GRIPPER_OPEN_CODE, controller=right, click_action=None)
     rig.tick(3)
@@ -510,12 +514,12 @@ def test_device_click_fires_switch_arm_once_per_press_and_latches_device_action(
 def test_device_click_edges_first_observation_and_stale_samples_do_not_fire():
     rig = Rig()
     rig.sample([0.0, 0.0, 0.0])
-    already = _pad_state(0.0, 0.9)  # controller first seen with click_seq 1: adopt silently
+    already = _pad_state(0.0, 0.9)  # controller first seen with edge_seq 1: adopt silently
     rig.device(controller=already, click_action="switch_arm")
     rig.tick(3)
     assert rig.loop.active_arm == "arm0"
     nxt = _pad_state(0.0, 0.9, prev=_pad_state(0.0, 0.9, prev=already, click=False))
-    rig.controller, rig.click_action = nxt, "switch_arm"
+    rig.controller, rig.click_actions = nxt, ((nxt.edge_seq, "switch_arm"),)
     rig.sample([0.0, 0.0, 0.0], age=0.5, sticky=False)  # edge arrives on a stale sample
     rig.tick(2)
     assert rig.loop.active_arm == "arm0"  # dropped, counter adopted

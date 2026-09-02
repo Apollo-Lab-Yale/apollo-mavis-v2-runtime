@@ -24,6 +24,7 @@ from apollo_xarm7_core import (
     Command,
     CommandResult,
     CommandSource,
+    Pose,
     ProfileNotFoundError,
     ProfileStore,
     se3,
@@ -140,7 +141,7 @@ class ControlLoop:
         self._states: dict[str, ArmState] = {}
         self._teleop_seeded: set[str] = set()
         self._arm_source: dict[str, CommandSource] = {}  # per-arm last resolving source
-        self._click_seq_seen: int | None = None  # controller.click_seq adopted last tick
+        self._edge_seq_seen: int | None = None  # controller.edge_seq adopted last tick
         self._device_action: tuple[str, float] | None = None  # (label, show until)
         self._seeded = False
         self._plan_state: dict[str, str] = {}  # arm -> planning|executing|failed
@@ -366,24 +367,32 @@ class ControlLoop:
         """Held keys -> twist -> integrate -> IK -> q (04-runtime §6).
 
         ``held`` is the merged set (WS ∪ device); ``scale`` is the WS watchdog
-        scale, which governs the keyboard translate/rotate/rail keys (only WS
-        codes carry those). While ``tracker_clutch`` is held by ANY source the
-        tracker supplies the target instead (13-tracker §4) at the scale of
-        the source holding the clutch (``HeldSources.scale_for``, 13-tracker
-        §1.1): keyboard translate/rotate keys are ignored, rail (here) and
-        gripper (``_gripper_step``) keys keep working.
+        scale, which governs the keyboard translate/rotate keys (only WS codes
+        carry those). Rail codes are integrated per source at that source's
+        scale (``_rail_rate``, 13-tracker §1.1), so a device-held rail code
+        moves the rail without a browser and through a WS deadman latch. While
+        ``tracker_clutch`` is held by ANY source the tracker supplies the
+        target instead (13-tracker §4) at the scale of the source holding the
+        clutch (``HeldSources.scale_for``): keyboard translate/rotate keys are
+        ignored, rail (here) and gripper (``_gripper_step``) keys keep working.
+        A rail-only tick holds the joint posture (``q[:7] = q_last``, so the
+        TCP rides the rail; 04-runtime §6 "Rail") and integrates only the rail
+        slot; it never seeds the teleop integrator and it INVALIDATES an
+        existing seed, because the base slides under the frozen world-frame
+        target (13-tracker §4 re-seed rule (d)): the next translate or clutch
+        tick re-seeds from the measured TCP instead of stepping up to a leash
+        toward the stale target.
         """
         if self.ik is None or self.kin is None:
             return None
         clutch_scale = (
             self.sources.scale_for(TRACKER_CLUTCH_CODE) if self.tracker is not None else 0.0
         )
-        if scale <= 0.0 and clutch_scale <= 0.0:
-            return None  # every live source is latched/stale: hold (anchors clear in end_tick)
-        tw = held_to_twist(held, self.cfg.teleop)
-        rail_v = tw.rail_v * scale
         has_rail = state.q.shape[0] > 7
-        rail_moving = bool(rail_v and has_rail)
+        rail_v = self._rail_rate(self.sources) if has_rail else 0.0
+        rail_moving = rail_v != 0.0
+        if scale <= 0.0 and clutch_scale <= 0.0 and not rail_moving:
+            return None  # every live source is latched/stale: hold (anchors clear in end_tick)
         measured_tcp = self.kin.tcp_world(arm_id, state.q)
         if self.tracker is not None and TRACKER_CLUTCH_CODE in held:
             if clutch_scale > 0.0:
@@ -394,19 +403,28 @@ class ControlLoop:
             if target is None and not rail_moving:
                 return None  # no fresh valid sample: hold-last
         else:
+            tw = held_to_twist(held, self.cfg.teleop)  # translate/rotate: WS codes only
             v = tw.v * scale
             w = tw.w * scale
-            if not (np.any(v) or np.any(w) or rail_moving):
-                return None  # nothing held: non-active-style hold (no re-servo)
-            self._seed_teleop(arm_id, measured_tcp)
-            from apollo_xarm7_core import Twist
+            if np.any(v) or np.any(w):
+                self._seed_teleop(arm_id, measured_tcp)
+                from apollo_xarm7_core import Twist
 
-            tw_world = twist_to_control_frame(
-                Twist(v=v, w=w), self.kin.base_quat_world(arm_id), measured_tcp.orientation
-            )
-            target = self.integrator.step(arm_id, tw_world, self.dt, measured_tcp)
+                tw_world = twist_to_control_frame(
+                    Twist(v=v, w=w), self.kin.base_quat_world(arm_id), measured_tcp.orientation
+                )
+                target = self.integrator.step(arm_id, tw_world, self.dt, measured_tcp)
+            elif rail_moving:
+                target = None  # rail-only: joints hold, the rail slot integrates below
+            else:
+                return None  # nothing held: non-active-style hold (no re-servo)
         if target is None:
-            q = np.array(q_last)  # tracker unavailable: rail keys still integrate
+            q = np.array(q_last)  # rail-only / tracker unavailable: rail codes still integrate
+            # The rail carries the base while the world-frame target is frozen:
+            # drop the seed so the next driven tick re-seeds from the measured
+            # TCP (otherwise integrator.step / the clutch engage would command a
+            # leash-sized step toward the stale target).
+            self._teleop_seeded.discard(arm_id)
         else:
             q = self._solve_target(arm_id, target, q_last, measured_tcp)
             if q is None:
@@ -417,10 +435,26 @@ class ControlLoop:
             q[7] = min(max(base + rail_v * self.dt, 0.0), RAIL_TRAVEL_M)
         return q
 
+    def _rail_rate(self, sources: HeldSources) -> float:
+        """Rail rate (m/s) from the held rail codes, per source at that source's
+        scale (mirrors ``_gripper_step``): a device-held rail code moves the
+        rail while the WS deadman is latched or no browser is connected, and
+        stops within ``stale_s`` when the controller stream dies. The magnitude
+        is clamped to ``teleop.rail_mps`` so two sources holding the same
+        direction never exceed the configured speed."""
+        rail_v = 0.0
+        for code in sources.held:
+            rv = held_to_twist(frozenset({code}), self.cfg.teleop).rail_v
+            if rv != 0.0:
+                rail_v += rv * sources.scale_for(code)
+        v_max = abs(self.cfg.teleop.rail_mps)
+        return min(max(rail_v, -v_max), v_max)
+
     def _seed_teleop(self, arm_id: str, measured_tcp: Pose) -> None:
         """(Re-)seed the integrated target from the measured TCP the moment
         teleop motion input starts (keys / clutch), not on idle hold ticks: the
         seed is invalidated by ``_note_source`` after plan/jog/policy motion,
+        by a rail-only tick (``_teleop_step``, the base slid under the target),
         an arm switch and recovery, so the first driven tick has zero delta."""
         if arm_id not in self._teleop_seeded:
             self.integrator.seed(arm_id, measured_tcp)
@@ -436,16 +470,23 @@ class ControlLoop:
             if self.tracker is not None:
                 self.tracker.slip(target, measured_tcp)
             return None
-        if (
-            result.pos_err_m > self.cfg.residual_max_pos_m
-            or result.rot_err_rad > self.cfg.residual_max_rot_rad
-        ):
-            # Freeze the target back to the achieved pose (glide, don't wind up);
-            # the tracker anchor slips by the same truncation.
+        over_pos = result.pos_err_m > self.cfg.residual_max_pos_m
+        over_rot = result.rot_err_rad > self.cfg.residual_max_rot_rad
+        if over_pos or over_rot:
+            # Freeze the target back to the achieved pose (glide, don't wind up)
+            # COMPONENT-WISE (04-runtime §6): only the component whose residual
+            # is over threshold is re-anchored, so a rotation residual never
+            # moves the position anchor (the QP trades position for orientation
+            # under velocity saturation; slipping both leaked that transient
+            # into permanent TCP drift). The tracker anchor slips the same way.
             achieved = self.kin.tcp_world(arm_id, result.q)
-            self.integrator.reanchor(arm_id, achieved)
+            frozen = Pose(
+                achieved.position if over_pos else target.position,
+                achieved.orientation if over_rot else target.orientation,
+            )
+            self.integrator.reanchor(arm_id, frozen)
             if self.tracker is not None:
-                self.tracker.slip(target, achieved)
+                self.tracker.slip(target, frozen)
         return np.array(result.q)
 
     def _tracker_target(
@@ -453,13 +494,22 @@ class ControlLoop:
     ) -> Pose | None:
         """Clutched tracker target: the provider engages/anchors and clamps to
         the leash; the watchdog ``scale`` shrinks the per-tick step toward it
-        (not the hand<->arm offset)."""
+        (not the hand<->arm offset); then the step from the previous commanded
+        target is rate-limited to ``target_rate`` (04-runtime §6) so the IK
+        never runs into joint-velocity saturation. The rate-limit truncation is
+        NOT slipped into the anchor: the target catches up inside the leash,
+        and a ``tracker_settings`` change mid catch-up re-anchors to the
+        provider's leash-clamped target (rule (c)), not to the rate-limited
+        pose handed to IK here (``set_target`` feeds telemetry only)."""
         now = self._clock() if now is None else now
         prev = self.integrator.get(arm_id) or measured_tcp
         clamped = self.tracker.target(arm_id, measured_tcp, prev, now)
         if clamped is None:
             return None
-        target = interp_pose(prev, clamped, scale)
+        rate = self.cfg.target_rate
+        target = se3.clamp_pose_to_leash(
+            interp_pose(prev, clamped, scale), prev, rate.v_mps * self.dt, rate.w_radps * self.dt
+        )
         self.integrator.reanchor(arm_id, target)
         self.tracker.set_target(target)
         return target
@@ -490,20 +540,24 @@ class ControlLoop:
         return sample.held_codes, 1.0
 
     def _device_click_edge(self, sample, fresh: bool, now: float) -> None:
-        """Fire the discrete device action bound to a trackpad press edge
-        (13-tracker §1.1): ``controller.click_seq`` advanced since the last
-        tick => run ``sample.click_action`` (``switch_arm`` / ``switch_arm_prev``)
-        through the same handler as the WS action (same nacks). The first
-        observed counter is adopted silently; edges on a stale sample are dropped."""
+        """Fire the discrete device actions bound to controller press edges
+        (trackpad click / menu / grip, 13-tracker §1.1): ``controller.edge_seq``
+        advanced since the last tick => run every ``sample.click_actions`` entry
+        newer than the last seen counter (``switch_arm`` / ``switch_arm_prev``,
+        derived per remembered edge, oldest first — two buttons edging inside
+        one tick both fire) through the same handler as the WS action (same
+        nacks). The first observed counter is adopted silently; edges on a
+        stale sample are dropped."""
         ctl = sample.controller
         if ctl is None:
-            self._click_seq_seen = None
+            self._edge_seq_seen = None
             return
-        seen, self._click_seq_seen = self._click_seq_seen, ctl.click_seq
-        if seen is None or ctl.click_seq == seen or not fresh:
+        seen, self._edge_seq_seen = self._edge_seq_seen, ctl.edge_seq
+        if seen is None or ctl.edge_seq == seen or not fresh:
             return
-        if sample.click_action is not None:
-            self._fire_device_action(sample.click_action, now)
+        for seq, action in sample.click_actions:
+            if seq > seen:
+                self._fire_device_action(action, now)
 
     def _fire_device_action(self, name: str, now: float) -> CommandResult:
         res = self._handle_command(Command(op=name, source="internal"))

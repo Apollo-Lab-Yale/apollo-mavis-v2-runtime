@@ -1,8 +1,9 @@
 """13-tracker §4 e2e: the ``fake`` tracker backend on ``mavis_v2`` through a
 REAL uvicorn server — clutch via ``KeyC`` moves the EE, telemetry carries
 ``tracker.*`` pre-session and in-session, settings/switch_arm_prev ack, no
-ERROR logs. §1.1: a scripted controller state on the fake backend drives the EE
-and the gripper without any KeysMsg, even while the WS deadman is latched."""
+ERROR logs. §1.1: a scripted controller state on the fake backend drives the EE,
+the gripper and the rail without any KeysMsg, even while the WS deadman is
+latched; the menu button switches arms."""
 
 from __future__ import annotations
 
@@ -251,16 +252,25 @@ def test_controller_trigger_moves_ee_without_any_keysmsg(server, api, session, c
         p2 = tele.latest()["arms"][0]["ee_pose"]["position"]
         time.sleep(0.5)
         assert _dist(p2, tele.latest()["arms"][0]["ee_pose"]["position"]) < 2e-3
-        # Trackpad click right / left / inside the deadzone -> KeyH / KeyF / nothing;
-        # each click is classified at its press edge, so release in between.
+        # Trackpad click right / left / inside the deadzone -> ArrowRight / ArrowLeft /
+        # nothing; each click is classified at its press edge, so release in between.
+        # The rail codes drive the rail of the active (view) arm with no /ws/control client.
+        r0 = tele.latest()["arms"][0]["rail_pos_m"]
         script["state"] = _pad(x=0.9)
-        trk = _wait_tracker(tele, lambda t: t["device_held"] == ["KeyH"])
-        assert trk["device_held"] == ["KeyH"] and trk["controller"]["trackpad_click"] is True
+        trk = _wait_tracker(tele, lambda t: t["device_held"] == ["ArrowRight"])
+        assert trk["device_held"] == ["ArrowRight"] and trk["controller"]["trackpad_click"]
+        time.sleep(0.5)
+        r1 = tele.latest()["arms"][0]["rail_pos_m"]
+        assert r1 > r0 + 0.02, (r0, r1)  # 0.10 m/s while held
         script["state"] = _pad(x=0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
+        time.sleep(0.3)
+        r2 = tele.latest()["arms"][0]["rail_pos_m"]
         script["state"] = _pad(x=-0.9)
-        trk = _wait_tracker(tele, lambda t: t["device_held"] == ["KeyF"])
-        assert trk["device_held"] == ["KeyF"] and trk["controller"]["trackpad_x"] == -0.9
+        trk = _wait_tracker(tele, lambda t: t["device_held"] == ["ArrowLeft"])
+        assert trk["device_held"] == ["ArrowLeft"] and trk["controller"]["trackpad_x"] == -0.9
+        time.sleep(0.5)
+        assert tele.latest()["arms"][0]["rail_pos_m"] < r2 - 0.02
         script["state"] = _pad(x=-0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
         script["state"] = _pad(x=0.1, y=0.1)
@@ -293,7 +303,7 @@ def test_controller_codes_survive_ws_deadman_latch(server, api, session):
         assert msg["active_arm"] == "grip"
         p0 = msg["arms"][1]["ee_pose"]["position"]
         g0 = msg["arms"][1]["gripper_open_frac"]
-        script["state"] = _pad(x=-1.0, trigger=True)  # trigger click + trackpad left
+        script["state"] = _pad(y=-1.0, trigger=True)  # trigger click + trackpad down
         trk = _wait_tracker(tele, lambda t: t["engaged_arm"] == "grip")
         assert sorted(trk["device_held"]) == ["KeyC", "KeyF"]
         time.sleep(1.5)
@@ -310,8 +320,8 @@ def test_controller_codes_survive_ws_deadman_latch(server, api, session):
         tele.close()
 
 
-# -- 13-tracker §1.1 remap + §4 filter: trackpad left/right gripper, up/down arm switch ----------
-def test_trackpad_click_gripper_only_on_grip_arm_and_up_switches_arm(server, api, session):
+# -- 13-tracker §1.1 remap: trackpad up/down gripper, left/right rail, menu arm switch --------
+def test_trackpad_click_gripper_only_on_grip_arm_and_menu_switches_arm(server, api, session):
     script = _script_controller(server)
     tele = Tele(server)
     try:
@@ -320,45 +330,45 @@ def test_trackpad_click_gripper_only_on_grip_arm_and_up_switches_arm(server, api
         script["state"] = _pad(click=False)  # pad touched, not clicked: controller adopted
         _wait_tracker(tele, lambda t: t["controller"] is not None)
         g_grip0 = msg["arms"][1]["gripper_open_frac"]
-        script["state"] = _pad(x=-0.9)  # left -> gripper_close (held)
+        script["state"] = _pad(y=-0.9)  # down -> gripper_close (held)
         trk = _wait_tracker(tele, lambda t: t["device_held"] == ["KeyF"])
         assert trk["device_action"] is None
         time.sleep(0.6)
         msg = tele.latest()
         assert msg["active_arm"] == "view"
         assert msg["arms"][1]["gripper_open_frac"] == pytest.approx(g_grip0, abs=0.01)  # no cmd
-        script["state"] = _pad(x=-0.9, click=False)
+        script["state"] = _pad(y=-0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
-        # Trackpad up: switch_arm fires once on the press edge -> grip arm, latched ~1 s.
-        script["state"] = _pad(y=0.9)
+        # Menu press: switch_arm fires once on the press edge -> grip arm, latched ~1 s.
+        script["state"] = ControllerState(menu=True)
         trk = _wait_tracker(tele, lambda t: t["device_action"] == "switch_arm")
-        assert trk["device_held"] == []
+        assert trk["device_held"] == [] and trk["controller"]["menu"] is True
         time.sleep(0.5)
         msg = tele.latest()
         assert msg["active_arm"] == "grip" and msg["tracker"]["device_action"] == "switch_arm"
-        script["state"] = _pad(y=0.9, click=False)
+        script["state"] = ControllerState()  # menu released
         trk = _wait_tracker(tele, lambda t: t["device_action"] is None, timeout_s=2.5)
         assert trk["device_action"] is None and tele.latest()["active_arm"] == "grip"
-        # Now the gripper codes act: left closes ...
+        # Now the gripper codes act: down closes ...
         g0 = tele.latest()["arms"][1]["gripper_open_frac"]
-        script["state"] = _pad(x=-0.9)
+        script["state"] = _pad(y=-0.9)
         _wait_tracker(tele, lambda t: t["device_held"] == ["KeyF"])
         time.sleep(0.6)
         g1 = tele.latest()["arms"][1]["gripper_open_frac"]
         assert g1 < g0 - 0.4  # 1.2/s while held
-        script["state"] = _pad(x=-0.9, click=False)
+        script["state"] = _pad(y=-0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
-        # ... and right (x dominant even with some y) opens again.
-        script["state"] = _pad(x=0.9, y=0.4)
+        # ... and up (y dominant even with some x) opens again.
+        script["state"] = _pad(x=0.4, y=0.9)
         _wait_tracker(tele, lambda t: t["device_held"] == ["KeyH"])
         time.sleep(0.6)
         g2 = tele.latest()["arms"][1]["gripper_open_frac"]
         assert g2 > g1 + 0.1  # sim gripper opens slower than it closes; direction is the point
-        script["state"] = _pad(x=0.9, click=False)
+        script["state"] = _pad(y=0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
-        # Trackpad down -> switch_arm_prev (wraps back to view).
-        script["state"] = _pad(y=-0.9)
-        trk = _wait_tracker(tele, lambda t: t["device_action"] == "switch_arm_prev")
+        # Menu again -> switch_arm wraps back to view (arm_prev has no controller binding).
+        script["state"] = ControllerState(menu=True)
+        trk = _wait_tracker(tele, lambda t: t["device_action"] == "switch_arm")
         time.sleep(0.2)
         assert tele.latest()["active_arm"] == "view"
         script["state"] = None

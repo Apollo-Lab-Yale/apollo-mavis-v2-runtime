@@ -1,11 +1,13 @@
 """Vive-controller inputs in the tracker reader (13-tracker §1.1): libsurvive
 button/touch/axis event parsing with synthetic pysurvive-like structs (no
 pysurvive import), trackpad click classification (dominant axis, deadzone,
-fixed at the press edge), ``held_codes`` / ``click_action`` derivation (map,
-``none``, validation), edge re-publish, the fake backend's scripted controller
-hook, and the libsurvive event loop driven by a stub ``ps`` module incl. the
-robustness rules (bad events, error-vs-searching status, rate decay, log rate
-limit, auto-restart)."""
+fixed at the press edge), press-edge accounting (the ``edges`` history with
+``edge_seq`` / ``edge_input`` over the trackpad, menu and grip buttons),
+``held_codes`` / ``click_actions`` derivation (map, ``none``, validation), edge
+re-publish (never refreshing the pose's age / rate / status), the fake backend's
+scripted controller hook, and the libsurvive event loop driven by a stub ``ps``
+module incl. the robustness rules (bad events, error-vs-searching status, rate
+decay, log rate limit, auto-restart)."""
 
 from __future__ import annotations
 
@@ -21,7 +23,12 @@ from apollo_xarm7_core import LatestSlot, Pose
 from apollo_xarm7_core.protocol import KEYMAP
 
 import apollo_xarm7_runtime.devices.tracker as tracker_mod
-from apollo_xarm7_runtime.config import ControllerMapConfig, TrackerConfig
+from apollo_xarm7_runtime.config import (
+    CONTROLLER_DISCRETE_ACTIONS,
+    CONTROLLER_HELD_ACTIONS,
+    ControllerMapConfig,
+    TrackerConfig,
+)
 from apollo_xarm7_runtime.devices.tracker import (
     AXIS_TRACKPAD_X,
     AXIS_TRACKPAD_Y,
@@ -32,6 +39,8 @@ from apollo_xarm7_runtime.devices.tracker import (
     BUTTON_TRACKPAD,
     BUTTON_TRIGGER,
     CLUTCH_CODE,
+    DISCRETE_ACTIONS,
+    EDGE_HISTORY,
     EVENT_AXIS_CHANGED,
     EVENT_BUTTON_DOWN,
     EVENT_BUTTON_UP,
@@ -39,14 +48,18 @@ from apollo_xarm7_runtime.devices.tracker import (
     EVENT_TOUCH_UP,
     GRIPPER_CLOSE_CODE,
     GRIPPER_OPEN_CODE,
+    HELD_ACTION_CODES,
+    RAIL_NEG_CODE,
+    RAIL_POS_CODE,
     ControllerState,
     TrackerReader,
     active_inputs,
     apply_button_event,
-    classify_click,
     classify_trackpad,
     derive_click_action,
+    derive_click_actions,
     derive_held_codes,
+    note_edges,
 )
 
 IDENT = np.array([1.0, 0.0, 0.0, 0.0])
@@ -61,7 +74,9 @@ def test_injected_codes_come_from_the_keymap_not_letters():
     assert CLUTCH_CODE == _code("tracker_clutch")
     assert GRIPPER_OPEN_CODE == _code("gripper_open")
     assert GRIPPER_CLOSE_CODE == _code("gripper_close")
-    assert len({CLUTCH_CODE, GRIPPER_OPEN_CODE, GRIPPER_CLOSE_CODE}) == 3
+    assert RAIL_NEG_CODE == _code("rail_neg") and RAIL_POS_CODE == _code("rail_pos")
+    codes = {CLUTCH_CODE, GRIPPER_OPEN_CODE, GRIPPER_CLOSE_CODE, RAIL_NEG_CODE, RAIL_POS_CODE}
+    assert len(codes) == 5
 
 
 # -- event parsing ------------------------------------------------------------------------
@@ -84,7 +99,8 @@ def test_button_touch_and_axis_events_fold_into_state():
     assert (s.trackpad_x, s.trackpad_y) == (pytest.approx(-0.2), pytest.approx(0.8))
     s = _ev(s, EVENT_BUTTON_DOWN, BUTTON_TRACKPAD)
     assert s.trackpad_click and s.trackpad_touch
-    assert s.click_seq == 0 and s.click_dir is None  # raw: classify_click adds these
+    assert s.edge_seq == 0 and s.edge_input is None  # raw: note_edges adds these
+    assert s.trackpad_dir is None
     s = _ev(s, EVENT_BUTTON_UP, BUTTON_TRACKPAD)
     s = _ev(s, EVENT_TOUCH_UP, BUTTON_TRACKPAD)
     assert not s.trackpad_click and not s.trackpad_touch
@@ -110,7 +126,12 @@ def _pad(x: float = 0.0, y: float = 0.0, click: bool = True, trigger: bool = Fal
 
 def _click(x: float, y: float, prev=None, **kw) -> ControllerState:
     """Classified state after a press edge at (x, y)."""
-    return classify_click(prev, _pad(x, y, **kw), DZ)
+    return note_edges(prev, _pad(x, y, **kw), DZ)
+
+
+def _btn(prev=None, **fields) -> ControllerState:
+    """State with the given buttons (menu / grip / trigger...) passed through note_edges."""
+    return note_edges(prev, ControllerState(**fields), DZ)
 
 
 @pytest.mark.parametrize(
@@ -137,31 +158,140 @@ def test_classify_trackpad_honours_custom_deadzone():
 
 def test_click_classified_once_at_press_edge_and_held_until_release():
     s1 = _click(0.9, 0.0)  # press edge at the right
-    assert s1.click_seq == 1 and s1.click_dir == "trackpad_right"
-    assert active_inputs(s1) == {"trackpad_right"}
-    s2 = classify_click(s1, _pad(0.0, 0.9), DZ)  # finger slides to the top while clicked
-    assert s2.click_seq == 1 and s2.click_dir == "trackpad_right"  # classification held
+    assert s1.edge_seq == 1 and s1.edge_input == "trackpad_right"
+    assert s1.trackpad_dir == "trackpad_right" and active_inputs(s1) == {"trackpad_right"}
+    s2 = note_edges(s1, _pad(0.0, 0.9), DZ)  # finger slides to the top while clicked
+    assert s2.edge_seq == 1 and s2.trackpad_dir == "trackpad_right"  # classification held
     assert active_inputs(s2) == {"trackpad_right"}
-    s3 = classify_click(s2, _pad(0.0, 0.9, click=False), DZ)  # release
-    assert not s3.trackpad_click and s3.click_seq == 1 and s3.click_dir == "trackpad_right"
+    s3 = note_edges(s2, _pad(0.0, 0.9, click=False), DZ)  # release
+    assert not s3.trackpad_click and s3.edge_seq == 1 and s3.edge_input == "trackpad_right"
     assert active_inputs(s3) == frozenset()  # released: nothing held
-    s4 = classify_click(s3, _pad(0.0, -0.9), DZ)  # new press at the bottom
-    assert s4.click_seq == 2 and s4.click_dir == "trackpad_down"
-    s5 = classify_click(s4, _pad(0.0, -0.9, click=False), DZ)
-    s6 = classify_click(s5, _pad(0.1, 0.1), DZ)  # press inside the deadzone: ignored
-    assert s6.click_seq == 3 and s6.click_dir is None and active_inputs(s6) == frozenset()
-    s7 = classify_click(s6, _pad(0.9, 0.0), DZ)  # slides out afterwards: still ignored
-    assert s7.click_seq == 3 and s7.click_dir is None and active_inputs(s7) == frozenset()
-    # Trigger is independent of the pad; a raw (never classified) click holds nothing.
+    s4 = note_edges(s3, _pad(0.0, -0.9), DZ)  # new press at the bottom
+    assert s4.edge_seq == 2 and s4.edge_input == "trackpad_down" == s4.trackpad_dir
+    s5 = note_edges(s4, _pad(0.0, -0.9, click=False), DZ)
+    s6 = note_edges(s5, _pad(0.1, 0.1), DZ)  # press inside the deadzone: counted, unclassified
+    assert s6.edge_seq == 3 and s6.edge_input is None and s6.trackpad_dir is None
+    assert active_inputs(s6) == frozenset()
+    s7 = note_edges(s6, _pad(0.9, 0.0), DZ)  # slides out afterwards: still ignored
+    assert s7.edge_seq == 3 and s7.edge_input is None and active_inputs(s7) == frozenset()
+    # Trigger is independent of the pad and registers no edge; a raw (never
+    # classified) click holds nothing.
     assert active_inputs(_pad(0.9, 0.0, trigger=True)) == {"trigger_click"}
-    assert active_inputs(classify_click(None, _pad(0.9, 0.0, trigger=True), DZ)) == {
-        "trigger_click", "trackpad_right"
-    }
+    t = note_edges(None, _pad(0.9, 0.0, trigger=True), DZ)
+    assert active_inputs(t) == {"trigger_click", "trackpad_right"} and t.edge_seq == 1
+    assert _btn(trigger_pressed=True).edge_seq == 0
     # A scripted state arriving with prev=None while already clicked counts as a press edge.
-    assert classify_click(None, _pad(0.0, 0.9), DZ).click_seq == 1
+    assert note_edges(None, _pad(0.0, 0.9), DZ).edge_seq == 1
     # Unclicked states carry the previous accounting and never classify.
-    s8 = classify_click(s7, ControllerState(trigger_pressed=True), DZ)
-    assert s8.click_seq == 3 and s8.click_dir is None
+    s8 = note_edges(s7, ControllerState(trigger_pressed=True), DZ)
+    assert s8.edge_seq == 3 and s8.edge_input is None
+
+
+def test_menu_and_grip_press_edges_advance_edge_seq_and_keep_trackpad_dir():
+    m1 = _btn(menu=True)
+    assert m1.edge_seq == 1 and m1.edge_input == "menu_click"
+    assert active_inputs(m1) == {"menu_click"}
+    m2 = note_edges(m1, ControllerState(menu=True), DZ)  # held: no new edge
+    assert m2.edge_seq == 1 and active_inputs(m2) == {"menu_click"}
+    m3 = note_edges(m2, ControllerState(), DZ)  # release: accounting carried
+    assert m3.edge_seq == 1 and m3.edge_input == "menu_click" and active_inputs(m3) == set()
+    g1 = note_edges(m3, ControllerState(grip=True), DZ)
+    assert g1.edge_seq == 2 and g1.edge_input == "grip_click"
+    assert active_inputs(g1) == {"grip_click"}
+    # Menu pressed while the pad is clicked: newest edge is the menu, the pad
+    # classification is carried so its held code keeps flowing.
+    up = _click(0.0, 0.9)
+    both = note_edges(
+        up, ControllerState(trackpad_touch=True, trackpad_click=True, trackpad_y=0.9, menu=True), DZ
+    )
+    assert both.edge_seq == 2 and both.edge_input == "menu_click"
+    assert both.trackpad_dir == "trackpad_up"
+    assert active_inputs(both) == {"trackpad_up", "menu_click"}
+    # The system button never registers an edge nor an input.
+    sysb = _btn(system=True)
+    assert sysb.edge_seq == 0 and sysb.edge_input is None and active_inputs(sysb) == set()
+    # Simultaneous edges (scripted) each count; the order trackpad, menu, grip resolves.
+    multi = note_edges(None, ControllerState(trackpad_click=True, trackpad_y=0.9, menu=True), DZ)
+    assert multi.edge_seq == 2 and multi.edge_input == "menu_click"
+    assert multi.trackpad_dir == "trackpad_up"
+    assert multi.edges == ((1, "trackpad_up"), (2, "menu_click"))
+
+
+def test_edge_history_is_lossless_up_to_edge_history_entries():
+    cfg = TrackerConfig(controller_map=ControllerMapConfig(arm_prev="grip_click"))
+    m = _btn(menu=True)
+    g = note_edges(m, ControllerState(menu=True, grip=True), DZ)  # grip edges while menu is down
+    assert g.edges == ((1, "menu_click"), (2, "grip_click"))
+    assert (g.edge_seq, g.edge_input) == (2, "grip_click")
+    assert derive_click_actions(g, cfg) == ((1, "switch_arm"), (2, "switch_arm_prev"))
+    assert derive_click_actions(g, TrackerConfig()) == ((1, "switch_arm"),)  # grip unbound
+    assert derive_click_action(g, TrackerConfig()) is None  # newest edge only
+    assert derive_click_actions(None, cfg) == ()
+    assert derive_click_actions(ControllerState(), cfg) == ()
+    # Released / held states carry the history; a deadzone click appends (seq, None).
+    r = note_edges(g, ControllerState(), DZ)
+    assert r.edges == g.edges and derive_click_actions(r, cfg) == derive_click_actions(g, cfg)
+    d = note_edges(r, _pad(0.1, 0.1), DZ)
+    assert d.edges[-1] == (3, None) and derive_click_actions(d, cfg)[-1] == (2, "switch_arm_prev")
+    # The history is bounded: only the newest EDGE_HISTORY edges are kept, seq stays absolute.
+    st, prev = None, None
+    for i in range(EDGE_HISTORY + 4):
+        st = note_edges(prev, ControllerState(menu=(i % 2 == 0)), DZ)
+        prev = st
+    presses = (EDGE_HISTORY + 4 + 1) // 2
+    assert st.edge_seq == presses and len(st.edges) == min(presses, EDGE_HISTORY)
+    assert st.edges[0][0] == presses - len(st.edges) + 1 and st.edges[-1][0] == presses
+    assert all(inp == "menu_click" for _, inp in st.edges)
+
+
+def test_controller_map_action_tables_agree_across_config_and_reader():
+    # config.CONTROLLER_*_ACTIONS is the single list of action names; the reader's
+    # code / action tables and the ControllerMapConfig fields must match it exactly
+    # (both modules raise at import time otherwise).
+    assert tuple(HELD_ACTION_CODES) == CONTROLLER_HELD_ACTIONS
+    assert tuple(DISCRETE_ACTIONS) == CONTROLLER_DISCRETE_ACTIONS
+    assert set(ControllerMapConfig.model_fields) == set(CONTROLLER_HELD_ACTIONS) | set(
+        CONTROLLER_DISCRETE_ACTIONS
+    )
+    assert not hasattr(__import__("apollo_xarm7_runtime.config", fromlist=["x"]), "TRACKPAD_INPUTS")
+
+
+# -- controller_map config ----------------------------------------------------------------------
+def test_controller_map_defaults_match_spec():
+    assert ControllerMapConfig().model_dump() == {
+        "clutch": "trigger_click",
+        "gripper_open": "trackpad_up",
+        "gripper_close": "trackpad_down",
+        "rail_neg": "trackpad_left",
+        "rail_pos": "trackpad_right",
+        "arm_next": "menu_click",
+        "arm_prev": "none",
+    }
+    assert TrackerConfig().trackpad_deadzone == 0.3
+
+
+def test_controller_map_validation():
+    with pytest.raises(ValueError, match="trigger_click"):
+        ControllerMapConfig(clutch="none", arm_next="trigger_click")  # held-only input
+    with pytest.raises(ValueError, match="held-only"):
+        ControllerMapConfig(clutch="none", arm_prev="trigger_click")
+    with pytest.raises(ValueError, match="more than one"):
+        ControllerMapConfig(gripper_open="trackpad_left")  # clashes with rail_neg default
+    with pytest.raises(ValueError, match="more than one"):
+        ControllerMapConfig(arm_prev="menu_click")  # clashes with arm_next default
+    with pytest.raises(ValueError):
+        ControllerMapConfig(clutch="system")  # system is not bindable
+    with pytest.raises(ValueError):
+        ControllerMapConfig(clutch="grip")  # not an input name
+    # Discrete actions accept menu / grip / trackpad; held actions accept menu / grip too.
+    ok = ControllerMapConfig(arm_next="menu_click", arm_prev="grip_click")
+    assert ok.arm_prev == "grip_click"
+    ok = ControllerMapConfig(arm_next="trackpad_left", rail_neg="none")
+    assert ok.arm_next == "trackpad_left"
+    ok = ControllerMapConfig(clutch="grip_click", arm_next="none", gripper_open="menu_click")
+    assert ok.clutch == "grip_click" and ok.gripper_open == "menu_click"
+    all_none = ControllerMapConfig(**{k: "none" for k in ControllerMapConfig.model_fields})
+    assert set(all_none.model_dump().values()) == {"none"}
 
 
 # -- held_codes / click_action derivation -----------------------------------------------------
@@ -171,54 +301,81 @@ def test_derive_held_codes_and_click_action_defaults():
     assert derive_held_codes(ControllerState(), cfg) == frozenset()
     assert derive_held_codes(ControllerState(trigger_pressed=True), cfg) == {CLUTCH_CODE}
     assert derive_held_codes(ControllerState(trigger=0.9), cfg) == frozenset()  # analog only
-    assert derive_held_codes(_click(0.9, 0.0), cfg) == {GRIPPER_OPEN_CODE}  # right
-    assert derive_held_codes(_click(-0.9, 0.0), cfg) == {GRIPPER_CLOSE_CODE}  # left
-    assert derive_held_codes(_click(0.0, 0.9), cfg) == frozenset()  # up: discrete only
-    assert derive_held_codes(_click(0.0, -0.9), cfg) == frozenset()  # down: discrete only
+    assert derive_held_codes(_click(-0.9, 0.0), cfg) == {RAIL_NEG_CODE}  # left -> ArrowLeft
+    assert derive_held_codes(_click(0.9, 0.0), cfg) == {RAIL_POS_CODE}  # right -> ArrowRight
+    assert derive_held_codes(_click(0.0, 0.9), cfg) == {GRIPPER_OPEN_CODE}  # up -> KeyH
+    assert derive_held_codes(_click(0.0, -0.9), cfg) == {GRIPPER_CLOSE_CODE}  # down -> KeyF
     assert derive_held_codes(_click(0.2, 0.2), cfg) == frozenset()  # deadzone
     assert derive_held_codes(_pad(0.9, 0.0), cfg) == frozenset()  # raw, never classified
     assert derive_held_codes(_pad(0.9, 0.0, click=False), cfg) == frozenset()  # touch only
-    assert derive_held_codes(ControllerState(grip=True, menu=True, system=True), cfg) == set()
-    both = _click(-0.9, 0.0, trigger=True)
+    assert derive_held_codes(_btn(menu=True), cfg) == frozenset()  # menu: discrete only
+    assert derive_held_codes(_btn(grip=True, system=True), cfg) == frozenset()  # unbound
+    both = _click(0.0, -0.9, trigger=True)
     assert derive_held_codes(both, cfg) == {CLUTCH_CODE, GRIPPER_CLOSE_CODE}
-    assert derive_click_action(_click(0.0, 0.9), cfg) == "switch_arm"
-    assert derive_click_action(_click(0.0, -0.9), cfg) == "switch_arm_prev"
-    assert derive_click_action(_click(0.9, 0.0), cfg) is None  # held binding, not discrete
+    assert derive_click_action(_btn(menu=True), cfg) == "switch_arm"
+    assert derive_click_action(_btn(grip=True), cfg) is None  # grip unbound by default
+    for held_only in (_click(0.0, 0.9), _click(0.0, -0.9), _click(-0.9, 0.0), _click(0.9, 0.0)):
+        assert derive_click_action(held_only, cfg) is None  # held bindings, not discrete
     assert derive_click_action(_click(0.2, 0.2), cfg) is None
     assert derive_click_action(None, cfg) is None
-    # The classification (and thus the action) persists after release for edge accounting.
-    released = classify_click(_click(0.0, 0.9), _pad(0.0, 0.9, click=False), DZ)
+    # The edge accounting (and thus the action) persists after release.
+    released = note_edges(_btn(menu=True), ControllerState(), DZ)
     assert derive_click_action(released, cfg) == "switch_arm"
     assert derive_held_codes(released, cfg) == frozenset()
     dz = TrackerConfig(trackpad_deadzone=0.5)
-    assert derive_held_codes(classify_click(None, _pad(0.4, 0.0), 0.5), dz) == frozenset()
+    assert derive_held_codes(note_edges(None, _pad(0.4, 0.0), 0.5), dz) == frozenset()
 
 
-def test_derive_honours_map_none_and_validation():
+def test_derive_click_edge_examples_and_deadzone_counts():
+    cfg = TrackerConfig()
+    left, right = _click(-0.9, 0.0), _click(0.9, 0.0)
+    assert derive_held_codes(left, cfg) == {"ArrowLeft"} == {RAIL_NEG_CODE}
+    assert derive_held_codes(right, cfg) == {"ArrowRight"} == {RAIL_POS_CODE}
+    up, down = _click(0.0, 0.9), _click(0.0, -0.9)
+    assert derive_held_codes(up, cfg) == {"KeyH"} and derive_held_codes(down, cfg) == {"KeyF"}
+    dead = note_edges(_click(0.9, 0.0, prev=None), _pad(0.1, 0.1, click=False), DZ)
+    dead = note_edges(dead, _pad(0.1, 0.1), DZ)  # second press, inside the deadzone
+    assert dead.edge_seq == 2 and dead.edge_input is None
+    assert derive_held_codes(dead, cfg) == frozenset()
+    assert derive_click_action(dead, cfg) is None
+
+
+def test_derive_honours_custom_map_and_none():
     cfg = TrackerConfig(
         controller_map=ControllerMapConfig(
-            clutch="trackpad_left", gripper_open="none", gripper_close="trigger_click",
-            arm_next="trackpad_right", arm_prev="none",
+            clutch="grip_click",
+            gripper_open="none",
+            gripper_close="trigger_click",
+            rail_neg="none",
+            rail_pos="menu_click",
+            arm_next="trackpad_right",
+            arm_prev="trackpad_down",
         )
     )
-    assert derive_held_codes(_click(-0.9, 0.0), cfg) == {CLUTCH_CODE}
+    assert derive_held_codes(_btn(grip=True), cfg) == {CLUTCH_CODE}
     assert derive_held_codes(ControllerState(trigger_pressed=True), cfg) == {GRIPPER_CLOSE_CODE}
-    assert derive_held_codes(_click(0.0, 0.9), cfg) == frozenset()
+    assert derive_held_codes(_btn(menu=True), cfg) == {RAIL_POS_CODE}
+    assert derive_held_codes(_click(0.0, 0.9), cfg) == frozenset()  # gripper_open unbound
+    assert derive_held_codes(_click(-0.9, 0.0), cfg) == frozenset()  # rail_neg unbound
+    assert derive_held_codes(_click(0.9, 0.0), cfg) == frozenset()  # right is discrete here
     assert derive_click_action(_click(0.9, 0.0), cfg) == "switch_arm"
-    assert derive_click_action(_click(0.0, -0.9), cfg) is None
-    off = TrackerConfig(controller_map=ControllerMapConfig(
-        clutch="none", gripper_open="none", gripper_close="none", arm_next="none", arm_prev="none"
-    ))
+    assert derive_click_action(_click(0.0, -0.9), cfg) == "switch_arm_prev"
+    assert derive_click_action(_btn(menu=True), cfg) is None  # menu is a held binding here
+    assert derive_click_action(_btn(grip=True), cfg) is None
+    off = TrackerConfig(
+        controller_map=ControllerMapConfig(
+            clutch="none",
+            gripper_open="none",
+            gripper_close="none",
+            rail_neg="none",
+            rail_pos="none",
+            arm_next="none",
+            arm_prev="none",
+        )
+    )
     assert derive_held_codes(_click(0.9, 0.0, trigger=True), off) == frozenset()
-    assert derive_click_action(_click(0.0, 0.9), off) is None
-    with pytest.raises(ValueError):
-        ControllerMapConfig(clutch="grip")  # grip/menu/system are not bindable
-    with pytest.raises(ValueError, match="trackpad"):
-        ControllerMapConfig(clutch="none", arm_next="trigger_click")  # discrete: trackpad only
-    with pytest.raises(ValueError, match="more than one"):
-        ControllerMapConfig(gripper_open="trackpad_up")  # clashes with arm_next default
-    with pytest.raises(ValueError, match="more than one"):
-        ControllerMapConfig(gripper_close="trackpad_right")  # clashes with gripper_open
+    assert derive_held_codes(_btn(menu=True, grip=True), off) == frozenset()
+    assert derive_click_action(_btn(menu=True), off) is None
 
 
 # -- reader: state, edge re-publish, status ---------------------------------------------------
@@ -245,7 +402,7 @@ def test_button_edge_republishes_last_pose_with_codes():
     reader._publish(Pose(np.array([0.1, 0.2, 0.3]), IDENT), np.zeros(3), np.zeros(3), 0.0)
     s1 = slot.get()[0]
     assert s1.controller == pressed and s1.held_codes == {CLUTCH_CODE} and s1.seq == 1
-    assert s1.click_action is None
+    assert s1.click_actions == ()
     assert reader.status().device_held == {CLUTCH_CODE}
     # Same buttons, analog change only: no edge, no re-publish.
     assert reader._on_controller(ControllerState(trigger=0.7, trigger_pressed=True)) is False
@@ -260,21 +417,32 @@ def test_button_edge_republishes_last_pose_with_codes():
     # Trackpad touch alone is an edge (telemetry), but injects no code.
     assert reader._on_controller(_pad(0.9, 0.0, click=False)) is True
     assert slot.get()[0].held_codes == frozenset()
-    # Trackpad click at the top: classified up -> discrete switch_arm, no held code.
+    # Trackpad click at the top: classified up -> gripper_open held, no discrete action.
     assert reader._on_controller(_pad(0.0, 0.9)) is True
     s3 = slot.get()[0]
-    assert s3.controller.click_seq == 1 and s3.controller.click_dir == "trackpad_up"
-    assert s3.held_codes == frozenset() and s3.click_action == "switch_arm"
+    assert s3.controller.edge_seq == 1 and s3.controller.edge_input == "trackpad_up"
+    assert s3.controller.trackpad_dir == "trackpad_up"
+    assert s3.held_codes == {GRIPPER_OPEN_CODE} and s3.click_actions == ()
     assert reader._on_controller(_pad(0.0, 0.9, click=False)) is True  # release edge
-    assert slot.get()[0].click_action == "switch_arm"  # persists for edge accounting
+    assert slot.get()[0].held_codes == frozenset() and slot.get()[0].click_actions == ()
+    # Menu press edge: discrete switch_arm, no held code.
+    assert reader._on_controller(ControllerState(menu=True)) is True
+    s4 = slot.get()[0]
+    assert s4.controller.edge_seq == 2 and s4.controller.edge_input == "menu_click"
+    assert s4.held_codes == frozenset() and s4.click_actions == ((2, "switch_arm"),)
+    assert reader._on_controller(ControllerState()) is True  # release edge
+    assert slot.get()[0].click_actions == ((2, "switch_arm"),)  # persists for edge accounting
     # Pose older than stale_s at the edge: codes still ride along, pose flagged invalid.
     clock.t += 1.0
-    assert reader._on_controller(_pad(-0.9, 0.0)) is True  # left -> gripper_close
+    assert reader._on_controller(_pad(-0.9, 0.0)) is True  # left -> rail_neg
     s5 = slot.get()[0]
-    assert s5.valid is False and s5.held_codes == {GRIPPER_CLOSE_CODE}
-    assert s5.controller.click_seq == 2 and s5.click_action is None
-    assert reader.status().device_held == {GRIPPER_CLOSE_CODE}  # fresh by rx_mono
+    assert s5.valid is False and s5.held_codes == {RAIL_NEG_CODE}
+    assert s5.controller.edge_seq == 3 and s5.click_actions == ((2, "switch_arm"),)
+    assert reader.status().device_held == {RAIL_NEG_CODE}  # fresh by the SAMPLE's rx_mono
     assert reader.status(clock.t + 0.5).device_held == frozenset()  # stale -> nothing
+    st = reader.status()  # ... but the POSE is 1.05 s old: the edge did not refresh it
+    assert st.status == "stale" and st.age_s == pytest.approx(1.05)
+    assert "older than" in st.detail and "jump" not in st.detail
 
 
 def test_on_button_event_reads_pysurvive_like_struct():
@@ -306,9 +474,70 @@ def test_on_button_event_reads_pysurvive_like_struct():
     )
     reader._on_button_event(be3)
     s3 = slot.get()[0]
-    assert s3.seq == 3 and s3.controller.click_seq == 1
-    assert s3.controller.click_dir == "trackpad_down" and s3.click_action == "switch_arm_prev"
-    assert s3.held_codes == {CLUTCH_CODE}  # trigger still held; down injects no code
+    assert s3.seq == 3 and s3.controller.edge_seq == 1
+    assert s3.controller.edge_input == "trackpad_down" and s3.click_actions == ()
+    assert s3.held_codes == {CLUTCH_CODE, GRIPPER_CLOSE_CODE}  # trigger still held; down = KeyF
+    # Menu press: discrete switch_arm rides on the re-published sample.
+    be4 = SimpleNamespace(
+        time=1.8, object=object(), event_type=EVENT_BUTTON_DOWN, button_id=BUTTON_MENU,
+        axis_count=0, axis_ids=[0] * 8, axis_val=[0.0] * 8,
+    )
+    reader._on_button_event(be4)
+    s4 = slot.get()[0]
+    assert s4.seq == 4 and s4.controller.edge_seq == 2 and s4.controller.menu
+    assert s4.controller.edge_input == "menu_click" and s4.click_actions == ((2, "switch_arm"),)
+    assert s4.held_codes == {CLUTCH_CODE, GRIPPER_CLOSE_CODE}  # pad classification carried
+    # Grip DOWN 3 ms after the menu: the slot holds only the grip sample, whose
+    # click_actions still carry the bound menu edge (lossless within a tick).
+    clock.t += 0.003
+    be5 = SimpleNamespace(
+        time=1.803, object=object(), event_type=EVENT_BUTTON_DOWN, button_id=BUTTON_GRIP,
+        axis_count=0, axis_ids=[0] * 8, axis_val=[0.0] * 8,
+    )
+    reader._on_button_event(be5)
+    s5 = slot.get()[0]
+    assert s5.seq == 5 and s5.controller.edge_seq == 3 and s5.controller.edge_input == "grip_click"
+    assert s5.click_actions == ((2, "switch_arm"),)
+
+
+def test_edge_republish_never_refreshes_pose_age_rate_or_status(caplog):
+    caplog.set_level(logging.DEBUG, logger="apollo_xarm7_runtime.devices.tracker")
+    reader, slot, clock = _reader()  # stale_s 0.2, max_jump_m 0.1
+    reader._publish(Pose(np.array([0.1, 0.0, 0.0]), IDENT), np.zeros(3), np.zeros(3), 0.0)
+    st0 = reader.status()
+    assert st0.status == "tracking" and st0.age_s == 0.0 and st0.detail == ""
+    touch, seen = False, []
+    for _ in range(6):  # the thumb taps the pad every 0.15 s; no pose arrives for 0.9 s
+        clock.t += 0.15
+        touch = not touch
+        assert reader._on_controller(ControllerState(trackpad_touch=touch)) is True
+        seen.append(slot.get()[0])
+    assert [s.valid for s in seen] == [True, False, False, False, False, False]
+    assert all(np.allclose(s.pose.position, [0.1, 0.0, 0.0]) for s in seen)
+    assert [s.seq for s in seen] == [2, 3, 4, 5, 6, 7]
+    st = reader.status()
+    assert st.status == "stale" and st.age_s == pytest.approx(0.9) and st.rate_hz == 0.0
+    assert st.seq == 7 and st.detail == "controller edge on a pose older than 0.2 s: sample invalid"
+    assert st.device_held == frozenset()  # nothing bound to the touch
+    # A stale-pose edge is not a jump: no WARNING at all, one DEBUG line per invalid re-publish.
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    dbg = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert len([m for m in dbg if "controller edge" in m and "invalid" in m]) == 5
+    # A new pose restores tracking; the jump check runs against the last real pose.
+    clock.t += 0.01
+    reader._publish(Pose(np.array([0.12, 0.0, 0.0]), IDENT), np.zeros(3), np.zeros(3), 1.0)
+    st = reader.status()
+    assert st.status == "tracking" and st.age_s == 0.0 and st.detail == ""
+    assert slot.get()[0].valid and slot.get()[0].seq == 8
+    # A genuine jump still warns with the jump detail; an edge on that (fresh, invalid)
+    # pose stays invalid and keeps the jump detail rather than claiming staleness.
+    reader._publish(Pose(np.array([0.5, 0.0, 0.0]), IDENT), np.zeros(3), np.zeros(3), 1.1)
+    assert slot.get()[0].valid is False and reader.status().detail.startswith("jump > 0.1 m")
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warns == ["tracker sample 9 invalid (jump > 0.10 m)"]
+    assert reader._on_controller(ControllerState(trackpad_touch=False, menu=True)) is True
+    assert slot.get()[0].valid is False and reader.status().detail.startswith("jump > 0.1 m")
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
 def test_fake_backend_scripted_controller_provider():
@@ -332,20 +561,20 @@ def test_fake_backend_scripted_controller_provider():
             time.sleep(0.01)
         assert s.controller == script["state"] and s.held_codes == {CLUTCH_CODE}
         assert reader.status().device_held == {CLUTCH_CODE}
-        script["state"] = _pad(0.9, 0.0)  # right -> gripper_open (classified by the reader)
-        while time.monotonic() < deadline and GRIPPER_OPEN_CODE not in slot.get()[0].held_codes:
+        script["state"] = _pad(0.9, 0.0)  # right -> rail_pos (classified by the reader)
+        while time.monotonic() < deadline and RAIL_POS_CODE not in slot.get()[0].held_codes:
             time.sleep(0.01)
         s = slot.get()[0]
-        assert s.held_codes == {GRIPPER_OPEN_CODE} and s.controller.click_seq == 1
-        assert s.controller.click_dir == "trackpad_right" and s.click_action is None
+        assert s.held_codes == {RAIL_POS_CODE} and s.controller.edge_seq == 1
+        assert s.controller.edge_input == "trackpad_right" and s.click_actions == ()
         script["state"] = _pad(0.9, 0.0, click=False)  # release
         while time.monotonic() < deadline and slot.get()[0].held_codes:
             time.sleep(0.01)
-        script["state"] = _pad(0.0, 0.9)  # up -> discrete switch_arm
-        while time.monotonic() < deadline and slot.get()[0].click_action != "switch_arm":
+        script["state"] = ControllerState(menu=True)  # menu -> discrete switch_arm
+        while time.monotonic() < deadline and slot.get()[0].click_actions != ((2, "switch_arm"),):
             time.sleep(0.01)
         s = slot.get()[0]
-        assert s.controller.click_seq == 2 and s.held_codes == frozenset()
+        assert s.controller.edge_seq == 2 and s.held_codes == frozenset()
         script["state"] = None
         while time.monotonic() < deadline and slot.get()[0].controller is not None:
             time.sleep(0.01)
@@ -453,8 +682,8 @@ def test_libsurvive_event_loop_routes_pose_and_button_events_by_object():
         (1, _button(wm0, EVENT_BUTTON_UP, BUTTON_TRIGGER)),  # edge: seq 2 re-publish
         (1, _button(wm0, EVENT_AXIS_CHANGED, 255, [(AXIS_TRACKPAD_X, -0.9)])),  # no edge
         NONE_EV,  # idle poll: nothing happens
-        (1, _button(wm0, EVENT_BUTTON_DOWN, BUTTON_TRACKPAD)),  # edge: left -> KeyF, seq 3
-        (3, _pose(wm0, [0.11, 0.0, 0.0], 0.4)),  # seq 4 keeps KeyF
+        (1, _button(wm0, EVENT_BUTTON_DOWN, BUTTON_TRACKPAD)),  # edge: left -> ArrowLeft, seq 3
+        (3, _pose(wm0, [0.11, 0.0, 0.0], 0.4)),  # seq 4 keeps ArrowLeft
     ], objects=[lh, wm0, wm1])
     reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
     seen = _spy_publish(reader)
@@ -464,9 +693,10 @@ def test_libsurvive_event_loop_routes_pose_and_button_events_by_object():
     assert np.allclose(seen[0].pose.position, [0.1, 0.0, 0.0])
     assert not seen[1].controller.trigger_pressed and seen[1].held_codes == frozenset()
     assert np.allclose(seen[1].pose.position, [0.1, 0.0, 0.0]) and seen[1].t_dev == 0.3
-    assert seen[2].controller.trackpad_click and seen[2].held_codes == {GRIPPER_CLOSE_CODE}
-    assert seen[2].controller.click_dir == "trackpad_left" and seen[2].click_action is None
-    assert seen[3].held_codes == {GRIPPER_CLOSE_CODE} and seen[3].t_dev == 0.4
+    assert seen[2].controller.trackpad_click and seen[2].held_codes == {RAIL_NEG_CODE}
+    assert seen[2].controller.trackpad_dir == "trackpad_left" and seen[2].click_actions == ()
+    assert seen[2].controller.edge_seq == 1 and seen[2].controller.edge_input == "trackpad_left"
+    assert seen[3].held_codes == {RAIL_NEG_CODE} and seen[3].t_dev == 0.4
     assert np.allclose(seen[3].pose.position, [0.11, 0.0, 0.0]) and seen[3].valid
     assert reader.status().status == "error" and "shut down" in reader.status().detail
     assert reader.status().controller.trackpad_x == pytest.approx(-0.9)

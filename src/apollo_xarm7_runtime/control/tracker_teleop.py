@@ -13,9 +13,12 @@ filter resets on engage and after stale/invalid gaps, free-runs while the
 clutch is up (so telemetry ``pose_filtered`` is live), and is retuned from the
 live settings (``tracker_settings``). Anchor rules (§4 "Anchor and re-seed
 rules"): the settings are snapshotted at engagement and a change while engaged
-re-anchors (``A_trk <- filtered(sample, new)``, ``A_ee <- current target``)
-instead of re-interpreting the accumulated offset; rotation anchor slip is
-applied in the BODY frame so ``D ⊗ A_ee'.q == achieved.q`` exactly.
+re-anchors (``A_trk <- filtered(sample, new)``, ``A_ee <- the provider's
+leash-clamped target``, i.e. the raw target the anchors produce with a still
+hand — NOT the rate-limited pose the loop handed to IK, so a pending
+rate-limit catch-up survives the change) instead of re-interpreting the
+accumulated offset; rotation anchor slip is applied in the BODY frame so
+``D ⊗ A_ee'.q == achieved.q`` exactly.
 """
 
 from __future__ import annotations
@@ -94,7 +97,10 @@ class TrackerTeleop:
         self.engaged_arm: str | None = None
         self._a_trk: Pose | None = None  # filtered aligned tracker pose at engagement
         self._a_ee: Pose | None = None  # EE target at engagement (slips on truncation)
-        self._target: Pose | None = None  # last target handed to IK (world)
+        self._target: Pose | None = None  # last target handed to IK (world; telemetry)
+        # Leash-clamped target of the last tick, shifted by later slips: the raw
+        # target the anchors produce with a still hand (rule (c) re-anchor).
+        self._intent: Pose | None = None
         self._consulted = False  # target() ran this tick
         self._applied = settings.get()  # settings the filter/anchors were built with
         self.pose_filter = PoseFilter(
@@ -109,12 +115,15 @@ class TrackerTeleop:
 
     # -- samples ------------------------------------------------------------------
     def fresh_sample(self, now: float) -> TrackerSample | None:
-        """Newest sample if ``now - rx_mono <= stale_s`` and valid, else None."""
+        """Newest sample if valid and its POSE is fresh (``now - pose_rx_mono <=
+        stale_s``), else None. A controller edge re-publishes the last pose
+        with a new ``rx_mono`` (the held-codes heartbeat) but the pose's own
+        receive time, so button edges never keep a dead pose stream engaged."""
         got = self.slot.get()
         if got is None:
             return None
         sample = got[0]
-        if not sample.valid or now - sample.rx_mono > self.stale_s:
+        if not sample.valid or now - sample.pose_rx_mono > self.stale_s:
             return None
         return sample
 
@@ -151,6 +160,7 @@ class TrackerTeleop:
         self._a_trk = None
         self._a_ee = None
         self._target = None
+        self._intent = None
 
     def end_tick(self, now: float | None = None) -> None:
         """Called once per tick by the loop: a tick that never consulted the
@@ -173,9 +183,10 @@ class TrackerTeleop:
 
         Engages (filter reset, anchors ``A_trk``/``A_ee``) on the first call,
         after a stale/invalid gap and after an arm switch. A settings change
-        while engaged re-anchors at the current filtered pose / current target
-        (zero delta this tick). When the leash truncates the raw target,
-        ``A_ee`` slips by the truncated amount.
+        while engaged re-anchors at the current filtered pose / the provider's
+        own leash-clamped target (zero delta this tick; a pending rate-limit
+        catch-up in the loop is kept, not dropped). When the leash truncates
+        the raw target, ``A_ee`` slips by the truncated amount.
         """
         self._consulted = True
         sample = self.fresh_sample(now)
@@ -193,7 +204,12 @@ class TrackerTeleop:
             self._a_ee = anchor_ee
         elif changed:  # rule (c): re-anchor, never re-interpret the offset
             self._a_trk = filtered
-            self._a_ee = self._target if self._target is not None else anchor_ee
+            # A_ee <- the leash-clamped target the anchors produced last tick
+            # (post-slip), NOT the rate-limited pose the loop handed to IK: the
+            # arm still does not move on the change, and the loop's pending
+            # catch-up toward the hand is preserved (04-runtime §6: rate-limit
+            # truncation is never slipped into the anchor).
+            self._a_ee = self._intent if self._intent is not None else anchor_ee
         dp = s.pos_scale * (filtered.position - self._a_trk.position)
         if s.follow_rotation:
             dq = se3.quat_mul(filtered.orientation, se3.quat_conj(self._a_trk.orientation))
@@ -202,7 +218,7 @@ class TrackerTeleop:
         raw = Pose(self._a_ee.position + dp, se3.quat_mul(dq, self._a_ee.orientation))
         clamped = se3.clamp_pose_to_leash(raw, measured, self.leash_pos_m, self.leash_rot_rad)
         self.slip(raw, clamped)
-        self._target = clamped
+        self._target = self._intent = clamped
         return clamped
 
     def slip(self, intended: Pose, achieved: Pose) -> None:
@@ -218,6 +234,10 @@ class TrackerTeleop:
         if float(np.linalg.norm(dpos)) < _EPS and abs(abs(dq_b[0]) - 1.0) < _EPS:
             return
         self._a_ee = Pose(self._a_ee.position + dpos, se3.quat_mul(self._a_ee.orientation, dq_b))
+        if self._intent is not None:  # the still-hand raw target shifts with A_ee
+            self._intent = Pose(
+                self._intent.position + dpos, se3.quat_mul(self._intent.orientation, dq_b)
+            )
         if self._target is not None:
             self._target = achieved
 

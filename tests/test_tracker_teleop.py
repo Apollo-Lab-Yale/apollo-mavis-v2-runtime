@@ -11,9 +11,10 @@ import numpy as np
 import pytest
 from apollo_xarm7_core import Command, HeldState, Pose, se3
 from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+from pydantic import ValidationError
 
 from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.config import ControlConfig
+from apollo_xarm7_runtime.config import ControlConfig, TargetRateConfig
 from apollo_xarm7_runtime.control.loop import ControlLoop
 from apollo_xarm7_runtime.control.tracker_teleop import (
     TRACKER_CLUTCH_CODE,
@@ -60,10 +61,25 @@ class Rig:
     """Deterministic ControlLoop + provider; the tracker slot is fed by hand.
 
     ``device(*codes)`` scripts the device-held codes (13-tracker §1.1) that
-    every subsequent sample carries; ``gripper_arms`` mirrors the loop option.
+    every subsequent sample carries; ``gripper_arms`` mirrors the loop option;
+    ``kin`` / ``ik`` swap the fake kinematics (default: rail-unaware PoseKin).
     """
 
-    def __init__(self, tracker: bool = True, gripper_arms=None, *, filter=False, filter_cfg=None):
+    def __init__(
+        self,
+        tracker: bool = True,
+        gripper_arms=None,
+        *,
+        filter=False,
+        filter_cfg=None,
+        kin=None,
+        ik=None,
+        rate_limit=False,
+    ):
+        # The tracker target rate limit (04-runtime §6) is OFF by default so
+        # the anchor/delta tests stay exact per tick; rate-limit tests opt in.
+        unlimited = TargetRateConfig(v_mps=1e9, w_radps=1e9)
+        self.cfg = ControlConfig(target_rate=TargetRateConfig() if rate_limit else unlimited)
         self.cell = FakeWorkcell(
             {"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")}
         )
@@ -83,11 +99,11 @@ class Rig:
         self.pose: tuple[np.ndarray, np.ndarray] | None = None  # re-published each tick
         self.codes: frozenset[str] = frozenset()  # device-held codes on every sample
         self.controller = None  # ControllerState echoed on every sample
-        self.click_action = None  # action bound to the newest trackpad press edge
+        self.click_actions: tuple = ()  # (edge_seq, action) of the bound controller press edges
         self.loop = ControlLoop(
-            self.cell, ControlConfig(), self.bus,
+            self.cell, self.cfg, self.bus,
             SafetySupervisor(NullGate(), InputWatchdog()), ["arm0", "arm1"],
-            ik=PoseIK(), kin=PoseKin(), tracker=self.tracker if tracker else None,
+            ik=ik or PoseIK(), kin=kin or PoseKin(), tracker=self.tracker if tracker else None,
             gripper_arms=gripper_arms, clock=lambda: self.t,
         )
         self.loop._seed_from_measured()
@@ -99,18 +115,22 @@ class Rig:
         s = TrackerSample(
             Pose(np.asarray(pos, float), quat), np.zeros(3), np.zeros(3),
             self.t, self.t - age, self.sample_seq, valid, self.controller, codes,
-            self.click_action,
+            self.click_actions, pose_rx_mono=self.t - age,
         )
         self.bus.tracker.put(s)
         self.pose = (np.asarray(pos, float), np.asarray(quat, float)) if sticky else None
 
-    def device(self, *codes, controller=None, click_action=None):
-        """Script the controller-derived codes (and the action bound to the
-        newest trackpad press, as the reader derives it); re-publishes the
-        current pose at once (the reader does the same on a button edge)."""
+    def device(self, *codes, controller=None, click_action=None, click_actions=None):
+        """Script the controller-derived codes and the bound discrete actions
+        as the reader derives them: ``click_action`` is the shorthand for "the
+        newest press edge is bound to this action", ``click_actions`` the full
+        ``(edge_seq, action)`` tuple; re-publishes the current pose at once
+        (the reader does the same on a button edge)."""
         self.codes = frozenset(codes)
         self.controller = controller
-        self.click_action = click_action
+        if click_actions is None:
+            click_actions = () if click_action is None else ((controller.edge_seq, click_action),)
+        self.click_actions = tuple(click_actions)
         if self.pose is not None:
             self.sample(*self.pose)
 
@@ -391,3 +411,145 @@ def test_tracker_settings_op_updates_live_settings_and_validates():
     assert res.ok
     rig2 = Rig(tracker=False)
     assert not rig2.act("tracker_settings", {"pos_scale": 1.0}).ok
+
+
+# -- target rate limit + component-wise residual slip (04-runtime §6, 2026-09-02) -----------
+def test_target_rate_config_rejects_zero_and_negative_rates():
+    # clamp_pose_to_leash with a zero cap freezes the clutched target, a negative
+    # cap steps AWAY from the hand: neither may pass config validation.
+    for bad in ({"v_mps": 0.0}, {"v_mps": -1.0}, {"w_radps": 0.0}, {"w_radps": -2.0}):
+        with pytest.raises(ValidationError):
+            TargetRateConfig(**bad)
+    with pytest.raises(ValidationError, match="target_rate"):
+        ControlConfig.model_validate({"target_rate": {"v_mps": -1.0}})
+    assert TargetRateConfig().v_mps == 1.0 and TargetRateConfig().w_radps == 2.0
+    assert TargetRateConfig(v_mps=1e9, w_radps=1e-3).w_radps == 1e-3  # any positive value
+
+
+def test_target_rate_limit_caps_the_per_tick_step_and_catches_up_without_slipping():
+    rig = Rig(rate_limit=True)  # defaults: 1.0 m/s -> 10 mm/tick, 2 rad/s -> 0.02 rad/tick
+    rig.sample([0.0, 0.0, 0.0])
+    rig.hold(CLUTCH)
+    rig.tick()
+    anchor0 = rig.extra()["anchor_tcp"].position.copy()
+    rig.sample([0.02, 0.0, 0.0])  # 20 mm jump, inside the 25 mm leash
+    rig.tick()
+    assert np.allclose(rig.cmd()[:3], [0.01, 0.0, 0.0], atol=1e-9)  # one tick = 10 mm
+    assert np.allclose(rig.extra()["anchor_tcp"].position, anchor0)  # truncation NOT slipped
+    rig.tick()
+    assert np.allclose(rig.cmd()[:3], [0.02, 0.0, 0.0], atol=1e-9)  # caught up, hand still
+    assert np.allclose(rig.extra()["anchor_tcp"].position, anchor0)
+    # rotation: 0.1 rad about z in one sample -> 0.02 rad per tick, complete after 5 ticks
+    rig.sample([0.02, 0.0, 0.0], se3.rotvec_to_quat([0.0, 0.0, 0.1]))
+    rig.tick()
+    assert np.isclose(rig.cmd()[5], 0.02, atol=1e-9)
+    rig.tick(4)
+    assert np.isclose(rig.cmd()[5], 0.1, atol=1e-9)
+    assert np.allclose(rig.cmd()[:3], [0.02, 0.0, 0.0], atol=1e-9)  # position untouched
+
+
+@pytest.mark.parametrize("channel", ["position", "rotation"])
+def test_target_rate_limit_beyond_the_leash_slips_once_and_converges_on_a_slow_arm(channel):
+    """Hand jump beyond the leash with an arm slower than the rate: the leash
+    slips the anchor exactly once (rule: leash slip bounds the offset), the
+    rate-limit truncation is never slipped, and the target converges to the
+    leash-clamped pose without creeping while the arm catches up."""
+    rig = Rig(rate_limit=True)  # 10 mm / 0.02 rad per tick
+    rig.cell.arms["arm0"]._max_joint_speed = 0.3  # 3 mm / 0.003 rad per tick: slower than the rate
+    rig.sample([0.0, 0.0, 0.0])
+    rig.hold(CLUTCH)
+    rig.tick()
+    a0 = rig.extra()["anchor_tcp"]
+    if channel == "position":
+        rig.sample([0.05, 0.0, 0.0])  # 5 cm > 25 mm leash
+        rig.tick()
+        a1 = rig.extra()["anchor_tcp"]
+        assert a1.position[0] == pytest.approx(a0.position[0] - 0.025)  # one leash slip
+        assert rig.cmd()[0] == pytest.approx(0.01)  # one rate step
+        rig.tick(15)
+        assert rig.cmd()[0] == pytest.approx(0.025)  # converged to the leash-clamped target
+        assert rig.extra()["target_tcp"].position[0] == pytest.approx(0.025)
+        assert rig.extra()["anchor_tcp"].position[0] == pytest.approx(a1.position[0])  # no 2nd slip
+        assert rig.cell.arms["arm0"].get_state().q[0] == pytest.approx(0.025, abs=1e-9)  # arrived
+        rig.sample([0.06, 0.0, 0.0])  # +1 cm applies on top of the slipped anchor
+        rig.tick(2)
+        assert rig.cmd()[0] == pytest.approx(0.035)
+    else:
+        rig.sample([0.0, 0.0, 0.0], se3.rotvec_to_quat([0.0, 0.0, 0.5]))  # 0.5 rad > 0.2 leash
+        rig.tick()
+        a1 = rig.extra()["anchor_tcp"]
+        assert se3.quat_geodesic(a1.orientation, a0.orientation) == pytest.approx(0.3, abs=1e-9)
+        assert rig.cmd()[5] == pytest.approx(0.02, abs=1e-9)
+        assert np.allclose(rig.cmd()[:3], 0.0, atol=1e-12)
+        rig.tick(15)
+        assert rig.cmd()[5] == pytest.approx(0.2, abs=1e-9)  # converged to the leash-clamped target
+        assert se3.quat_geodesic(rig.extra()["anchor_tcp"].orientation, a1.orientation) < 1e-9
+        assert np.allclose(rig.extra()["anchor_tcp"].position, a0.position, atol=1e-12)
+        rig.tick(60)  # the wrist needs ~67 ticks at 0.003 rad/tick: no creep, no 2nd slip meanwhile
+        assert rig.cmd()[5] == pytest.approx(0.2, abs=1e-9)
+        assert se3.quat_geodesic(rig.extra()["anchor_tcp"].orientation, a1.orientation) < 1e-9
+        assert rig.cell.arms["arm0"].get_state().q[5] == pytest.approx(0.2, abs=1e-9)  # arrived
+
+
+def test_settings_change_mid_catch_up_keeps_the_pending_rate_limited_step():
+    """Rule (c) re-anchors to the provider's leash-clamped target, not to the
+    rate-limited pose handed to IK: no settings-induced motion AND the pending
+    catch-up toward the hand is finished, not silently slipped into A_ee."""
+    rig = Rig(rate_limit=True)
+    rig.sample([0.0, 0.0, 0.0])
+    rig.hold(CLUTCH)
+    rig.tick()
+    rig.sample([0.02, 0.0, 0.0])  # 20 mm inside the leash: two 10 mm ticks
+    rig.tick()
+    assert rig.cmd()[0] == pytest.approx(0.01)
+    assert rig.act("tracker_settings", {"pos_scale": 1.5}).ok  # one tick: re-anchor (rule c)
+    assert rig.cmd()[0] == pytest.approx(0.02)  # the second 10 mm step still happened
+    assert rig.extra()["anchor_tcp"].position[0] == pytest.approx(0.02)
+    rig.tick(3)
+    assert rig.cmd()[0] == pytest.approx(0.02)  # hand still: no creep either way
+    rig.sample([0.03, 0.0, 0.0])  # +10 mm at scale 1.5 -> +15 mm on top of 0.02 (not 0.01)
+    rig.tick(2)
+    assert rig.cmd()[0] == pytest.approx(0.035)
+    # Rotation: 0.1 rad hand rotation = five 0.02 rad ticks; a change after the first
+    # tick must not drop the remaining 0.08 rad.
+    rig.sample([0.03, 0.0, 0.0], se3.rotvec_to_quat([0.0, 0.0, 0.1]))
+    rig.tick()
+    assert rig.cmd()[5] == pytest.approx(0.02, abs=1e-9)
+    assert rig.act("tracker_settings", {"pos_scale": 1.2}).ok
+    assert rig.cmd()[5] == pytest.approx(0.04, abs=1e-9)
+    rig.tick(5)
+    assert rig.cmd()[5] == pytest.approx(0.1, abs=1e-9)
+    assert rig.cmd()[0] == pytest.approx(0.035)
+
+
+class RotationLaggingIK(PoseIK):
+    """Reaches the position exactly but reports an over-threshold rotation
+    residual and leaves the orientation where it was (velocity-saturated wrist)."""
+
+    def solve(self, arm_id, target, q_last):
+        q = np.array(q_last, dtype=float)
+        q[:3] = target.position
+        return SimpleNamespace(q=q, diverged=False, pos_err_m=0.0, rot_err_rad=0.3)
+
+
+def test_rotation_residual_slips_orientation_only_and_leaves_the_position_anchor():
+    rig = Rig(ik=RotationLaggingIK())
+    rig.sample([0.0, 0.0, 0.0])
+    rig.hold(CLUTCH)
+    rig.tick()
+    anchor0 = rig.extra()["anchor_tcp"]
+    q_hand = se3.rotvec_to_quat([0.0, 0.0, 0.3])
+    rig.sample([0.01, 0.0, 0.0], q_hand)  # translate 10 mm AND rotate 0.3 rad
+    rig.tick()
+    ex = rig.extra()
+    # position: followed 1:1, anchor position untouched by the rotation residual
+    assert np.allclose(rig.cmd()[:3], [0.01, 0.0, 0.0], atol=1e-12)
+    assert np.allclose(ex["target_tcp"].position, [0.01, 0.0, 0.0], atol=1e-12)
+    assert np.allclose(ex["anchor_tcp"].position, anchor0.position, atol=1e-12)
+    # orientation: frozen back to the achieved (unrotated) pose -> anchor slipped in rotation
+    assert se3.quat_geodesic(ex["target_tcp"].orientation, IDENT) < 1e-9
+    assert se3.quat_geodesic(ex["anchor_tcp"].orientation, anchor0.orientation) > 0.29
+    # hand still: no further motion of either component
+    rig.tick(3)
+    assert np.allclose(rig.cmd()[:3], [0.01, 0.0, 0.0], atol=1e-12)
+    assert np.allclose(ex["anchor_tcp"].position, rig.extra()["anchor_tcp"].position, atol=1e-12)

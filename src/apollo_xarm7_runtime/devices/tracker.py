@@ -14,6 +14,21 @@ counted, exceptions never kill the thread), the libsurvive loop auto-restarts
 with backoff when it dies, ``start()`` is restartable, libsurvive warnings are
 rate-limited per message class, and the device status distinguishes ``error``
 (no OBJECT-type device) from ``searching`` (device present, no pose yet).
+
+Controller inputs (13-tracker §1.1): button/axis events fold into a
+:class:`ControllerState`; :func:`note_edges` classifies a trackpad click once
+at its press edge and records the press edges of the trackpad, menu and grip
+buttons as a short ``(seq, input)`` history (``edges``; ``edge_seq`` /
+``edge_input`` are its newest entry). ``TrackerConfig.controller_map`` binds
+inputs to held actions (clutch, gripper_open/close, rail_neg/pos -> the keymap
+codes of those actions, published as ``TrackerSample.held_codes``) and to the
+discrete actions arm_next / arm_prev (``TrackerSample.click_actions``: the
+``(seq, action)`` of every remembered bound edge; the control loop fires those
+newer than the last ``edge_seq`` it saw on a fresh sample, so two edges inside
+one tick both fire). A controller edge re-publishes the last pose so the loop
+sees it within a tick, but never refreshes the pose's age: a pose older than
+``stale_s`` is re-published invalid and status / age / rate follow the real
+pose stream only.
 """
 
 from __future__ import annotations
@@ -25,14 +40,19 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import numpy as np
 from apollo_xarm7_core import LatestSlot, Pose
 from apollo_xarm7_core.protocol import KEYMAP
 
-from ..config import ControllerInput, TrackerConfig
+from ..config import (
+    CONTROLLER_DISCRETE_ACTIONS,
+    CONTROLLER_HELD_ACTIONS,
+    ControllerInput,
+    TrackerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +69,7 @@ LIBSURVIVE_RESTART_RESET_S = 30.0  # a run longer than this resets the backoff
 RATE_WINDOW_S = 1.0  # rate_hz is measured over this window; decays to 0 when samples stop
 LOG_RATE_LIMIT_S = 1.0  # forwarded libsurvive warnings: <= 1 line/s per message class
 QUAT_NORM_TOL = 1e-2  # |‖q‖ - 1| above this -> bad event
+EDGE_HISTORY = 8  # press edges remembered on ControllerState.edges (lossless up to 8 per tick)
 
 # libsurvive button events, verified on the lab Vive Pro controller (13-tracker §1.1).
 EVENT_BUTTON_UP = 2
@@ -76,21 +97,51 @@ def _code_for(action: str) -> str:
 CLUTCH_CODE: str = _code_for("tracker_clutch")
 GRIPPER_OPEN_CODE: str = _code_for("gripper_open")
 GRIPPER_CLOSE_CODE: str = _code_for("gripper_close")
+RAIL_NEG_CODE: str = _code_for("rail_neg")
+RAIL_POS_CODE: str = _code_for("rail_pos")
+
+# Held controller_map actions -> the code they inject while their input is active.
+HELD_ACTION_CODES: dict[str, str] = {
+    "clutch": CLUTCH_CODE,
+    "gripper_open": GRIPPER_OPEN_CODE,
+    "gripper_close": GRIPPER_CLOSE_CODE,
+    "rail_neg": RAIL_NEG_CODE,
+    "rail_pos": RAIL_POS_CODE,
+}
 
 # Discrete device actions -> the ActionName the loop executes (13-tracker §1.1).
 DISCRETE_ACTIONS: dict[str, str] = {"arm_next": "switch_arm", "arm_prev": "switch_arm_prev"}
+
+if (
+    tuple(HELD_ACTION_CODES) != CONTROLLER_HELD_ACTIONS
+    or tuple(DISCRETE_ACTIONS) != CONTROLLER_DISCRETE_ACTIONS
+):  # pragma: no cover - import-time invariant: config and reader agree on the action names
+    raise RuntimeError(
+        "controller_map action tables out of sync: config.CONTROLLER_*_ACTIONS vs "
+        "devices.tracker HELD_ACTION_CODES / DISCRETE_ACTIONS"
+    )
 
 
 @dataclass(frozen=True)
 class ControllerState:
     """Latest Vive-controller input state (mirrors core ``ControllerTelemetry``).
 
-    ``click_seq`` counts trackpad press edges and ``click_dir`` is the
-    classification of the newest one (13-tracker §1.1: dominant axis at the
-    press edge; ``None`` when both axes were inside the deadzone). Both are
-    maintained by :func:`classify_click` (the reader applies it to every new
-    state), so held codes follow ``click_dir`` while ``trackpad_click`` is True
-    and the loop fires discrete actions when ``click_seq`` advances.
+    Discrete edge accounting (13-tracker §1.1): ``edges`` remembers the last
+    ``EDGE_HISTORY`` press edges of the trackpad click, the menu button and the
+    grip button as ``(seq, input)``, newest last, where ``seq`` counts every
+    press edge so far and ``input`` is the ``ControllerInput`` that produced it
+    — the trackpad click's classification (dominant axis at the press edge;
+    ``None`` when both axes were inside the deadzone, the counter still
+    advances), ``menu_click`` or ``grip_click``. ``edge_seq`` / ``edge_input``
+    are the newest entry. Keeping a history (not just the newest edge) makes
+    the accounting lossless when two buttons edge inside one 10 ms loop tick
+    (the slot is depth 1, the loop reads it once per tick). ``trackpad_dir``
+    carries the current click's classification until release so held codes
+    follow it while ``trackpad_click`` is True even if another button edges
+    meanwhile. All are maintained by :func:`note_edges` (the reader applies it
+    to every new state); the loop fires the discrete actions of the edges newer
+    than the ``edge_seq`` it saw last. The trigger is held-only and registers
+    no edge.
     """
 
     trigger: float = 0.0  # analog pull, 0..1 (axis 1)
@@ -103,8 +154,19 @@ class ControllerState:
     menu: bool = False  # button 6
     system: bool = False  # button 3
     rx_mono: float = 0.0  # time.monotonic() of the newest event folded in
-    click_seq: int = 0  # number of trackpad press edges so far
-    click_dir: TrackpadDir | None = None  # classification of the newest press edge
+    trackpad_dir: TrackpadDir | None = None  # current click's classification, held to release
+    # Last EDGE_HISTORY press edges (trackpad click, menu, grip) as (seq, input), newest last.
+    edges: tuple[tuple[int, ControllerInput | None], ...] = ()
+
+    @property
+    def edge_seq(self) -> int:
+        """Press edges so far (trackpad click, menu, grip); 0 before the first."""
+        return self.edges[-1][0] if self.edges else 0
+
+    @property
+    def edge_input(self) -> ControllerInput | None:
+        """Input of the newest press edge (``None``: none yet / deadzone click)."""
+        return self.edges[-1][1] if self.edges else None
 
     def buttons(self) -> tuple[bool, ...]:
         """Boolean inputs only (edge detection ignores the analog axes)."""
@@ -138,8 +200,8 @@ def apply_button_event(
 
     ``axis_ids`` / ``axis_vals`` are the event's ``axis_count`` leading entries;
     they are applied for every event type (button events may carry axes too).
-    Unknown button or axis ids are ignored. Raw state only: the trackpad click
-    classification is added by :func:`classify_click`.
+    Unknown button or axis ids are ignored. Raw state only: the edge accounting
+    and the trackpad click classification are added by :func:`note_edges`.
     """
     changes: dict = {"rx_mono": float(rx_mono)}
     for axis_id, val in zip(axis_ids, axis_vals, strict=True):
@@ -166,61 +228,106 @@ def classify_trackpad(x: float, y: float, deadzone: float) -> TrackpadDir | None
     return "trackpad_up" if y > 0.0 else "trackpad_down"
 
 
-def classify_click(
+def note_edges(
     prev: ControllerState | None, state: ControllerState, deadzone: float
 ) -> ControllerState:
-    """Fix the trackpad click classification ONCE at its press edge and carry
-    it (with the press counter) until release; a click that starts inside the
-    deadzone stays ignored however far the finger moves afterwards."""
-    prev_click = prev.trackpad_click if prev is not None else False
-    seq = prev.click_seq if prev is not None else 0
-    if state.trackpad_click and not prev_click:  # press edge: classify now
-        return replace(
-            state, click_seq=seq + 1,
-            click_dir=classify_trackpad(state.trackpad_x, state.trackpad_y, deadzone),
-        )
-    if prev is not None:  # held or released: keep the edge accounting
-        return replace(state, click_seq=seq, click_dir=prev.click_dir)
-    return state
+    """Discrete press-edge accounting + trackpad click classification.
+
+    Compares ``state`` with ``prev`` (the previously adopted state; ``None`` =
+    first observation, every pressed button counts as an edge): a trackpad
+    press edge is classified ONCE from the pad position (``trackpad_dir``,
+    carried until release; a click that starts inside the deadzone stays
+    ignored however far the finger moves afterwards), and every press edge of
+    the trackpad click, the menu button and the grip button appends
+    ``(seq, input)`` to ``edges`` (the deadzone click appends ``None`` as the
+    input); the history keeps the newest ``EDGE_HISTORY`` entries.
+    Simultaneous edges in one state (scripted states only: libsurvive delivers
+    one button per event) are appended in the order trackpad, menu, grip.
+    Held or released states carry the previous accounting unchanged.
+    """
+    seq = prev.edge_seq if prev is not None else 0
+    history = prev.edges if prev is not None else ()
+    trackpad_dir = prev.trackpad_dir if prev is not None else None
+    new: list[tuple[int, ControllerInput | None]] = []
+    if state.trackpad_click and not (prev is not None and prev.trackpad_click):
+        trackpad_dir = classify_trackpad(state.trackpad_x, state.trackpad_y, deadzone)
+        new.append((seq + len(new) + 1, trackpad_dir))
+    if state.menu and not (prev is not None and prev.menu):
+        new.append((seq + len(new) + 1, "menu_click"))
+    if state.grip and not (prev is not None and prev.grip):
+        new.append((seq + len(new) + 1, "grip_click"))
+    if not new and prev is None:
+        return state  # first observation, nothing pressed: adopt as is
+    edges = (*history, *new)[-EDGE_HISTORY:]
+    return replace(state, edges=edges, trackpad_dir=trackpad_dir)
 
 
 def active_inputs(state: ControllerState) -> frozenset[ControllerInput]:
-    """Which bindable held inputs (``ControllerInput``) are active in ``state``:
-    the trigger click and, while the trackpad is clicked, its press-edge
-    classification (``click_dir``)."""
+    """Which bindable inputs (``ControllerInput``) are active in ``state``: the
+    trigger click, the trackpad's press-edge classification while it is
+    clicked, ``menu_click`` while menu is down and ``grip_click`` while grip is
+    down."""
     out: set[ControllerInput] = set()
     if state.trigger_pressed:
         out.add("trigger_click")
-    if state.trackpad_click and state.click_dir is not None:
-        out.add(state.click_dir)
+    if state.trackpad_click and state.trackpad_dir is not None:
+        out.add(state.trackpad_dir)
+    if state.menu:
+        out.add("menu_click")
+    if state.grip:
+        out.add("grip_click")
     return frozenset(out)
 
 
 def derive_held_codes(state: ControllerState | None, cfg: TrackerConfig) -> frozenset[str]:
     """Key codes the controller currently stands in for (13-tracker §1.1):
-    ``cfg.controller_map`` binds each held action to an input; ``none`` = unbound."""
+    ``cfg.controller_map`` binds each held action (clutch, gripper_open,
+    gripper_close, rail_neg, rail_pos) to an input; ``none`` = unbound."""
     if state is None:
         return frozenset()
     active = active_inputs(state)
     m = cfg.controller_map
-    bindings = (
-        (m.clutch, CLUTCH_CODE), (m.gripper_open, GRIPPER_OPEN_CODE),
-        (m.gripper_close, GRIPPER_CLOSE_CODE),
+    return frozenset(
+        code
+        for action, code in HELD_ACTION_CODES.items()
+        if (src := getattr(m, action)) != "none" and src in active
     )
-    return frozenset(code for src, code in bindings if src != "none" and src in active)
+
+
+def _discrete_action_for(edge_input: ControllerInput | None, cfg: TrackerConfig) -> str | None:
+    """ActionName bound to ``edge_input`` through the discrete bindings, or
+    ``None`` (unbound / held binding / deadzone click)."""
+    if edge_input is None:
+        return None
+    m = cfg.controller_map
+    for name, action in DISCRETE_ACTIONS.items():
+        if getattr(m, name) == edge_input:
+            return action
+    return None
+
+
+def derive_click_actions(
+    state: ControllerState | None, cfg: TrackerConfig
+) -> tuple[tuple[int, str], ...]:
+    """``(seq, ActionName)`` for every remembered press edge (``state.edges``)
+    whose input is bound to a discrete action (``switch_arm`` /
+    ``switch_arm_prev``), oldest first. The loop fires the entries newer than
+    the ``edge_seq`` it saw last, so no bound edge is lost when several buttons
+    edge inside one tick (13-tracker §1.1)."""
+    if state is None:
+        return ()
+    out = []
+    for seq, edge_input in state.edges:
+        action = _discrete_action_for(edge_input, cfg)
+        if action is not None:
+            out.append((seq, action))
+    return tuple(out)
 
 
 def derive_click_action(state: ControllerState | None, cfg: TrackerConfig) -> str | None:
-    """ActionName (``switch_arm`` / ``switch_arm_prev``) bound to the newest
-    trackpad press edge (``state.click_dir``), or ``None`` (unbound / deadzone).
-    The loop fires it once when ``state.click_seq`` advances."""
-    if state is None or state.click_dir is None:
-        return None
-    m = cfg.controller_map
-    for field, action in DISCRETE_ACTIONS.items():
-        if getattr(m, field) == state.click_dir:
-            return action
-    return None
+    """ActionName bound to the input of the NEWEST press edge
+    (``state.edge_input``), or ``None``; see :func:`derive_click_actions`."""
+    return None if state is None else _discrete_action_for(state.edge_input, cfg)
 
 
 @dataclass(frozen=True)
@@ -231,12 +338,18 @@ class TrackerSample:
     vel_lin: np.ndarray  # m/s, world
     vel_ang: np.ndarray  # rad/s axis-angle, world
     t_dev: float  # libsurvive run time, s (NOT wall clock)
-    rx_mono: float  # time.monotonic() on receipt (staleness feed)
+    rx_mono: float  # time.monotonic() this SAMPLE was published (held-codes heartbeat)
     seq: int
-    valid: bool = True  # False: jump > max_jump_m vs the previous sample
+    valid: bool = True  # False: jump > max_jump_m vs the previous pose, or pose older than stale_s
     controller: ControllerState | None = None  # None: backend reports no controller
     held_codes: frozenset[str] = frozenset()  # device-held codes (13-tracker §1.1)
-    click_action: str | None = None  # action bound to controller.click_dir (press edge)
+    # (edge_seq, action) of every remembered bound press edge, oldest first
+    # (``derive_click_actions``); the loop fires those newer than its last seen edge_seq.
+    click_actions: tuple[tuple[int, str], ...] = ()
+    # time.monotonic() the POSE was received: == rx_mono for a pose event, the older
+    # pose's time for a controller-edge re-publish. The clutch's staleness feed
+    # (13-tracker §4): a button edge never makes an old pose look fresh.
+    pose_rx_mono: float = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -343,18 +456,19 @@ class TrackerReader:
 
     ``start()`` is a no-op for backend ``none`` and while a thread is alive; a
     finished thread clears ``_thread`` so ``start()`` can be called again.
-    ``status(now)`` derives ``stale`` from the newest sample's age
-    (``cfg.stale_s``) and a ``rate_hz`` over the last ``RATE_WINDOW_S`` that
-    decays to 0 when samples stop; everything else is set by the backend thread
-    under ``_lock``.
+    ``status(now)`` derives ``age_s`` / ``stale`` from the receive time of the
+    last REAL pose (``cfg.stale_s``) and a ``rate_hz`` over the last
+    ``RATE_WINDOW_S`` of real poses that decays to 0 when they stop;
+    everything else is set by the backend thread under ``_lock``.
 
     Controller inputs (13-tracker §1.1): the libsurvive backend folds button
-    events into a :class:`ControllerState`; every published sample carries the
-    newest state plus the derived ``held_codes`` / ``click_action``, and a
-    button edge re-publishes the last pose immediately so the loop sees the
-    edge within one tick. The fake backend has no buttons (``controller=None``)
-    unless a ``controller_provider`` (test hook, polled every fake tick)
-    supplies one.
+    events into a :class:`ControllerState` (press edges noted by
+    :func:`note_edges`); every published sample carries the newest state plus
+    the derived ``held_codes`` / ``click_actions``, and a button edge
+    re-publishes the last pose immediately so the loop sees the edge within
+    one tick — without refreshing the pose's age (see :meth:`_publish`). The
+    fake backend has no buttons (``controller=None``) unless a
+    ``controller_provider`` (test hook, polled every fake tick) supplies one.
     """
 
     def __init__(
@@ -371,13 +485,15 @@ class TrackerReader:
         self.controller_provider = controller_provider  # fake backend only; settable live
         self._controller: ControllerState | None = None
         self._held_codes: frozenset[str] = frozenset()
-        self._click_action: str | None = None
+        self._click_actions: tuple[tuple[int, str], ...] = ()
         self._lock = threading.Lock()
         self._status: TrackerStatus = "no_backend"
         self._detail = "tracker disabled (backend: none)" if cfg.backend == "none" else ""
         self._seq = 0
         self._last: TrackerSample | None = None
-        self._rx_times: deque[float] = deque(maxlen=64)
+        self._last_pose_rx: float | None = None  # receive time of the last REAL pose (age feed)
+        self._pose_valid = False  # validity (jump check) of the last REAL pose
+        self._rx_times: deque[float] = deque(maxlen=64)  # real poses only (rate feed)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_error_log = ""  # newest libsurvive error/warn line
@@ -429,11 +545,15 @@ class TrackerReader:
         now = self._clock() if now is None else now
         with self._lock:
             status, detail, last = self._status, self._detail, self._last
+            pose_rx = self._last_pose_rx
             rx = [t for t in self._rx_times if t > now - RATE_WINDOW_S]
             controller = self._controller
-        age = None if last is None else max(0.0, now - last.rx_mono)
+        # Pose age: the last REAL pose (an edge re-publish carries an old pose).
+        age = None if pose_rx is None else max(0.0, now - pose_rx)
         if status == "tracking" and age is not None and age > self.cfg.stale_s:
             status = "stale"
+        # Held codes ride on the controller stream: fresh by the newest SAMPLE's age.
+        codes_fresh = last is not None and now - last.rx_mono <= self.cfg.stale_s
         # Samples within the window over the time since the oldest of them: a
         # dead stream decays toward 0 and reads exactly 0 once the window is empty.
         rate = (len(rx) - 1) / (now - rx[0]) if len(rx) > 1 and now > rx[0] else 0.0
@@ -447,28 +567,44 @@ class TrackerReader:
             age_s=age,
             pose_raw=last.pose if last is not None else None,
             controller=controller,
-            device_held=(
-                last.held_codes
-                if last is not None and age is not None and age <= self.cfg.stale_s
-                else frozenset()
-            ),
+            device_held=last.held_codes if codes_fresh else frozenset(),
             bad_events=self.bad_events,
             restarts=self.restarts,
         )
 
     # -- publishing (backend threads) ----------------------------------------------------
     def _publish(
-        self, pose: Pose, vel_lin, vel_ang, t_dev: float, *, valid_override: bool | None = None
+        self, pose: Pose, vel_lin, vel_ang, t_dev: float, *, edge: bool = False
     ) -> TrackerSample:
+        """Publish a sample carrying the current controller state / codes / actions.
+
+        A pose event (``edge=False``) is checked for a jump against the previous
+        pose (``valid``), refreshes the pose age (``_last_pose_rx``), feeds the
+        rate window and sets the status to ``tracking``. A controller edge
+        (``edge=True``, :meth:`_on_controller`) re-publishes the LAST pose so
+        the loop sees the edge within one tick: the pose keeps its validity
+        unless it is older than ``stale_s`` (then the sample is invalid so the
+        clutch cannot anchor on it), and neither the pose age, the rate nor the
+        status are touched — button edges are the heartbeat of the held codes,
+        not of the pose, so a chain of edges can never keep a dead pose stream
+        looking fresh.
+        """
         rx = self._clock()
         with self._lock:
             prev = self._last
             self._seq += 1
-            valid = prev is None or (
-                float(np.linalg.norm(pose.position - prev.pose.position)) <= self.cfg.max_jump_m
-            )
-            if valid_override is not None:
-                valid = valid_override
+            jump = stale_edge = False
+            if edge and self._last_pose_rx is not None:
+                pose_rx = self._last_pose_rx
+                pose_fresh = rx - pose_rx <= self.cfg.stale_s
+                valid = self._pose_valid and pose_fresh
+                stale_edge = self._pose_valid and not pose_fresh
+            else:  # a pose event (an edge before any pose is not re-published)
+                pose_rx = rx
+                jump = prev is not None and (
+                    float(np.linalg.norm(pose.position - prev.pose.position)) > self.cfg.max_jump_m
+                )
+                valid = not jump
             sample = TrackerSample(
                 pose=pose,
                 vel_lin=np.asarray(vel_lin, dtype=np.float64),
@@ -479,50 +615,61 @@ class TrackerReader:
                 valid=valid,
                 controller=self._controller,
                 held_codes=self._held_codes,
-                click_action=self._click_action,
+                click_actions=self._click_actions,
+                pose_rx_mono=pose_rx,
             )
             self._last = sample
-            self._rx_times.append(rx)
-            self._status = "tracking"
-            self._detail = "" if valid else f"jump > {self.cfg.max_jump_m} m: sample invalid"
-        if not valid:
+            if not edge:
+                self._last_pose_rx = rx
+                self._pose_valid = valid
+                self._rx_times.append(rx)
+                self._status = "tracking"
+                self._detail = "" if valid else f"jump > {self.cfg.max_jump_m} m: sample invalid"
+            elif stale_edge:
+                self._detail = (
+                    f"controller edge on a pose older than {self.cfg.stale_s} s: sample invalid"
+                )
+        if jump:
             logger.warning(
                 "tracker sample %d invalid (jump > %.2f m)", sample.seq, self.cfg.max_jump_m
+            )
+        elif stale_edge:
+            logger.debug(
+                "tracker sample %d re-published on a controller edge with a pose older than "
+                "%.2f s: invalid", sample.seq, self.cfg.stale_s,
             )
         self.slot.put(sample)
         return sample
 
     # -- controller inputs (13-tracker §1.1) ----------------------------------------------
     def _on_controller(self, state: ControllerState | None) -> bool:
-        """Adopt a new controller state (trackpad click classified at its press
-        edge, :func:`classify_click`); on a button edge (or a change of the
-        derived codes) re-publish the last pose so the loop sees the edge now.
+        """Adopt a new controller state (press edges noted and the trackpad
+        click classified at its edge, :func:`note_edges`); on a button edge (or
+        a change of the derived codes) re-publish the last pose so the loop
+        sees the edge now.
 
         The re-published sample keeps the pose's own validity, but a pose older
-        than ``stale_s`` is flagged invalid: the codes still count (gripper,
+        than ``stale_s`` (measured from the last REAL pose, never from an
+        earlier re-publish) is flagged invalid: the codes still count (gripper,
         clutch *held*), while the clutch cannot anchor on a stale pose.
         Returns True when a sample was re-published.
         """
         with self._lock:
             prev, prev_codes, last = self._controller, self._held_codes, self._last
         if state is not None:
-            state = classify_click(prev, state, self.cfg.trackpad_deadzone)
+            state = note_edges(prev, state, self.cfg.trackpad_deadzone)
         codes = derive_held_codes(state, self.cfg)
         with self._lock:
             self._controller = state
             self._held_codes = codes
-            self._click_action = derive_click_action(state, self.cfg)
+            self._click_actions = derive_click_actions(state, self.cfg)
         edge = codes != prev_codes or (
             (state.buttons() if state is not None else None)
             != (prev.buttons() if prev is not None else None)
         )
         if not edge or last is None:
             return False
-        fresh = self._clock() - last.rx_mono <= self.cfg.stale_s
-        self._publish(
-            last.pose, last.vel_lin, last.vel_ang, last.t_dev,
-            valid_override=last.valid and fresh,
-        )
+        self._publish(last.pose, last.vel_lin, last.vel_ang, last.t_dev, edge=True)
         return True
 
     # -- fake backend: slow circle, identity orientation ----------------------------------
@@ -761,8 +908,12 @@ class TrackerReader:
 __all__ = [
     "CLUTCH_CODE",
     "DISCRETE_ACTIONS",
+    "EDGE_HISTORY",
     "GRIPPER_CLOSE_CODE",
     "GRIPPER_OPEN_CODE",
+    "HELD_ACTION_CODES",
+    "RAIL_NEG_CODE",
+    "RAIL_POS_CODE",
     "ControllerState",
     "TrackerDeviceStatus",
     "TrackerReader",
@@ -773,8 +924,9 @@ __all__ = [
     "TrackpadDir",
     "active_inputs",
     "apply_button_event",
-    "classify_click",
     "classify_trackpad",
     "derive_click_action",
+    "derive_click_actions",
     "derive_held_codes",
+    "note_edges",
 ]
