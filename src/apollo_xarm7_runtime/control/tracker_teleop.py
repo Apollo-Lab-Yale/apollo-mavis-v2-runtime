@@ -15,12 +15,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from apollo_xarm7_core import LatestSlot, Pose, se3
-from apollo_xarm7_core.protocol import KEYMAP
+
+from ..devices.tracker import CLUTCH_CODE
 
 if TYPE_CHECKING:
     from ..devices.tracker import TrackerSample, TrackerSettings
 
-TRACKER_CLUTCH_CODE: str = next(e.code for e in KEYMAP if e.action == "tracker_clutch")
+TRACKER_CLUTCH_CODE: str = CLUTCH_CODE  # keymap code of ``tracker_clutch`` (KeyC)
 _EPS = 1e-12
 
 

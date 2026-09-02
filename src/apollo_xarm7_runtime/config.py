@@ -95,11 +95,37 @@ class DaggerConfig(BaseModel):
     trainer: TrainerSettings = TrainerSettings()
 
 
+ControllerInput = Literal["trigger_click", "trackpad_up", "trackpad_down", "none"]
+"""Vive-controller inputs a teleop action may be bound to (13-tracker §1.1).
+
+``trigger_click`` = trigger button (id 0) pressed; ``trackpad_up`` /
+``trackpad_down`` = trackpad button (id 1) pressed with ``trackpad_y`` above
+``+trackpad_deadzone`` / below ``-trackpad_deadzone``; ``none`` = unbound.
+Grip / menu / system are deliberately not bindable (menu + system is the
+dongle pairing combo).
+"""
+
+
+class ControllerMapConfig(BaseModel):
+    """Controller input -> injected key code, per teleop action (13-tracker §1.1).
+
+    The injected codes are looked up from the core keymap by action
+    (``tracker_clutch`` / ``gripper_open`` / ``gripper_close``), never
+    hard-coded.
+    """
+
+    clutch: ControllerInput = "trigger_click"
+    gripper_open: ControllerInput = "trackpad_up"
+    gripper_close: ControllerInput = "trackpad_down"
+
+
 class TrackerConfig(BaseModel):
     """Vive-tracker teleop device + defaults (13-tracker §4).
 
     ``yaw_deg`` / ``pos_scale`` / ``follow_rotation`` are the process-lifetime
     defaults; the ``tracker_settings`` action mutates the live values.
+    ``controller_map`` / ``trackpad_deadzone`` bind the paired controller's
+    buttons to device-held key codes (13-tracker §1.1).
     """
 
     backend: Literal["none", "fake", "libsurvive"] = "none"
@@ -110,6 +136,8 @@ class TrackerConfig(BaseModel):
     follow_rotation: bool = True
     stale_s: float = 0.2  # sample older than this -> hold
     max_jump_m: float = 0.10  # consecutive-sample jump above this -> invalid sample
+    controller_map: ControllerMapConfig = ControllerMapConfig()
+    trackpad_deadzone: float = Field(default=0.3, ge=0.0, le=1.0)  # |pad y| <= dz: no up/down
 
 
 class RuntimeConfig(BaseModel):
@@ -179,6 +207,8 @@ __all__ = [
     "DaggerConfig",
     "ExtrinsicsTolerance",
     "RecorderConfig",
+    "ControllerInput",
+    "ControllerMapConfig",
     "TrackerConfig",
     "VideoConfig",
     "RuntimeConfig",

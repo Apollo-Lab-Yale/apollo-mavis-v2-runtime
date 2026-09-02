@@ -9,6 +9,7 @@ from apollo_xarm7_core import CollisionReport, Pose
 from apollo_xarm7_core.protocol import (
     ArmTelemetry,
     ClearanceItem,
+    ControllerTelemetry,
     PoseMsg,
     SessionTelemetry,
     TelemetryMsg,
@@ -18,6 +19,23 @@ from apollo_xarm7_core.protocol import (
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ..control.tracker_teleop import align_pose
+from ..devices.tracker import ControllerState
+
+
+def _controller_msg(state: ControllerState | None) -> ControllerTelemetry | None:
+    if state is None:
+        return None
+    return ControllerTelemetry(
+        trigger=state.trigger,
+        trigger_pressed=state.trigger_pressed,
+        trackpad_touch=state.trackpad_touch,
+        trackpad_click=state.trackpad_click,
+        trackpad_x=state.trackpad_x,
+        trackpad_y=state.trackpad_y,
+        grip=state.grip,
+        menu=state.menu,
+        system=state.system,
+    )
 
 
 def _pose_msg(pose: Pose | None) -> PoseMsg | None:
@@ -30,7 +48,8 @@ def _pose_msg(pose: Pose | None) -> PoseMsg | None:
 
 
 def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
-    """Device fields from the Runtime-owned reader (pre-session too); clutch/
+    """Device fields (incl. the raw controller state and the device-held codes,
+    13-tracker §1.1) from the Runtime-owned reader (pre-session too); clutch/
     anchor/target from ``session_extra["tracker"]`` (13-tracker §3.5/§4)."""
     dev = runtime.tracker.status(now)
     settings = runtime.tracker_settings.get()
@@ -56,6 +75,8 @@ def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
             pos_scale=settings.pos_scale,
             follow_rotation=settings.follow_rotation,
         ),
+        controller=_controller_msg(dev.controller),
+        device_held=sorted(dev.device_held),
     )
 
 

@@ -44,3 +44,16 @@ tracker:
   follow_rotation: true                       # apply tracker orientation deltas
   stale_s: 0.2                                # sample age above this -> hold
   max_jump_m: 0.10                            # consecutive-sample jump -> invalid
+  # Vive-controller buttons as device-held key codes (13-tracker §1.1). Each
+  # action is bound to one input: trigger_click | trackpad_up | trackpad_down |
+  # none. The injected codes are the keymap codes of tracker_clutch (KeyC),
+  # gripper_open (KeyH) and gripper_close (KeyF); they merge into the tick's
+  # held set while the controller's sample stream is fresh (<= stale_s), are
+  # NOT covered by the WebSocket deadman, and never drive the rail. Grip /
+  # menu / system are not bindable (menu+system = dongle pairing combo). The
+  # `fake` backend has no buttons; unit/e2e tests script a controller state.
+  controller_map:
+    clutch: trigger_click                     # trigger button (id 0) pressed
+    gripper_open: trackpad_up                 # trackpad click with y > +trackpad_deadzone
+    gripper_close: trackpad_down              # trackpad click with y < -trackpad_deadzone
+  trackpad_deadzone: 0.3                      # |trackpad y| within this -> neither up nor down

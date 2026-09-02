@@ -57,9 +57,13 @@ class PoseIK:
 
 
 class Rig:
-    """Deterministic ControlLoop + provider; the tracker slot is fed by hand."""
+    """Deterministic ControlLoop + provider; the tracker slot is fed by hand.
 
-    def __init__(self, tracker: bool = True):
+    ``device(*codes)`` scripts the device-held codes (13-tracker §1.1) that
+    every subsequent sample carries; ``gripper_arms`` mirrors the loop option.
+    """
+
+    def __init__(self, tracker: bool = True, gripper_arms=None):
         self.cell = FakeWorkcell(
             {"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")}
         )
@@ -74,23 +78,39 @@ class Rig:
         self.sample_seq = 0
         self.held: tuple[str, ...] = ()
         self.pose: tuple[np.ndarray, np.ndarray] | None = None  # re-published each tick
+        self.codes: frozenset[str] = frozenset()  # device-held codes on every sample
+        self.controller = None  # ControllerState echoed on every sample
         self.loop = ControlLoop(
             self.cell, ControlConfig(), self.bus,
             SafetySupervisor(NullGate(), InputWatchdog()), ["arm0", "arm1"],
             ik=PoseIK(), kin=PoseKin(), tracker=self.tracker if tracker else None,
-            clock=lambda: self.t,
+            gripper_arms=gripper_arms, clock=lambda: self.t,
         )
         self.loop._seed_from_measured()
 
     # -- inputs -----------------------------------------------------------------
-    def sample(self, pos, quat=IDENT, *, valid=True, age=0.0, sticky=True):
+    def sample(self, pos, quat=IDENT, *, valid=True, age=0.0, sticky=True, codes=None):
         self.sample_seq += 1
+        codes = self.codes if codes is None else frozenset(codes)
         s = TrackerSample(
             Pose(np.asarray(pos, float), quat), np.zeros(3), np.zeros(3),
-            self.t, self.t - age, self.sample_seq, valid,
+            self.t, self.t - age, self.sample_seq, valid, self.controller, codes,
         )
         self.bus.tracker.put(s)
         self.pose = (np.asarray(pos, float), np.asarray(quat, float)) if sticky else None
+
+    def device(self, *codes, controller=None):
+        """Script the controller-derived codes; re-publishes the current pose
+        at once (the reader does the same on a button edge)."""
+        self.codes = frozenset(codes)
+        self.controller = controller
+        if self.pose is not None:
+            self.sample(*self.pose)
+
+    def latch_ws(self):
+        """Drive the WS InputWatchdog into AWAIT_EMPTY (scale 0) without
+        touching the held slot (the last KeysMsg stays in force)."""
+        self.loop.supervisor.watchdog.on_disconnect()
 
     def hold(self, *codes):
         self.held = codes

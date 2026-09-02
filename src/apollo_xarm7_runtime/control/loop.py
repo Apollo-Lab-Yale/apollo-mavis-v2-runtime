@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -48,6 +49,41 @@ logger = logging.getLogger(__name__)
 RAIL_TRAVEL_M = se3.RAIL_TRAVEL_M
 GRIPPER_SEND_EVERY_N_TICKS = 10  # <= 10 Hz (modbus is slow)
 PLAN_STATUS_LINGER_TICKS = 100  # keep "done"/"failed" visible ~1 s
+
+
+@dataclass(frozen=True)
+class HeldSources:
+    """The tick's held codes by source, each with its own scale (13-tracker §1.1).
+
+    ``ws``: ``KeysMsg.held`` (keyboard + gamepad) scaled by the WS
+    ``InputWatchdog``; ``device``: codes injected by the tracker reader from the
+    Vive controller's buttons, scaled ``1.0`` while the sample is fresh /
+    ``0.0`` when stale (then the set is empty). ``held`` is the merged set the
+    tick acts on; a code held by both sources takes the larger scale, so a
+    latched WS deadman (``AWAIT_EMPTY``) never zeroes device-driven motion.
+    """
+
+    ws: frozenset[str] = frozenset()
+    ws_scale: float = 1.0
+    device: frozenset[str] = frozenset()
+    device_scale: float = 0.0
+
+    @property
+    def held(self) -> frozenset[str]:
+        return self.ws | self.device
+
+    def scale_for(self, code: str) -> float:
+        """Largest scale among the sources holding ``code``; 0.0 if none does."""
+        scale = 0.0
+        if code in self.ws:
+            scale = max(scale, self.ws_scale)
+        if code in self.device:
+            scale = max(scale, self.device_scale)
+        return scale
+
+    def moving(self, codes: frozenset[str]) -> bool:
+        """True when some code in ``codes`` is held by a source with scale > 0."""
+        return any(self.scale_for(c) > 0.0 for c in self.held & codes)
 
 
 class ControlLoop:
@@ -90,6 +126,7 @@ class ControlLoop:
         self.tracker = tracker
         self._clock = clock
         self.dt = 1.0 / cfg.rate_hz
+        self.sources = HeldSources()  # this tick's held codes by source (step 2)
 
         self.active_arm: str | None = self.session_arms[0] if self.session_arms else None
         self.jog = JogState(cfg.jog)
@@ -185,9 +222,12 @@ class ControlLoop:
         self.bus.commands.drain(self._handle_command)  # 1
 
         got = self.bus.held_keys.get()  # 2
-        held: frozenset[str] = got[0].held if got is not None else frozenset()
-        scale = self.supervisor.watchdog.scale(now)
+        held_ws: frozenset[str] = got[0].held if got is not None else frozenset()
+        scale = self.supervisor.watchdog.scale(now)  # WS-source scale
         watchdog_tripped = self.supervisor.watchdog.tripped
+        device_codes, device_scale = self._device_inputs(now)
+        self.sources = HeldSources(held_ws, scale, device_codes, device_scale)
+        held = self.sources.held  # held_eff = held ∪ device_codes (13-tracker §1.1)
         if self.tracker is not None:
             self.tracker.clutch = TRACKER_CLUTCH_CODE in held
 
@@ -198,8 +238,8 @@ class ControlLoop:
             self.ik.sync_passive(states)
         q_meas = {a: states[a].q for a in self.session_arms}
 
-        # A held movement key cancels running plans (04-runtime §7).
-        if self.plans.active_arms and scale > 0.0 and (held & HELD_CODES):
+        # A held movement key (from a live source) cancels running plans (04-runtime §7).
+        if self.plans.active_arms and self.sources.moving(HELD_CODES):
             self._cancel_plans("movement key")
 
         # 5-7: per-arm action resolution -> commanded q (mode hook, phase-08).
@@ -226,7 +266,7 @@ class ControlLoop:
             self._last_cmd[arm_id] = np.array(q)
             self.bus.arm_slot(arm_id).put(np.array(q))
 
-        self._gripper_step(held, scale)
+        self._gripper_step(self.sources)
         self._expire_plan_status()
 
         episode = None
@@ -303,14 +343,21 @@ class ControlLoop:
     ) -> np.ndarray | None:
         """Held keys -> twist -> integrate -> IK -> q (04-runtime §6).
 
-        While ``tracker_clutch`` is held the tracker supplies the target
-        instead (13-tracker §4): keyboard translate/rotate keys are ignored,
-        rail (here) and gripper (``_gripper_step``) keys keep working.
+        ``held`` is the merged set (WS ∪ device); ``scale`` is the WS watchdog
+        scale, which governs the keyboard translate/rotate/rail keys (only WS
+        codes carry those). While ``tracker_clutch`` is held by ANY source the
+        tracker supplies the target instead (13-tracker §4) at the scale of
+        the source holding the clutch (``HeldSources.scale_for``, 13-tracker
+        §1.1): keyboard translate/rotate keys are ignored, rail (here) and
+        gripper (``_gripper_step``) keys keep working.
         """
         if self.ik is None or self.kin is None:
             return None
-        if scale <= 0.0:
-            return None  # deadman latched: hold (tracker anchors clear in end_tick)
+        clutch_scale = (
+            self.sources.scale_for(TRACKER_CLUTCH_CODE) if self.tracker is not None else 0.0
+        )
+        if scale <= 0.0 and clutch_scale <= 0.0:
+            return None  # every live source is latched/stale: hold (anchors clear in end_tick)
         tw = held_to_twist(held, self.cfg.teleop)
         rail_v = tw.rail_v * scale
         has_rail = state.q.shape[0] > 7
@@ -320,7 +367,11 @@ class ControlLoop:
             self.integrator.seed(arm_id, measured_tcp)
             self._teleop_seeded.add(arm_id)
         if self.tracker is not None and TRACKER_CLUTCH_CODE in held:
-            target = self._tracker_target(arm_id, measured_tcp, scale, now)
+            target = (
+                self._tracker_target(arm_id, measured_tcp, clutch_scale, now)
+                if clutch_scale > 0.0
+                else None  # clutch held only by a latched source: hold
+            )
             if target is None and not rail_moving:
                 return None  # no fresh valid sample: hold-last
         else:
@@ -392,14 +443,33 @@ class ControlLoop:
             return None
         return q_last + (q_next - q_last) * scale
 
-    def _gripper_step(self, held: frozenset[str], scale: float) -> None:
+    def _device_inputs(self, now: float) -> tuple[frozenset[str], float]:
+        """Device-held codes + scale from the newest tracker sample (13-tracker
+        §1.1). The controller's own sample stream is their heartbeat: fresh
+        (``age <= stale_s``) => the sample's codes at scale 1.0; stale or no
+        sample/provider => no codes, scale 0.0. Not covered by the WS watchdog."""
+        if self.tracker is None:
+            return frozenset(), 0.0
+        got = self.tracker.slot.get()
+        if got is None or now - got[0].rx_mono > self.tracker.stale_s:
+            return frozenset(), 0.0
+        return got[0].held_codes, 1.0
+
+    def _gripper_step(self, sources: HeldSources) -> None:
+        """F/H integrate ``open_frac`` per source at that source's scale: a
+        device-held gripper code keeps working while the WS deadman is latched
+        and stops within ``stale_s`` when the controller stream dies."""
         arm_id = self.active_arm
         if arm_id is None or arm_id not in self.gripper_arms:
             return  # gripper keys are ignored on a camera-only arm
-        tw = held_to_twist(held, self.cfg.teleop)
-        if tw.grip_v == 0.0 or scale <= 0.0:
+        grip_v = 0.0
+        for code in sources.held:
+            gv = held_to_twist(frozenset({code}), self.cfg.teleop).grip_v
+            if gv != 0.0:
+                grip_v += gv * sources.scale_for(code)
+        if grip_v == 0.0:
             return
-        frac = self._grip_frac[arm_id] + tw.grip_v * self.dt * scale
+        frac = self._grip_frac[arm_id] + grip_v * self.dt
         self._grip_frac[arm_id] = min(max(frac, 0.0), 1.0)
         if self.tick_count % GRIPPER_SEND_EVERY_N_TICKS == 0:
             sender = self._senders.get(arm_id)
@@ -632,4 +702,4 @@ class ControlLoop:
         return CommandResult(cmd.corr_id, True, profile.profile_id)
 
 
-__all__ = ["ControlLoop", "GRIPPER_SEND_EVERY_N_TICKS", "PLAN_STATUS_LINGER_TICKS"]
+__all__ = ["ControlLoop", "GRIPPER_SEND_EVERY_N_TICKS", "HeldSources", "PLAN_STATUS_LINGER_TICKS"]
