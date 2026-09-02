@@ -98,7 +98,7 @@ class RuntimeConfig(BaseModel):
     """Top-level runtime config; sane defaults for sim-only dev."""
 
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int = 8765  # 8000 is commonly taken on dev boxes (gohttpserver on the lab machine)
     ui_dist: Path | None = None  # built SPA; None = API-only (Vite dev)
     workcells: dict[str, WorkcellConfig] = Field(default_factory=dict)  # "hardware"|"sim"
     profiles_dir: Path = Path("~/apollo/profiles")
