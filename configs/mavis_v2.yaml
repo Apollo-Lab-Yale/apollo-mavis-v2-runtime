@@ -1,15 +1,18 @@
-# Example sim-only runtime config (04-runtime §14).
-# Run: uv run python -m apollo_xarm7_runtime --config configs/sim.yaml
+# MAVIS v2 lab cell in simulation (scene apollo-xarm7-sim scenes/mavis_v2.yaml).
+# Run: uv run python -m apollo_xarm7_runtime --config configs/mavis_v2.yaml
 host: 127.0.0.1
 port: 8765
 ui_dist: null              # path to built SPA; null = API-only (Vite dev proxy)
 workcells:
   sim:
     kind: sim
-    sim_scene: single_rail  # default scene; POST /api/session may override
+    sim_scene: mavis_v2     # POST /api/session may override
     arms:
-      - id: arm0
+      - id: view            # front, camera-only arm
         base_in_world: {}   # sim arm placement comes from the scene descriptor
+        gripper: none
+      - id: grip            # back, xArm gripper + wrist camera
+        base_in_world: {}
     cameras: []
     safety:
       safety_debug: false   # true = full hardware safety stack vs the sim cell
