@@ -26,6 +26,7 @@ from apollo_xarm7_core.protocol import SessionInfo, SessionSpec
 
 from ..config import RuntimeConfig
 from ..control.loop import ControlLoop
+from ..control.pose_filter import PoseFilterConfig
 from ..control.tracker_teleop import TrackerTeleop
 from ..devices.tracker import TrackerSettings
 from ..errors import SessionError, SessionNotFoundError
@@ -145,6 +146,7 @@ class SessionManager:
             stale_s=self.cfg.tracker.stale_s,
             leash_pos_m=self.cfg.control.leash.pos_m,
             leash_rot_rad=self.cfg.control.leash.rot_rad,
+            filter_cfg=PoseFilterConfig(**self.cfg.tracker.filter.model_dump()),
         )
 
     # -- validation ---------------------------------------------------------------

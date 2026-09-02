@@ -146,18 +146,22 @@ class GatedPolicyExecutor(ControlLoop):
                 out[arm_id] = None
             elif self.plans.active(arm_id):
                 q = self.plans.step(arm_id, q_last)
+                self._note_source(arm_id, CommandSource.PLANNER)
                 if not self.plans.active(arm_id):
                     self._finish_plan(arm_id, ok=True)
                 out[arm_id] = q
             elif arm_id == engaged:
+                self._note_source(arm_id, CommandSource.TELEOP)
                 out[arm_id] = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             elif engaged is not None:
                 out[arm_id] = None  # frozen: hold; ordinary policy frame (§2)
             elif policy_on:
+                self._note_source(arm_id, CommandSource.POLICY)  # teleop re-seeds after this
                 out[arm_id] = self._policy_step(arm_id, states[arm_id], q_last, now)
                 self._policy_drove = True
             elif self.session_mode == "dagger" and arm_id == self.active_arm:
                 # between episodes: plain teleop for scene staging
+                self._note_source(arm_id, CommandSource.TELEOP)
                 out[arm_id] = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             else:
                 out[arm_id] = None

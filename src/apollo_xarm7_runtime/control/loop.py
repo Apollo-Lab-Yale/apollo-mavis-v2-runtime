@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 RAIL_TRAVEL_M = se3.RAIL_TRAVEL_M
 GRIPPER_SEND_EVERY_N_TICKS = 10  # <= 10 Hz (modbus is slow)
 PLAN_STATUS_LINGER_TICKS = 100  # keep "done"/"failed" visible ~1 s
+DEVICE_ACTION_LINGER_S = 1.0  # telemetry shows the last device-sourced discrete action this long
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,9 @@ class ControlLoop:
         self._grip_frac: dict[str, float] = {}
         self._states: dict[str, ArmState] = {}
         self._teleop_seeded: set[str] = set()
+        self._arm_source: dict[str, CommandSource] = {}  # per-arm last resolving source
+        self._click_seq_seen: int | None = None  # controller.click_seq adopted last tick
+        self._device_action: tuple[str, float] | None = None  # (label, show until)
         self._seeded = False
         self._plan_state: dict[str, str] = {}  # arm -> planning|executing|failed
         self._plan_clear_at: dict[str, int] = {}
@@ -245,7 +249,7 @@ class ControlLoop:
         # 5-7: per-arm action resolution -> commanded q (mode hook, phase-08).
         resolved, source = self._resolve_arms(states, held, scale, now)
         if self.tracker is not None:
-            self.tracker.end_tick()  # not consulted this tick -> anchors cleared
+            self.tracker.end_tick(now)  # not consulted this tick -> anchors cleared
         q_cmd: dict[str, np.ndarray] = {
             arm_id: (q if q is not None else self._last_cmd[arm_id])
             for arm_id, q in resolved.items()
@@ -291,7 +295,12 @@ class ControlLoop:
                 "plan_status": self._plan_status,
                 "kind": self.workcell_kind,
                 "tracker": (
-                    self.tracker.telemetry_extra() if self.tracker is not None else None
+                    {
+                        **self.tracker.telemetry_extra(),
+                        "device_action": self._device_action_label(now),
+                    }
+                    if self.tracker is not None
+                    else None
                 ),
                 **self._session_extra(now),
             },
@@ -314,15 +323,28 @@ class ControlLoop:
             elif self.plans.active(arm_id):
                 q_next = self.plans.step(arm_id, q_last)
                 source = CommandSource.PLANNER
+                self._note_source(arm_id, CommandSource.PLANNER)
                 if not self.plans.active(arm_id):  # final waypoint reached
                     self._finish_plan(arm_id, ok=True)
             elif self.jog.active(arm_id):
                 q_next = self._jog_step(arm_id, q_last, scale)
                 source = CommandSource.JOINT_JOG
+                self._note_source(arm_id, CommandSource.JOINT_JOG)
             elif arm_id == self.active_arm:
+                self._note_source(arm_id, CommandSource.TELEOP)
                 q_next = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             out[arm_id] = q_next
         return out, source
+
+    def _note_source(self, arm_id: str, source: CommandSource) -> None:
+        """Record the source resolving ``arm_id`` this tick (13-tracker §4
+        "Anchor and re-seed rules" (a)): any non-teleop source (plan, jog,
+        policy) invalidates the arm's teleop seed, so the next teleop tick
+        re-seeds the integrator from the measured TCP and the first clutched
+        tick after such motion has zero delta."""
+        self._arm_source[arm_id] = source
+        if source is not CommandSource.TELEOP:
+            self._teleop_seeded.discard(arm_id)
 
     def _post_filter(self, dec, now: float) -> None:
         """After the safety gate; dagger uses this for block-streak anomaly."""
@@ -363,15 +385,12 @@ class ControlLoop:
         has_rail = state.q.shape[0] > 7
         rail_moving = bool(rail_v and has_rail)
         measured_tcp = self.kin.tcp_world(arm_id, state.q)
-        if arm_id not in self._teleop_seeded:
-            self.integrator.seed(arm_id, measured_tcp)
-            self._teleop_seeded.add(arm_id)
         if self.tracker is not None and TRACKER_CLUTCH_CODE in held:
-            target = (
-                self._tracker_target(arm_id, measured_tcp, clutch_scale, now)
-                if clutch_scale > 0.0
-                else None  # clutch held only by a latched source: hold
-            )
+            if clutch_scale > 0.0:
+                self._seed_teleop(arm_id, measured_tcp)
+                target = self._tracker_target(arm_id, measured_tcp, clutch_scale, now)
+            else:
+                target = None  # clutch held only by a latched source: hold
             if target is None and not rail_moving:
                 return None  # no fresh valid sample: hold-last
         else:
@@ -379,6 +398,7 @@ class ControlLoop:
             w = tw.w * scale
             if not (np.any(v) or np.any(w) or rail_moving):
                 return None  # nothing held: non-active-style hold (no re-servo)
+            self._seed_teleop(arm_id, measured_tcp)
             from apollo_xarm7_core import Twist
 
             tw_world = twist_to_control_frame(
@@ -396,6 +416,15 @@ class ControlLoop:
             base = q_last[7] if rail_v else q[7]
             q[7] = min(max(base + rail_v * self.dt, 0.0), RAIL_TRAVEL_M)
         return q
+
+    def _seed_teleop(self, arm_id: str, measured_tcp: Pose) -> None:
+        """(Re-)seed the integrated target from the measured TCP the moment
+        teleop motion input starts (keys / clutch), not on idle hold ticks: the
+        seed is invalidated by ``_note_source`` after plan/jog/policy motion,
+        an arm switch and recovery, so the first driven tick has zero delta."""
+        if arm_id not in self._teleop_seeded:
+            self.integrator.seed(arm_id, measured_tcp)
+            self._teleop_seeded.add(arm_id)
 
     def _solve_target(
         self, arm_id: str, target: Pose, q_last: np.ndarray, measured_tcp: Pose
@@ -451,9 +480,47 @@ class ControlLoop:
         if self.tracker is None:
             return frozenset(), 0.0
         got = self.tracker.slot.get()
-        if got is None or now - got[0].rx_mono > self.tracker.stale_s:
+        if got is None:
             return frozenset(), 0.0
-        return got[0].held_codes, 1.0
+        sample = got[0]
+        fresh = now - sample.rx_mono <= self.tracker.stale_s
+        self._device_click_edge(sample, fresh, now)
+        if not fresh:
+            return frozenset(), 0.0
+        return sample.held_codes, 1.0
+
+    def _device_click_edge(self, sample, fresh: bool, now: float) -> None:
+        """Fire the discrete device action bound to a trackpad press edge
+        (13-tracker §1.1): ``controller.click_seq`` advanced since the last
+        tick => run ``sample.click_action`` (``switch_arm`` / ``switch_arm_prev``)
+        through the same handler as the WS action (same nacks). The first
+        observed counter is adopted silently; edges on a stale sample are dropped."""
+        ctl = sample.controller
+        if ctl is None:
+            self._click_seq_seen = None
+            return
+        seen, self._click_seq_seen = self._click_seq_seen, ctl.click_seq
+        if seen is None or ctl.click_seq == seen or not fresh:
+            return
+        if sample.click_action is not None:
+            self._fire_device_action(sample.click_action, now)
+
+    def _fire_device_action(self, name: str, now: float) -> CommandResult:
+        res = self._handle_command(Command(op=name, source="internal"))
+        label = name if res.ok else f"{name} nacked: {res.detail}"
+        self._device_action = (label, now + DEVICE_ACTION_LINGER_S)
+        logger.info("device action %s -> %s", name, "ok" if res.ok else f"nack ({res.detail})")
+        return res
+
+    def _device_action_label(self, now: float) -> str | None:
+        """Last device-sourced discrete action, shown for ``DEVICE_ACTION_LINGER_S``."""
+        if self._device_action is None:
+            return None
+        label, until = self._device_action
+        if now >= until:
+            self._device_action = None
+            return None
+        return label
 
     def _gripper_step(self, sources: HeldSources) -> None:
         """F/H integrate ``open_frac`` per source at that source's scale: a
@@ -540,7 +607,8 @@ class ControlLoop:
         return self._switch_arm(cmd, -1)
 
     def _op_tracker_settings(self, cmd: Command) -> CommandResult:
-        """Mutate the live yaw/scale/rotation settings (echoed in telemetry)."""
+        """Mutate the live yaw/scale/rotation/filter settings (echoed in telemetry);
+        the provider re-anchors instead of moving the arm when engaged (13-tracker §4)."""
         if self.tracker is None:
             return CommandResult(cmd.corr_id, False, "no tracker provider in this session")
         try:
@@ -548,12 +616,16 @@ class ControlLoop:
         except Exception as e:
             return CommandResult(cmd.corr_id, False, f"invalid tracker_settings args: {e}")
         v = self.tracker.settings.update(
-            yaw_deg=args.yaw_deg, pos_scale=args.pos_scale, follow_rotation=args.follow_rotation
+            yaw_deg=args.yaw_deg, pos_scale=args.pos_scale, follow_rotation=args.follow_rotation,
+            filter_enabled=args.filter_enabled, filter_min_cutoff_hz=args.filter_min_cutoff_hz,
+            filter_beta=args.filter_beta,
         )
         return CommandResult(
             cmd.corr_id, True,
             f"yaw_deg={v.yaw_deg:g} pos_scale={v.pos_scale:g} "
-            f"follow_rotation={str(v.follow_rotation).lower()}",
+            f"follow_rotation={str(v.follow_rotation).lower()} "
+            f"filter_enabled={str(v.filter_enabled).lower()} "
+            f"filter_min_cutoff_hz={v.filter_min_cutoff_hz:g} filter_beta={v.filter_beta:g}",
         )
 
     def _op_takeover_toggle(self, cmd: Command) -> CommandResult:
@@ -702,4 +774,10 @@ class ControlLoop:
         return CommandResult(cmd.corr_id, True, profile.profile_id)
 
 
-__all__ = ["ControlLoop", "GRIPPER_SEND_EVERY_N_TICKS", "HeldSources", "PLAN_STATUS_LINGER_TICKS"]
+__all__ = [
+    "ControlLoop",
+    "DEVICE_ACTION_LINGER_S",
+    "GRIPPER_SEND_EVERY_N_TICKS",
+    "HeldSources",
+    "PLAN_STATUS_LINGER_TICKS",
+]

@@ -8,8 +8,22 @@ control channel; compression only adds CPU and buffering).
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
+
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+
+def configure_logging(level: int = logging.INFO) -> bool:
+    """INFO to stderr with a sane format unless the root logger is already
+    configured (embedding apps / tests keep their own handlers). Returns True
+    when this call installed the handler."""
+    root = logging.getLogger()
+    if root.handlers:
+        return False
+    logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args(argv)
+    configure_logging()  # tracker/reader warnings must reach stderr (13-tracker §4)
 
     # MUST precede any mujoco import / GL init (04-runtime §13.5).
     os.environ.setdefault("MUJOCO_GL", "egl")

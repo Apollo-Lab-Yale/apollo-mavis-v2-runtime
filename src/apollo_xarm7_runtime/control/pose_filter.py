@@ -78,6 +78,7 @@ class PoseFilter:
         self.cfg = cfg or PoseFilterConfig()
         c = self.cfg
         self._pos = OneEuroVector(c.min_cutoff_hz, c.beta, c.d_cutoff_hz)
+        self.enabled = bool(c.enabled)  # live-toggled via retune(); False = passthrough
         self.min_cutoff_hz = c.min_cutoff_hz
         self.beta = c.beta
         self._q_hat: np.ndarray | None = None
@@ -92,12 +93,21 @@ class PoseFilter:
         self._t = None
         self._emitted = None
 
-    def retune(self, min_cutoff_hz: float | None = None, beta: float | None = None) -> None:
-        """Live tuning from ``tracker_settings``; keeps the current state."""
+    def retune(
+        self,
+        min_cutoff_hz: float | None = None,
+        beta: float | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        """Live tuning from ``tracker_settings``; keeps the current state.
+        Re-enabling after a passthrough stretch restarts from the next pose."""
         if min_cutoff_hz is not None:
             self.min_cutoff_hz = self._pos.min_cutoff_hz = max(float(min_cutoff_hz), 1e-3)
         if beta is not None:
             self.beta = self._pos.beta = max(float(beta), 0.0)
+        if enabled is not None and bool(enabled) != self.enabled:
+            self.enabled = bool(enabled)
+            self.reset()
 
     def _step_orientation(self, q: np.ndarray, t: float) -> np.ndarray:
         if self._q_hat is None or self._t is None:
@@ -116,7 +126,7 @@ class PoseFilter:
         return self._q_hat
 
     def step(self, pose: Pose, t: float) -> Pose:
-        if not self.cfg.enabled:
+        if not self.enabled:
             return pose
         p_hat = self._pos.step(pose.position, t)
         q_hat = self._step_orientation(np.asarray(pose.orientation), t)

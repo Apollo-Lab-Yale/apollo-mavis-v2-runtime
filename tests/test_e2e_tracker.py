@@ -80,6 +80,9 @@ class Tele:
         self.sock.close()
 
 
+FILTER_DEFAULTS = {"filter_enabled": True, "filter_min_cutoff_hz": 1.0, "filter_beta": 0.05}
+
+
 def _dist(a, b) -> float:
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b, strict=True)))
 
@@ -111,7 +114,10 @@ def test_tracker_telemetry_pre_session_device_fields(server, api):
         assert _dist(trk["pose_raw"]["position"], trk["pose_world"]["position"]) < 1e-9  # yaw 0
         assert trk["clutch"] is False and trk["engaged_arm"] is None
         assert trk["anchor_tcp"] is None and trk["target_tcp"] is None
-        assert trk["settings"] == {"yaw_deg": 0.0, "pos_scale": 1.0, "follow_rotation": True}
+        assert trk["settings"] == FILTER_DEFAULTS | {
+            "yaw_deg": 0.0, "pos_scale": 1.0, "follow_rotation": True
+        }
+        assert trk["pose_filtered"] is None and trk["device_action"] is None  # no session
     finally:
         tele.close()
 
@@ -174,7 +180,7 @@ def test_tracker_settings_and_switch_arm_prev_over_ws(server, api, session):
             s = tele.latest()["tracker"]["settings"]
             if s["pos_scale"] == 2.0:
                 break
-        assert s == {"yaw_deg": 30.0, "pos_scale": 2.0, "follow_rotation": True}
+        assert s == FILTER_DEFAULTS | {"yaw_deg": 30.0, "pos_scale": 2.0, "follow_rotation": True}
         trk = tele.latest()["tracker"]  # pose_world now yaw-rotated vs pose_raw
         assert _dist(trk["pose_raw"]["position"], trk["pose_world"]["position"]) > 0.01
         ack = ctl.action("tracker_settings", {"pos_scale": 9.0})
@@ -200,10 +206,11 @@ def _script_controller(server):
     return script
 
 
-def _pad(y: float, trigger: bool = False) -> ControllerState:
+def _pad(x: float = 0.0, y: float = 0.0, trigger: bool = False, click: bool = True):
+    """Raw scripted controller state (the reader classifies the click at its edge)."""
     return ControllerState(
         trigger=1.0 if trigger else 0.0, trigger_pressed=trigger,
-        trackpad_touch=True, trackpad_click=True, trackpad_y=y,
+        trackpad_touch=True, trackpad_click=click, trackpad_x=x, trackpad_y=y,
     )
 
 
@@ -244,17 +251,24 @@ def test_controller_trigger_moves_ee_without_any_keysmsg(server, api, session, c
         p2 = tele.latest()["arms"][0]["ee_pose"]["position"]
         time.sleep(0.5)
         assert _dist(p2, tele.latest()["arms"][0]["ee_pose"]["position"]) < 2e-3
-        # Trackpad click up / down / inside the deadzone -> KeyH / KeyF / nothing.
-        script["state"] = _pad(0.9)
+        # Trackpad click right / left / inside the deadzone -> KeyH / KeyF / nothing;
+        # each click is classified at its press edge, so release in between.
+        script["state"] = _pad(x=0.9)
         trk = _wait_tracker(tele, lambda t: t["device_held"] == ["KeyH"])
         assert trk["device_held"] == ["KeyH"] and trk["controller"]["trackpad_click"] is True
-        script["state"] = _pad(-0.9)
+        script["state"] = _pad(x=0.9, click=False)
+        _wait_tracker(tele, lambda t: t["device_held"] == [])
+        script["state"] = _pad(x=-0.9)
         trk = _wait_tracker(tele, lambda t: t["device_held"] == ["KeyF"])
-        assert trk["device_held"] == ["KeyF"] and trk["controller"]["trackpad_y"] == -0.9
-        script["state"] = _pad(0.1)
-        trk = _wait_tracker(tele, lambda t: t["device_held"] == [])
+        assert trk["device_held"] == ["KeyF"] and trk["controller"]["trackpad_x"] == -0.9
+        script["state"] = _pad(x=-0.9, click=False)
+        _wait_tracker(tele, lambda t: t["device_held"] == [])
+        script["state"] = _pad(x=0.1, y=0.1)
+        time.sleep(0.3)
+        trk = tele.latest()["tracker"]
         assert trk["device_held"] == [] and trk["controller"]["trackpad_click"] is True
-        assert trk["controller"]["trackpad_y"] == pytest.approx(0.1)
+        assert trk["controller"]["trackpad_x"] == pytest.approx(0.1)
+        assert trk["device_action"] is None
     finally:
         script["state"] = None
         server.runtime.tracker.controller_provider = None
@@ -279,7 +293,7 @@ def test_controller_codes_survive_ws_deadman_latch(server, api, session):
         assert msg["active_arm"] == "grip"
         p0 = msg["arms"][1]["ee_pose"]["position"]
         g0 = msg["arms"][1]["gripper_open_frac"]
-        script["state"] = _pad(-1.0, trigger=True)  # trigger click + trackpad down
+        script["state"] = _pad(x=-1.0, trigger=True)  # trigger click + trackpad left
         trk = _wait_tracker(tele, lambda t: t["engaged_arm"] == "grip")
         assert sorted(trk["device_held"]) == ["KeyC", "KeyF"]
         time.sleep(1.5)
@@ -292,5 +306,99 @@ def test_controller_codes_survive_ws_deadman_latch(server, api, session):
     finally:
         script["state"] = None
         server.runtime.tracker.controller_provider = None
+        ctl.close()
+        tele.close()
+
+
+# -- 13-tracker §1.1 remap + §4 filter: trackpad left/right gripper, up/down arm switch ----------
+def test_trackpad_click_gripper_only_on_grip_arm_and_up_switches_arm(server, api, session):
+    script = _script_controller(server)
+    tele = Tele(server)
+    try:
+        msg = tele.latest()
+        assert msg["active_arm"] == "view"  # camera-only arm: gripper codes are ignored
+        script["state"] = _pad(click=False)  # pad touched, not clicked: controller adopted
+        _wait_tracker(tele, lambda t: t["controller"] is not None)
+        g_grip0 = msg["arms"][1]["gripper_open_frac"]
+        script["state"] = _pad(x=-0.9)  # left -> gripper_close (held)
+        trk = _wait_tracker(tele, lambda t: t["device_held"] == ["KeyF"])
+        assert trk["device_action"] is None
+        time.sleep(0.6)
+        msg = tele.latest()
+        assert msg["active_arm"] == "view"
+        assert msg["arms"][1]["gripper_open_frac"] == pytest.approx(g_grip0, abs=0.01)  # no cmd
+        script["state"] = _pad(x=-0.9, click=False)
+        _wait_tracker(tele, lambda t: t["device_held"] == [])
+        # Trackpad up: switch_arm fires once on the press edge -> grip arm, latched ~1 s.
+        script["state"] = _pad(y=0.9)
+        trk = _wait_tracker(tele, lambda t: t["device_action"] == "switch_arm")
+        assert trk["device_held"] == []
+        time.sleep(0.5)
+        msg = tele.latest()
+        assert msg["active_arm"] == "grip" and msg["tracker"]["device_action"] == "switch_arm"
+        script["state"] = _pad(y=0.9, click=False)
+        trk = _wait_tracker(tele, lambda t: t["device_action"] is None, timeout_s=2.5)
+        assert trk["device_action"] is None and tele.latest()["active_arm"] == "grip"
+        # Now the gripper codes act: left closes ...
+        g0 = tele.latest()["arms"][1]["gripper_open_frac"]
+        script["state"] = _pad(x=-0.9)
+        _wait_tracker(tele, lambda t: t["device_held"] == ["KeyF"])
+        time.sleep(0.6)
+        g1 = tele.latest()["arms"][1]["gripper_open_frac"]
+        assert g1 < g0 - 0.4  # 1.2/s while held
+        script["state"] = _pad(x=-0.9, click=False)
+        _wait_tracker(tele, lambda t: t["device_held"] == [])
+        # ... and right (x dominant even with some y) opens again.
+        script["state"] = _pad(x=0.9, y=0.4)
+        _wait_tracker(tele, lambda t: t["device_held"] == ["KeyH"])
+        time.sleep(0.6)
+        g2 = tele.latest()["arms"][1]["gripper_open_frac"]
+        assert g2 > g1 + 0.1  # sim gripper opens slower than it closes; direction is the point
+        script["state"] = _pad(x=0.9, click=False)
+        _wait_tracker(tele, lambda t: t["device_held"] == [])
+        # Trackpad down -> switch_arm_prev (wraps back to view).
+        script["state"] = _pad(y=-0.9)
+        trk = _wait_tracker(tele, lambda t: t["device_action"] == "switch_arm_prev")
+        time.sleep(0.2)
+        assert tele.latest()["active_arm"] == "view"
+        script["state"] = None
+        _wait_tracker(tele, lambda t: t["controller"] is None)
+    finally:
+        script["state"] = None
+        server.runtime.tracker.controller_provider = None
+        tele.close()
+
+
+def test_filter_settings_echoed_and_pose_filtered_in_session(server, api, session):
+    ctl = Ctl(server)
+    tele = Tele(server)
+    try:
+        trk = _wait_tracker(tele, lambda t: t["pose_filtered"] is not None)
+        assert trk["settings"] == FILTER_DEFAULTS | {
+            "yaw_deg": 0.0, "pos_scale": 1.0, "follow_rotation": True
+        }
+        # Free-running filter while the clutch is up: filtered pose trails the moving fake.
+        assert _dist(trk["pose_filtered"]["position"], trk["pose_world"]["position"]) < 0.05
+        ack = ctl.action(
+            "tracker_settings",
+            {"filter_min_cutoff_hz": 5.0, "filter_beta": 0.5, "filter_enabled": False},
+        )
+        assert ack["ok"] and "filter_min_cutoff_hz=5" in ack["detail"], ack
+        trk = _wait_tracker(tele, lambda t: t["settings"]["filter_enabled"] is False)
+        assert trk["settings"]["filter_min_cutoff_hz"] == 5.0
+        assert trk["settings"]["filter_beta"] == 0.5 and trk["settings"]["pos_scale"] == 1.0
+        trk = tele.latest()["tracker"]  # passthrough: filtered == world pose
+        assert _dist(trk["pose_filtered"]["position"], trk["pose_world"]["position"]) < 2e-3
+        ack = ctl.action("tracker_settings", {"filter_min_cutoff_hz": 0.0})
+        assert not ack["ok"] and "invalid args" in ack["detail"]
+        ack = ctl.action(
+            "tracker_settings",
+            {"filter_min_cutoff_hz": 1.0, "filter_beta": 0.05, "filter_enabled": True},
+        )
+        assert ack["ok"]
+        _wait_tracker(tele, lambda t: t["settings"] == FILTER_DEFAULTS | {
+            "yaw_deg": 0.0, "pos_scale": 1.0, "follow_rotation": True
+        })
+    finally:
         ctl.close()
         tele.close()

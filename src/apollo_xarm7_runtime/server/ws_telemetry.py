@@ -50,7 +50,9 @@ def _pose_msg(pose: Pose | None) -> PoseMsg | None:
 def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
     """Device fields (incl. the raw controller state and the device-held codes,
     13-tracker §1.1) from the Runtime-owned reader (pre-session too); clutch/
-    anchor/target from ``session_extra["tracker"]`` (13-tracker §3.5/§4)."""
+    anchor/target/filtered pose/last device action from
+    ``session_extra["tracker"]`` (13-tracker §3.5/§4); settings incl. the live
+    filter fields from the Runtime-owned ``TrackerSettings``."""
     dev = runtime.tracker.status(now)
     settings = runtime.tracker_settings.get()
     extra = (snap.session_extra.get("tracker") if snap is not None else None) or {}
@@ -66,6 +68,7 @@ def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
         pose_world=_pose_msg(
             align_pose(dev.pose_raw, settings.yaw_deg) if dev.pose_raw is not None else None
         ),
+        pose_filtered=_pose_msg(extra.get("pose_filtered")),
         clutch=bool(extra.get("clutch", False)),
         engaged_arm=extra.get("engaged_arm"),
         anchor_tcp=_pose_msg(extra.get("anchor_tcp")),
@@ -74,9 +77,13 @@ def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
             yaw_deg=settings.yaw_deg,
             pos_scale=settings.pos_scale,
             follow_rotation=settings.follow_rotation,
+            filter_enabled=settings.filter_enabled,
+            filter_min_cutoff_hz=settings.filter_min_cutoff_hz,
+            filter_beta=settings.filter_beta,
         ),
         controller=_controller_msg(dev.controller),
         device_held=sorted(dev.device_held),
+        device_action=extra.get("device_action"),
     )
 
 

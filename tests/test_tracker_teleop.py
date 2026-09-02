@@ -63,15 +63,18 @@ class Rig:
     every subsequent sample carries; ``gripper_arms`` mirrors the loop option.
     """
 
-    def __init__(self, tracker: bool = True, gripper_arms=None):
+    def __init__(self, tracker: bool = True, gripper_arms=None, *, filter=False, filter_cfg=None):
         self.cell = FakeWorkcell(
             {"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")}
         )
         self.cell.start()
         self.bus = RuntimeBus()
-        self.settings = TrackerSettings()
+        # The pose filter is OFF by default here so the anchor/delta math is
+        # exact; filter tests opt in (``filter=True`` / a PoseFilterConfig).
+        self.settings = TrackerSettings(filter_enabled=filter)
         self.tracker = TrackerTeleop(
-            self.bus.tracker, self.settings, stale_s=0.2, leash_pos_m=0.025, leash_rot_rad=0.2
+            self.bus.tracker, self.settings, stale_s=0.2, leash_pos_m=0.025, leash_rot_rad=0.2,
+            filter_cfg=filter_cfg,
         )
         self.t = 0.0
         self.key_seq = 0
@@ -80,6 +83,7 @@ class Rig:
         self.pose: tuple[np.ndarray, np.ndarray] | None = None  # re-published each tick
         self.codes: frozenset[str] = frozenset()  # device-held codes on every sample
         self.controller = None  # ControllerState echoed on every sample
+        self.click_action = None  # action bound to the newest trackpad press edge
         self.loop = ControlLoop(
             self.cell, ControlConfig(), self.bus,
             SafetySupervisor(NullGate(), InputWatchdog()), ["arm0", "arm1"],
@@ -95,15 +99,18 @@ class Rig:
         s = TrackerSample(
             Pose(np.asarray(pos, float), quat), np.zeros(3), np.zeros(3),
             self.t, self.t - age, self.sample_seq, valid, self.controller, codes,
+            self.click_action,
         )
         self.bus.tracker.put(s)
         self.pose = (np.asarray(pos, float), np.asarray(quat, float)) if sticky else None
 
-    def device(self, *codes, controller=None):
-        """Script the controller-derived codes; re-publishes the current pose
-        at once (the reader does the same on a button edge)."""
+    def device(self, *codes, controller=None, click_action=None):
+        """Script the controller-derived codes (and the action bound to the
+        newest trackpad press, as the reader derives it); re-publishes the
+        current pose at once (the reader does the same on a button edge)."""
         self.codes = frozenset(codes)
         self.controller = controller
+        self.click_action = click_action
         if self.pose is not None:
             self.sample(*self.pose)
 

@@ -8,7 +8,7 @@ from typing import Literal
 
 import yaml
 from apollo_xarm7_core import ConfigError, WorkcellConfig
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
 class TeleopRates(BaseModel):
@@ -95,28 +95,66 @@ class DaggerConfig(BaseModel):
     trainer: TrainerSettings = TrainerSettings()
 
 
-ControllerInput = Literal["trigger_click", "trackpad_up", "trackpad_down", "none"]
+ControllerInput = Literal[
+    "trigger_click", "trackpad_left", "trackpad_right", "trackpad_up", "trackpad_down", "none"
+]
 """Vive-controller inputs a teleop action may be bound to (13-tracker §1.1).
 
-``trigger_click`` = trigger button (id 0) pressed; ``trackpad_up`` /
-``trackpad_down`` = trackpad button (id 1) pressed with ``trackpad_y`` above
-``+trackpad_deadzone`` / below ``-trackpad_deadzone``; ``none`` = unbound.
-Grip / menu / system are deliberately not bindable (menu + system is the
-dongle pairing combo).
+``trigger_click`` = trigger button (id 0) pressed. ``trackpad_left`` /
+``trackpad_right`` / ``trackpad_up`` / ``trackpad_down`` = trackpad button
+(id 1) pressed, classified ONCE at the press edge from the pad position by the
+dominant axis (``|x|`` and ``|y|`` both below ``trackpad_deadzone`` => the click
+is ignored) and held until release. ``none`` = unbound. Grip / menu / system are
+deliberately not bindable (menu + system is the dongle pairing combo).
 """
+
+TRACKPAD_INPUTS: frozenset[str] = frozenset(
+    {"trackpad_left", "trackpad_right", "trackpad_up", "trackpad_down"}
+)
 
 
 class ControllerMapConfig(BaseModel):
-    """Controller input -> injected key code, per teleop action (13-tracker §1.1).
+    """Controller input per teleop action (13-tracker §1.1).
 
-    The injected codes are looked up from the core keymap by action
-    (``tracker_clutch`` / ``gripper_open`` / ``gripper_close``), never
-    hard-coded.
+    Held actions (``clutch`` / ``gripper_open`` / ``gripper_close``) inject the
+    core keymap code of ``tracker_clutch`` / ``gripper_open`` / ``gripper_close``
+    (looked up by action, never hard-coded) while the input is active. Discrete
+    actions (``arm_next`` -> ``switch_arm``, ``arm_prev`` -> ``switch_arm_prev``)
+    fire once per trackpad press edge inside the control loop, subject to the
+    same nacks as the WS actions; they accept trackpad inputs only (the trigger
+    is a held input). Every input may be bound to at most one action.
     """
 
     clutch: ControllerInput = "trigger_click"
-    gripper_open: ControllerInput = "trackpad_up"
-    gripper_close: ControllerInput = "trackpad_down"
+    gripper_close: ControllerInput = "trackpad_left"
+    gripper_open: ControllerInput = "trackpad_right"
+    arm_next: ControllerInput = "trackpad_up"
+    arm_prev: ControllerInput = "trackpad_down"
+
+    @model_validator(mode="after")
+    def _check_bindings(self) -> ControllerMapConfig:
+        for name in ("arm_next", "arm_prev"):
+            value = getattr(self, name)
+            if value != "none" and value not in TRACKPAD_INPUTS:
+                raise ValueError(f"{name} must be a trackpad_* input or none, got {value!r}")
+        bound = [v for v in self.model_dump().values() if v != "none"]
+        dup = sorted({v for v in bound if bound.count(v) > 1})
+        if dup:
+            raise ValueError(f"controller input bound to more than one action: {dup}")
+        return self
+
+
+class TrackerFilterConfig(BaseModel):
+    """One Euro pose filter on the aligned tracker pose (13-tracker §4 "Pose
+    filter"); mirrors ``control.pose_filter.PoseFilterConfig``. ``enabled`` /
+    ``min_cutoff_hz`` / ``beta`` are live-tunable via ``tracker_settings``."""
+
+    enabled: bool = True
+    min_cutoff_hz: float = Field(default=1.0, ge=0.05, le=50.0)  # cutoff at rest
+    beta: float = Field(default=0.05, ge=0.0, le=5.0)  # speed coefficient
+    d_cutoff_hz: float = Field(default=1.0, gt=0.0)  # velocity-estimate cutoff
+    deadband_m: float = Field(default=0.002, ge=0.0)  # rest deadband, position
+    deadband_rad: float = Field(default=0.005, ge=0.0)  # rest deadband, orientation
 
 
 class TrackerConfig(BaseModel):
@@ -137,7 +175,8 @@ class TrackerConfig(BaseModel):
     stale_s: float = 0.2  # sample older than this -> hold
     max_jump_m: float = 0.10  # consecutive-sample jump above this -> invalid sample
     controller_map: ControllerMapConfig = ControllerMapConfig()
-    trackpad_deadzone: float = Field(default=0.3, ge=0.0, le=1.0)  # |pad y| <= dz: no up/down
+    trackpad_deadzone: float = Field(default=0.3, ge=0.0, le=1.0)  # |x|,|y| <= dz: click ignored
+    filter: TrackerFilterConfig = TrackerFilterConfig()
 
 
 class RuntimeConfig(BaseModel):
@@ -208,7 +247,9 @@ __all__ = [
     "ExtrinsicsTolerance",
     "RecorderConfig",
     "ControllerInput",
+    "TRACKPAD_INPUTS",
     "ControllerMapConfig",
+    "TrackerFilterConfig",
     "TrackerConfig",
     "VideoConfig",
     "RuntimeConfig",

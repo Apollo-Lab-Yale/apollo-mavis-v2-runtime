@@ -44,16 +44,39 @@ tracker:
   follow_rotation: true                       # apply tracker orientation deltas
   stale_s: 0.2                                # sample age above this -> hold
   max_jump_m: 0.10                            # consecutive-sample jump -> invalid
-  # Vive-controller buttons as device-held key codes (13-tracker §1.1). Each
-  # action is bound to one input: trigger_click | trackpad_up | trackpad_down |
-  # none. The injected codes are the keymap codes of tracker_clutch (KeyC),
-  # gripper_open (KeyH) and gripper_close (KeyF); they merge into the tick's
-  # held set while the controller's sample stream is fresh (<= stale_s), are
-  # NOT covered by the WebSocket deadman, and never drive the rail. Grip /
+  # Vive-controller buttons (13-tracker §1.1). Each action is bound to one
+  # input: trigger_click | trackpad_left | trackpad_right | trackpad_up |
+  # trackpad_down | none; an input may serve one action only. A trackpad click
+  # is classified ONCE at its press edge from the pad position (dominant axis;
+  # |x| and |y| both within trackpad_deadzone -> ignored) and held until release.
+  # Held actions inject the keymap codes of tracker_clutch (KeyC), gripper_open
+  # (KeyH) and gripper_close (KeyF) while the input is active; they merge into
+  # the tick's held set while the controller's sample stream is fresh
+  # (<= stale_s), are NOT covered by the WebSocket deadman, and never drive the
+  # rail. Discrete actions (arm_next -> switch_arm, arm_prev -> switch_arm_prev)
+  # fire once per press edge inside the control loop with the same nacks as the
+  # WS actions (e.g. takeover engaged) and show up as telemetry
+  # tracker.device_action for ~1 s; they accept trackpad_* inputs only. Grip /
   # menu / system are not bindable (menu+system = dongle pairing combo). The
   # `fake` backend has no buttons; unit/e2e tests script a controller state.
   controller_map:
-    clutch: trigger_click                     # trigger button (id 0) pressed
-    gripper_open: trackpad_up                 # trackpad click with y > +trackpad_deadzone
-    gripper_close: trackpad_down              # trackpad click with y < -trackpad_deadzone
-  trackpad_deadzone: 0.3                      # |trackpad y| within this -> neither up nor down
+    clutch: trigger_click                     # trigger button (id 0) pressed (held)
+    gripper_close: trackpad_left              # trackpad click, x dominant and negative (held)
+    gripper_open: trackpad_right              # trackpad click, x dominant and positive (held)
+    arm_next: trackpad_up                     # trackpad click, y dominant and positive (edge)
+    arm_prev: trackpad_down                   # trackpad click, y dominant and negative (edge)
+  trackpad_deadzone: 0.3                      # |x| and |y| both within this -> click ignored
+  # One Euro pose filter on the aligned tracker pose, run in the provider at the
+  # 100 Hz tick before the anchor/delta math (13-tracker §4 "Pose filter"):
+  # strong smoothing at rest (min_cutoff_hz), cutoff rising with speed (beta),
+  # then a rest deadband so a resting hand commands exactly zero motion. Resets
+  # on clutch engage and after stale/invalid gaps. enabled / min_cutoff_hz /
+  # beta are live-tunable via the tracker_settings action (filter_* fields);
+  # telemetry echoes them and reports tracker.pose_filtered.
+  filter:
+    enabled: true
+    min_cutoff_hz: 1.0                        # 0.05-50; lower = smoother at rest, more lag
+    beta: 0.05                                # 0-5; higher = less lag during fast motion
+    d_cutoff_hz: 1.0                          # cutoff of the velocity estimate
+    deadband_m: 0.002                         # rest deadband, position (m)
+    deadband_rad: 0.005                       # rest deadband, orientation (rad)

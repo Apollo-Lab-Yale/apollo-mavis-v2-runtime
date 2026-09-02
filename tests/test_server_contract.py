@@ -154,4 +154,8 @@ def test_telemetry_pre_session_idle(client):
         trk = msg["tracker"]
         assert trk["backend"] == "none" and trk["status"] == "no_backend"
         assert trk["clutch"] is False and trk["engaged_arm"] is None
-        assert trk["settings"] == {"yaw_deg": 0.0, "pos_scale": 1.0, "follow_rotation": True}
+        assert trk["settings"] == {
+            "yaw_deg": 0.0, "pos_scale": 1.0, "follow_rotation": True,
+            "filter_enabled": True, "filter_min_cutoff_hz": 1.0, "filter_beta": 0.05,
+        }
+        assert trk["pose_filtered"] is None and trk["device_action"] is None
