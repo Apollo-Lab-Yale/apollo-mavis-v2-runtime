@@ -61,7 +61,10 @@ class RecorderConfig(BaseModel):
     """Episode recorder tuning (04-runtime §10/§14; 10-frames §7.5)."""
 
     fps: int = Field(default=25, ge=20, le=30)  # dataset fps; 20-30 band (binding)
-    vcodec: str = "auto"  # rgb encoder; "auto" -> NVENC when available, else libsvtav1
+    # rgb encoder; "auto" -> first hardware encoder that really OPENS with lerobot's
+    # options (NVENC on the 4090s, needs bf=0), else libsvtav1. A resumed dataset
+    # keeps its codec family (10-frames §7.5).
+    vcodec: str = "auto"
     jpeg_quality: int = 80
     image_writer_threads: int = 4  # PNG fallback path only
     # Checkpoint-load extrinsics verification thresholds (10-frames §5.3; phase-08).
