@@ -234,7 +234,7 @@ class GatedPolicyExecutor(ControlLoop):
             now,
         )
         grip = float(block[6])
-        if np.isfinite(grip):
+        if np.isfinite(grip) and arm_id in self.gripper_arms:
             self._grip_frac[arm_id] = float(np.clip(grip, 0.0, 1.0))
             if self.tick_count % GRIPPER_SEND_EVERY_N_TICKS == 0:
                 sender = self._senders.get(arm_id)

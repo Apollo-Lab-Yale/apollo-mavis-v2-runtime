@@ -65,6 +65,12 @@ def _servo_faithful_scene(scene_id: str):
     return BuiltScene(scene.meta, spec, model, spec.to_xml(), Addressing(model, scene.meta))
 
 
+def _gripper_arms(scene, arm_ids: list[str]) -> list[str]:
+    """Session arms that carry a gripper (the scene is the truth in sim;
+    camera-only arms have no gripper actuator)."""
+    return [a for a in arm_ids if scene.addressing[a].has_gripper]
+
+
 @dataclass
 class ActiveSession:
     """Everything one running session owns (torn down in reverse)."""
@@ -253,6 +259,7 @@ class SessionManager:
                     profile_store=self.profile_store,
                     workcell_kind="sim",
                     recorder=recorder_thread,
+                    gripper_arms=_gripper_arms(scene, spec.arms),
                 )
         except Exception:
             workcell.stop()
@@ -505,7 +512,7 @@ class SessionManager:
         anchor = ActionAnchor(ik, kin, SlewLimits(window_s=dcfg.slew_window_s),
                               action_space=info.action_space)
         common = dict(ik=ik, kin=kin, planner=twin, profile_store=self.profile_store,
-                      workcell_kind="sim")
+                      workcell_kind="sim", gripper_arms=_gripper_arms(scene, spec.arms))
         if spec.mode == "inference":
             loop = GatedPolicyExecutor(
                 workcell, self.cfg.control, self.bus, supervisor, list(spec.arms),
@@ -600,7 +607,8 @@ class SessionManager:
                     goal.append(float(st.q[7]) if rail is None else float(rail))
                 q_start[arm_id] = [float(x) for x in st.q]
                 q_goal[arm_id] = goal
-                grippers[arm_id] = float(posture.gripper_open_frac)
+                if arm_id in session.loop.gripper_arms:
+                    grippers[arm_id] = float(posture.gripper_open_frac)
             from apollo_xarm7_core import PlanRequest
 
             if session.supervisor.twin is None:  # plain sim: keep the plan twin fresh
@@ -767,8 +775,9 @@ class SessionManager:
                 limits = self._joint_limits(scene, arm_id)
                 arms.append(ArmStatusInfo(
                     arm_id=arm_id, ip=None, connected=connected,
-                    has_rail=scene.meta.rail[arm_id], gripper="xarm",
-                    gripper_force_capable=False,
+                    has_rail=scene.meta.rail[arm_id],
+                    gripper="xarm" if scene.addressing[arm_id].has_gripper else "none",
+                    gripper_force_capable=False,  # sim grippers are position-only
                     error_code=states[arm_id].error_code if arm_id in states else 0,
                     joint_limits=limits,
                 ))

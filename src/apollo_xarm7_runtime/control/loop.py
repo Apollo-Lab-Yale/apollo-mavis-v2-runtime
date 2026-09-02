@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -65,6 +65,7 @@ class ControlLoop:
         profile_store: ProfileStore | None = None,
         workcell_kind: str = "sim",
         recorder=None,  # RecorderThread (collect/dagger): episode ops + status
+        gripper_arms: Iterable[str] | None = None,  # None = every session arm
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.workcell = workcell
@@ -72,6 +73,11 @@ class ControlLoop:
         self.bus = bus
         self.supervisor = supervisor
         self.session_arms = list(session_arms)
+        # Arms that carry a gripper (camera-only arms have none): only these
+        # get F/H integration, gripper sends and start_from gripper targets.
+        self.gripper_arms: frozenset[str] = frozenset(
+            self.session_arms if gripper_arms is None else gripper_arms
+        )
         self.ik = ik
         self.kin = kin
         self.planner = planner
@@ -152,7 +158,8 @@ class ControlLoop:
         for arm_id in self.session_arms:
             st = states[arm_id]
             self._last_cmd[arm_id] = np.array(st.q, dtype=np.float64)
-            self._grip_frac[arm_id] = float(st.gripper.open_frac)
+            if arm_id in self.gripper_arms:
+                self._grip_frac[arm_id] = float(st.gripper.open_frac)
         self._teleop_seeded.clear()
         self._seeded = True
 
@@ -332,8 +339,8 @@ class ControlLoop:
 
     def _gripper_step(self, held: frozenset[str], scale: float) -> None:
         arm_id = self.active_arm
-        if arm_id is None:
-            return
+        if arm_id is None or arm_id not in self.gripper_arms:
+            return  # gripper keys are ignored on a camera-only arm
         tw = held_to_twist(held, self.cfg.teleop)
         if tw.grip_v == 0.0 or scale <= 0.0:
             return
@@ -508,7 +515,7 @@ class ControlLoop:
             self.plans.load(arm_id, wps)
             self._plan_state[arm_id] = "executing"
         for arm_id, frac in cmd.args.get("gripper", {}).items():
-            if arm_id in self._grip_frac:
+            if arm_id in self.gripper_arms:
                 self._grip_frac[arm_id] = min(max(float(frac), 0.0), 1.0)
                 sender = self._senders.get(arm_id)
                 if sender is not None:

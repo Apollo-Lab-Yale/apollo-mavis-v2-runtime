@@ -125,3 +125,65 @@ def test_held_movement_key_cancels_plan(fake_loop):
     assert not loop.plans.active("arm0")
     assert loop._plan_status == "cancelled"
     assert not np.allclose(loop._last_cmd["arm0"], goal)  # stopped short
+
+
+class _Sender:
+    """Stands in for the ArmSender thread: records gripper puts."""
+
+    def __init__(self):
+        self.puts: list[float] = []
+
+    def put_gripper(self, open_frac: float) -> None:
+        self.puts.append(open_frac)
+
+
+def test_gripper_keys_and_targets_skip_gripperless_arm():
+    """arm0 is camera-only (no gripper): F/H, execute_plan gripper targets
+    and the snapshot never touch it; the same inputs drive arm1 normally."""
+    from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+
+    from apollo_xarm7_runtime.bus import RuntimeBus
+    from apollo_xarm7_runtime.config import ControlConfig
+    from apollo_xarm7_runtime.control.loop import ControlLoop
+    from apollo_xarm7_runtime.safety.gate import NullGate
+    from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
+    from apollo_xarm7_runtime.safety.watchdog import InputWatchdog
+
+    cell = FakeWorkcell({"arm0": FakeArm("arm0"), "arm1": FakeArm("arm1")})
+    cell.start()
+    bus = RuntimeBus()
+    loop = ControlLoop(
+        cell, ControlConfig(), bus, SafetySupervisor(NullGate(), InputWatchdog()),
+        ["arm0", "arm1"], gripper_arms=["arm1"],
+    )
+    senders = {a: _Sender() for a in ("arm0", "arm1")}
+    loop._senders.update(senders)  # what start() wires, minus the threads
+
+    def hold(key: str, n: int, t: float) -> float:
+        for _ in range(n):  # fresh KeysMsg every tick: deadman scale stays 1.0
+            t += loop.dt
+            hs = HeldState(held=frozenset({key}), seq=loop.tick_count + 1, rx_mono=t)
+            loop.supervisor.watchdog.on_keys(hs)
+            bus.held_keys.put(hs)
+            loop.run_tick(t)
+            cell.step(loop.dt)
+        return t
+
+    assert loop.active_arm == "arm0" and loop.gripper_arms == {"arm1"}
+    t = hold("KeyF", 20, 0.0)  # close on the camera-only arm: ignored
+    snap = loop.run_tick(t + loop.dt)
+    assert "arm0" not in loop._grip_frac and "arm0" not in snap.gripper_frac
+    assert senders["arm0"].puts == [] and senders["arm1"].puts == []
+
+    # start_from gripper targets: only the gripper arm receives one.
+    submit(bus, "execute_plan", waypoints={}, gripper={"arm0": 0.3, "arm1": 0.3})
+    t = run_ticks(loop, cell, 1, t)
+    assert loop._grip_frac == {"arm1": 0.3}
+    assert senders["arm0"].puts == [] and senders["arm1"].puts == [0.3]
+
+    # Tab to arm1 (has a gripper): F/H integrate and reach the sender.
+    submit(bus, "switch_arm")
+    t = hold("KeyH", 20, t)
+    assert loop.active_arm == "arm1"
+    assert loop._grip_frac["arm1"] > 0.3 and len(senders["arm1"].puts) > 1
+    assert senders["arm0"].puts == []
