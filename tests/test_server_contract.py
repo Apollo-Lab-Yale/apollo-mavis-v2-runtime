@@ -46,7 +46,9 @@ def test_keymap_matches_core(client):
 
     served = client.get("/api/keymap").json()
     assert served == [e.model_dump() for e in KEYMAP]
-    assert len(served) == 21
+    assert len(served) == 23  # 13-tracker §3: + KeyC tracker_clutch, KeyZ switch_arm_prev
+    by_code = {row["code"]: row for row in served}
+    assert by_code["KeyC"]["gamepad"] == "RT" and by_code["KeyZ"]["gamepad"] == "LB"
 
 
 def test_scenes_listing(client):
@@ -148,3 +150,8 @@ def test_telemetry_pre_session_idle(client):
         assert msg["t"] == "telemetry"
         assert msg["session"]["state"] == "idle"
         assert msg["arms"] == [] and msg["collision"]["severity"] == "ok"
+        # Tracker block is populated pre-session (device fields; backend none here).
+        trk = msg["tracker"]
+        assert trk["backend"] == "none" and trk["status"] == "no_backend"
+        assert trk["clutch"] is False and trk["engaged_arm"] is None
+        assert trk["settings"] == {"yaw_deg": 0.0, "pos_scale": 1.0, "follow_rotation": True}

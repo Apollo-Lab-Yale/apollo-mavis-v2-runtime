@@ -11,7 +11,7 @@ import pytest
 from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
 
 from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.config import ControlConfig, RuntimeConfig, VideoConfig
+from apollo_xarm7_runtime.config import ControlConfig, RuntimeConfig, TrackerConfig, VideoConfig
 from apollo_xarm7_runtime.control.loop import ControlLoop
 from apollo_xarm7_runtime.safety.gate import NullGate
 from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
@@ -25,7 +25,9 @@ SIM_WORKCELL_YAML = {
 }
 
 
-def make_runtime_config(tmp_path, scene: str = "single_rail", **safety) -> RuntimeConfig:
+def make_runtime_config(
+    tmp_path, scene: str = "single_rail", *, tracker: TrackerConfig | None = None, **safety
+) -> RuntimeConfig:
     wc = dict(SIM_WORKCELL_YAML, sim_scene=scene)
     if safety:
         wc["safety"] = safety
@@ -35,6 +37,7 @@ def make_runtime_config(tmp_path, scene: str = "single_rail", **safety) -> Runti
         datasets_root=tmp_path / "datasets",
         checkpoints_root=tmp_path / "ckpts",
         video=VideoConfig(preview_fps=15, session_fps=30),
+        tracker=tracker or TrackerConfig(),
     )
 
 

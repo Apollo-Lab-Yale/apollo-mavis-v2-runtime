@@ -5,15 +5,58 @@ from __future__ import annotations
 import asyncio
 import time
 
-from apollo_xarm7_core import CollisionReport
+from apollo_xarm7_core import CollisionReport, Pose
 from apollo_xarm7_core.protocol import (
     ArmTelemetry,
     ClearanceItem,
     PoseMsg,
     SessionTelemetry,
     TelemetryMsg,
+    TrackerSettingsMsg,
+    TrackerTelemetry,
 )
 from fastapi import WebSocket, WebSocketDisconnect
+
+from ..control.tracker_teleop import align_pose
+
+
+def _pose_msg(pose: Pose | None) -> PoseMsg | None:
+    if pose is None:
+        return None
+    return PoseMsg(
+        position=tuple(float(x) for x in pose.position),
+        orientation=tuple(float(x) for x in pose.orientation),
+    )
+
+
+def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
+    """Device fields from the Runtime-owned reader (pre-session too); clutch/
+    anchor/target from ``session_extra["tracker"]`` (13-tracker §3.5/§4)."""
+    dev = runtime.tracker.status(now)
+    settings = runtime.tracker_settings.get()
+    extra = (snap.session_extra.get("tracker") if snap is not None else None) or {}
+    return TrackerTelemetry(
+        backend=dev.backend,
+        status=dev.status,
+        detail=dev.detail,
+        object_name=dev.object_name,
+        seq=dev.seq,
+        rate_hz=dev.rate_hz,
+        age_s=dev.age_s,
+        pose_raw=_pose_msg(dev.pose_raw),
+        pose_world=_pose_msg(
+            align_pose(dev.pose_raw, settings.yaw_deg) if dev.pose_raw is not None else None
+        ),
+        clutch=bool(extra.get("clutch", False)),
+        engaged_arm=extra.get("engaged_arm"),
+        anchor_tcp=_pose_msg(extra.get("anchor_tcp")),
+        target_tcp=_pose_msg(extra.get("target_tcp")),
+        settings=TrackerSettingsMsg(
+            yaw_deg=settings.yaw_deg,
+            pos_scale=settings.pos_scale,
+            follow_rotation=settings.follow_rotation,
+        ),
+    )
 
 
 def build_telemetry(runtime, seq: int) -> TelemetryMsg:
@@ -21,6 +64,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
     got = runtime.bus.snapshot.get()
     session = runtime.manager.session
     snap = got[0] if got is not None and session is not None else None
+    now = time.monotonic()
     arms: list[ArmTelemetry] = []
     if snap is not None:
         for arm_id, st in snap.arms.items():
@@ -43,7 +87,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
             )
     return TelemetryMsg(
         seq=seq,
-        ts=time.monotonic(),
+        ts=now,
         epoch=runtime.epoch,
         active_arm=snap.active_arm if snap is not None else None,
         controller_connected=runtime.controller_connected,
@@ -68,6 +112,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
                 else None
             ),
         ),
+        tracker=build_tracker_telemetry(runtime, snap, now),
     )
 
 
@@ -88,4 +133,4 @@ async def endpoint(websocket: WebSocket) -> None:
         pass
 
 
-__all__ = ["endpoint", "build_telemetry"]
+__all__ = ["endpoint", "build_telemetry", "build_tracker_telemetry"]

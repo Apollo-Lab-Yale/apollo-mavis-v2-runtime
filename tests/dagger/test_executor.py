@@ -284,3 +284,18 @@ def test_counterfactual_deposit_present_during_policy_and_human():
     ann = rig.loop._session_extra(0.0)["dagger_frame"]
     assert ann["control_mode"] == 1 and ann["action_source"] == 3
     assert ann["policy_action"] is not None  # queried even during HUMAN (§4)
+
+
+def test_switch_arm_prev_wraps_and_is_nacked_during_takeover():
+    rig = build("inference")
+    assert rig.loop.active_arm == "arm0"
+    res = act(rig, "switch_arm_prev")
+    assert res.ok and res.detail == "arm1"  # (0 - 1) mod 2 wraps
+    res = act(rig, "switch_arm_prev")
+    assert res.ok and res.detail == "arm0"
+    assert act(rig, "takeover_toggle").ok  # human engaged on arm0
+    res = act(rig, "switch_arm_prev")
+    assert not res.ok and res.detail == "takeover active"
+    res = act(rig, "switch_arm")
+    assert not res.ok and res.detail == "takeover active"
+    assert rig.loop.active_arm == "arm0"

@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import numpy as np
 from apollo_xarm7_core import Pose, Twist, se3
-from apollo_xarm7_core.protocol import HELD_CODES, KEYMAP, axis_map
+from apollo_xarm7_core.protocol import HELD_CODES, HELD_MODIFIER_ACTIONS, KEYMAP, axis_map
 
 from ..config import TeleopRates
 
-# code -> (axis, sign), resolved once from the canonical keymap.
+# code -> (axis, sign), resolved once from the canonical keymap. Held
+# modifiers (tracker_clutch) are not axes and never reach the twist.
 _CODE_AXIS: dict[str, tuple[str, float]] = {}
 for _e in KEYMAP:
-    if _e.kind == "held":
+    if _e.kind == "held" and _e.action not in HELD_MODIFIER_ACTIONS:
         _CODE_AXIS[_e.code] = axis_map()[_e.action]
 
 _LINEAR = {"x": 0, "y": 1, "z": 2}
@@ -31,8 +32,8 @@ def held_to_twist(held: frozenset[str], rates: TeleopRates) -> Twist:
     rail_v = 0.0
     grip_v = 0.0
     for code in held:
-        if code not in HELD_CODES:
-            continue
+        if code not in HELD_CODES or code not in _CODE_AXIS:
+            continue  # unbound key or held modifier (13-tracker §3.3)
         axis, sign = _CODE_AXIS[code]
         if axis in _LINEAR:
             v[_LINEAR[axis]] += sign * rates.linear_mps

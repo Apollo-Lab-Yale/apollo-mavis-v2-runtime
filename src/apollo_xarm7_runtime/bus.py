@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     import numpy as np
 
     from .control.snapshot import StateSnapshot
+    from .devices.tracker import TrackerSample
 
 
 class RuntimeBus:
@@ -21,7 +22,8 @@ class RuntimeBus:
 
     Slots: ``held_keys`` (WS -> control), ``q_cmd[arm_id]`` (control ->
     senders), ``snapshot`` (control -> telemetry/recorder/twin-sync),
-    ``policy_action`` (policy runner -> control, phase-08), and
+    ``policy_action`` (policy runner -> control, phase-08), ``tracker``
+    (TrackerReader -> control/telemetry, 13-tracker §2) and
     ``encoded[stream_id]`` (encoders -> WS/MJPEG).
     """
 
@@ -31,6 +33,7 @@ class RuntimeBus:
         self.q_cmd: dict[str, LatestSlot[np.ndarray]] = {}
         self.snapshot: LatestSlot[StateSnapshot] = LatestSlot()
         self.policy_action: LatestSlot[Any] = LatestSlot()
+        self.tracker: LatestSlot[TrackerSample] = LatestSlot()
         self.encoded: dict[str, LatestSlot[bytes]] = {}
 
     def arm_slot(self, arm_id: str) -> LatestSlot:

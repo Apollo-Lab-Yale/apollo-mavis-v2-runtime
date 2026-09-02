@@ -27,19 +27,21 @@ from apollo_xarm7_core import (
     ProfileStore,
     se3,
 )
-from apollo_xarm7_core.protocol import HELD_CODES, JointTargetArgs
+from apollo_xarm7_core.protocol import HELD_CODES, JointTargetArgs, TrackerSettingsArgs
 
 from ..config import ControlConfig
 from ..profiles.store import save_from_states, save_initial_overwrite
 from .joint_panel import JogState, PlanExecutor
 from .snapshot import StateSnapshot
 from .teleop import TargetIntegrator, held_to_twist, twist_to_control_frame
+from .tracker_teleop import TRACKER_CLUTCH_CODE, interp_pose
 
 if TYPE_CHECKING:
-    from apollo_xarm7_core import IKSolver, WorkcellInterface
+    from apollo_xarm7_core import IKSolver, Pose, WorkcellInterface
 
     from ..bus import RuntimeBus
     from ..safety.supervisor import SafetySupervisor
+    from .tracker_teleop import TrackerTeleop
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,7 @@ class ControlLoop:
         workcell_kind: str = "sim",
         recorder=None,  # RecorderThread (collect/dagger): episode ops + status
         gripper_arms: Iterable[str] | None = None,  # None = every session arm
+        tracker: TrackerTeleop | None = None,  # clutched Vive-tracker target provider
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.workcell = workcell
@@ -84,6 +87,7 @@ class ControlLoop:
         self.profile_store = profile_store
         self.workcell_kind = workcell_kind
         self.recorder = recorder
+        self.tracker = tracker
         self._clock = clock
         self.dt = 1.0 / cfg.rate_hz
 
@@ -184,6 +188,8 @@ class ControlLoop:
         held: frozenset[str] = got[0].held if got is not None else frozenset()
         scale = self.supervisor.watchdog.scale(now)
         watchdog_tripped = self.supervisor.watchdog.tripped
+        if self.tracker is not None:
+            self.tracker.clutch = TRACKER_CLUTCH_CODE in held
 
         states = self.workcell.states()  # 3 (driver caches; never blocks)
         self._states = states
@@ -198,6 +204,8 @@ class ControlLoop:
 
         # 5-7: per-arm action resolution -> commanded q (mode hook, phase-08).
         resolved, source = self._resolve_arms(states, held, scale, now)
+        if self.tracker is not None:
+            self.tracker.end_tick()  # not consulted this tick -> anchors cleared
         q_cmd: dict[str, np.ndarray] = {
             arm_id: (q if q is not None else self._last_cmd[arm_id])
             for arm_id, q in resolved.items()
@@ -242,6 +250,9 @@ class ControlLoop:
             session_extra={
                 "plan_status": self._plan_status,
                 "kind": self.workcell_kind,
+                "tracker": (
+                    self.tracker.telemetry_extra() if self.tracker is not None else None
+                ),
                 **self._session_extra(now),
             },
         )
@@ -269,7 +280,7 @@ class ControlLoop:
                 q_next = self._jog_step(arm_id, q_last, scale)
                 source = CommandSource.JOINT_JOG
             elif arm_id == self.active_arm:
-                q_next = self._teleop_step(arm_id, states[arm_id], q_last, held, scale)
+                q_next = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             out[arm_id] = q_next
         return out, source
 
@@ -288,46 +299,90 @@ class ControlLoop:
         q_last: np.ndarray,
         held: frozenset[str],
         scale: float,
+        now: float | None = None,
     ) -> np.ndarray | None:
-        """Held keys -> twist -> integrate -> IK -> q (04-runtime §6)."""
+        """Held keys -> twist -> integrate -> IK -> q (04-runtime §6).
+
+        While ``tracker_clutch`` is held the tracker supplies the target
+        instead (13-tracker §4): keyboard translate/rotate keys are ignored,
+        rail (here) and gripper (``_gripper_step``) keys keep working.
+        """
         if self.ik is None or self.kin is None:
             return None
-        tw = held_to_twist(held, self.cfg.teleop)
         if scale <= 0.0:
-            return None  # deadman latched: hold
-        v = tw.v * scale
-        w = tw.w * scale
+            return None  # deadman latched: hold (tracker anchors clear in end_tick)
+        tw = held_to_twist(held, self.cfg.teleop)
         rail_v = tw.rail_v * scale
         has_rail = state.q.shape[0] > 7
-        moving = bool(np.any(v) or np.any(w) or (rail_v and has_rail))
+        rail_moving = bool(rail_v and has_rail)
         measured_tcp = self.kin.tcp_world(arm_id, state.q)
         if arm_id not in self._teleop_seeded:
             self.integrator.seed(arm_id, measured_tcp)
             self._teleop_seeded.add(arm_id)
-        if not moving:
-            return None  # nothing held: non-active-style hold (no re-servo)
-        from apollo_xarm7_core import Twist
+        if self.tracker is not None and TRACKER_CLUTCH_CODE in held:
+            target = self._tracker_target(arm_id, measured_tcp, scale, now)
+            if target is None and not rail_moving:
+                return None  # no fresh valid sample: hold-last
+        else:
+            v = tw.v * scale
+            w = tw.w * scale
+            if not (np.any(v) or np.any(w) or rail_moving):
+                return None  # nothing held: non-active-style hold (no re-servo)
+            from apollo_xarm7_core import Twist
 
-        tw_world = twist_to_control_frame(
-            Twist(v=v, w=w), self.kin.base_quat_world(arm_id), measured_tcp.orientation
-        )
-        target = self.integrator.step(arm_id, tw_world, self.dt, measured_tcp)
-        result = self.ik.solve(arm_id, target, q_last)
-        if result.diverged or not np.isfinite(result.pos_err_m):
-            self.integrator.reanchor(arm_id, measured_tcp)
-            return None
-        if (
-            result.pos_err_m > self.cfg.residual_max_pos_m
-            or result.rot_err_rad > self.cfg.residual_max_rot_rad
-        ):
-            # Freeze the target back to the achieved pose (glide, don't wind up).
-            self.integrator.reanchor(arm_id, self.kin.tcp_world(arm_id, result.q))
-        q = np.array(result.q)
+            tw_world = twist_to_control_frame(
+                Twist(v=v, w=w), self.kin.base_quat_world(arm_id), measured_tcp.orientation
+            )
+            target = self.integrator.step(arm_id, tw_world, self.dt, measured_tcp)
+        if target is None:
+            q = np.array(q_last)  # tracker unavailable: rail keys still integrate
+        else:
+            q = self._solve_target(arm_id, target, q_last, measured_tcp)
+            if q is None:
+                return None
         if has_rail:
             # Rail keys integrate the rail slot directly (ignored w/o rail).
             base = q_last[7] if rail_v else q[7]
             q[7] = min(max(base + rail_v * self.dt, 0.0), RAIL_TRAVEL_M)
         return q
+
+    def _solve_target(
+        self, arm_id: str, target: Pose, q_last: np.ndarray, measured_tcp: Pose
+    ) -> np.ndarray | None:
+        """IK + residual handling shared by the keyboard and tracker paths."""
+        result = self.ik.solve(arm_id, target, q_last)
+        if result.diverged or not np.isfinite(result.pos_err_m):
+            self.integrator.reanchor(arm_id, measured_tcp)
+            if self.tracker is not None:
+                self.tracker.slip(target, measured_tcp)
+            return None
+        if (
+            result.pos_err_m > self.cfg.residual_max_pos_m
+            or result.rot_err_rad > self.cfg.residual_max_rot_rad
+        ):
+            # Freeze the target back to the achieved pose (glide, don't wind up);
+            # the tracker anchor slips by the same truncation.
+            achieved = self.kin.tcp_world(arm_id, result.q)
+            self.integrator.reanchor(arm_id, achieved)
+            if self.tracker is not None:
+                self.tracker.slip(target, achieved)
+        return np.array(result.q)
+
+    def _tracker_target(
+        self, arm_id: str, measured_tcp: Pose, scale: float, now: float | None
+    ) -> Pose | None:
+        """Clutched tracker target: the provider engages/anchors and clamps to
+        the leash; the watchdog ``scale`` shrinks the per-tick step toward it
+        (not the hand<->arm offset)."""
+        now = self._clock() if now is None else now
+        prev = self.integrator.get(arm_id) or measured_tcp
+        clamped = self.tracker.target(arm_id, measured_tcp, prev, now)
+        if clamped is None:
+            return None
+        target = interp_pose(prev, clamped, scale)
+        self.integrator.reanchor(arm_id, target)
+        self.tracker.set_target(target)
+        return target
 
     def _jog_step(self, arm_id: str, q_last: np.ndarray, scale: float) -> np.ndarray | None:
         if scale <= 0.0:
@@ -396,14 +451,40 @@ class ControlLoop:
             return CommandResult(cmd.corr_id, False, f"unknown op {cmd.op!r}")
         return handler(cmd)
 
-    def _op_switch_arm(self, cmd: Command) -> CommandResult:
-        """Server-authoritative Tab cycling; previous arm's target freezes."""
+    def _switch_arm(self, cmd: Command, step: int) -> CommandResult:
         if not self.session_arms:
             return CommandResult(cmd.corr_id, False, "no session arms")
-        i = self.session_arms.index(self.active_arm) if self.active_arm else -1
-        self.active_arm = self.session_arms[(i + 1) % len(self.session_arms)]
+        i = self.session_arms.index(self.active_arm) if self.active_arm else -step
+        self.active_arm = self.session_arms[(i + step) % len(self.session_arms)]
         self._teleop_seeded.discard(self.active_arm)  # reseed target from measured
+        if self.tracker is not None:
+            self.tracker.release()  # arm switch clears the tracker anchors
         return CommandResult(cmd.corr_id, True, self.active_arm)
+
+    def _op_switch_arm(self, cmd: Command) -> CommandResult:
+        """Server-authoritative Tab / RB cycling; previous arm's target freezes."""
+        return self._switch_arm(cmd, +1)
+
+    def _op_switch_arm_prev(self, cmd: Command) -> CommandResult:
+        """KeyZ / LB: previous arm, ``(i - 1) mod n`` (13-tracker §4)."""
+        return self._switch_arm(cmd, -1)
+
+    def _op_tracker_settings(self, cmd: Command) -> CommandResult:
+        """Mutate the live yaw/scale/rotation settings (echoed in telemetry)."""
+        if self.tracker is None:
+            return CommandResult(cmd.corr_id, False, "no tracker provider in this session")
+        try:
+            args = TrackerSettingsArgs.model_validate(cmd.args)
+        except Exception as e:
+            return CommandResult(cmd.corr_id, False, f"invalid tracker_settings args: {e}")
+        v = self.tracker.settings.update(
+            yaw_deg=args.yaw_deg, pos_scale=args.pos_scale, follow_rotation=args.follow_rotation
+        )
+        return CommandResult(
+            cmd.corr_id, True,
+            f"yaw_deg={v.yaw_deg:g} pos_scale={v.pos_scale:g} "
+            f"follow_rotation={str(v.follow_rotation).lower()}",
+        )
 
     def _op_takeover_toggle(self, cmd: Command) -> CommandResult:
         if self.plans.active_arms:

@@ -29,3 +29,18 @@ control:
 telemetry_hz: 25
 video: {preview_fps: 15, session_fps: 30, jpeg_quality: 80}
 egl_device_id: 0
+tracker:
+  # Vive-tracker teleop (13-tracker §4). backend: none | fake | libsurvive.
+  # `fake` = scripted 0.15 m circle at 100 Hz so the UI/pipeline can be
+  # exercised without hardware (hold KeyC / gamepad RT to clutch).
+  # For the real tracker: run scripts/tracker/01-sudo-udev-and-deps.sh and
+  # 02-build-pysurvive.sh once, keep the tracker still with both base
+  # stations visible on first start (~10-20 s), then set `backend: libsurvive`.
+  backend: fake
+  object_name: WM0                            # dongle-paired tracker codename
+  libsurvive_args: ["--lighthousecount", "4"]
+  yaw_deg: 0.0                                # lighthouse -> MJCF world yaw (calibrate)
+  pos_scale: 1.0                              # tracker -> EE displacement gain (0.1-3)
+  follow_rotation: true                       # apply tracker orientation deltas
+  stale_s: 0.2                                # sample age above this -> hold
+  max_jump_m: 0.10                            # consecutive-sample jump -> invalid

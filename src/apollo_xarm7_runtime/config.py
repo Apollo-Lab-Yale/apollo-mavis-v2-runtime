@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from apollo_xarm7_core import ConfigError, WorkcellConfig
@@ -94,6 +95,23 @@ class DaggerConfig(BaseModel):
     trainer: TrainerSettings = TrainerSettings()
 
 
+class TrackerConfig(BaseModel):
+    """Vive-tracker teleop device + defaults (13-tracker §4).
+
+    ``yaw_deg`` / ``pos_scale`` / ``follow_rotation`` are the process-lifetime
+    defaults; the ``tracker_settings`` action mutates the live values.
+    """
+
+    backend: Literal["none", "fake", "libsurvive"] = "none"
+    object_name: str = "WM0"  # libsurvive codename of the dongle-paired tracker
+    libsurvive_args: list[str] = Field(default_factory=lambda: ["--lighthousecount", "2"])
+    yaw_deg: float = 0.0  # lighthouse world -> MJCF world (both z-up; yaw only)
+    pos_scale: float = Field(default=1.0, ge=0.1, le=3.0)
+    follow_rotation: bool = True
+    stale_s: float = 0.2  # sample older than this -> hold
+    max_jump_m: float = 0.10  # consecutive-sample jump above this -> invalid sample
+
+
 class RuntimeConfig(BaseModel):
     """Top-level runtime config; sane defaults for sim-only dev."""
 
@@ -107,6 +125,7 @@ class RuntimeConfig(BaseModel):
     control: ControlConfig = ControlConfig()
     recorder: RecorderConfig = RecorderConfig()
     dagger: DaggerConfig = DaggerConfig()
+    tracker: TrackerConfig = TrackerConfig()
     telemetry_hz: float = 25.0
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
@@ -160,6 +179,7 @@ __all__ = [
     "DaggerConfig",
     "ExtrinsicsTolerance",
     "RecorderConfig",
+    "TrackerConfig",
     "VideoConfig",
     "RuntimeConfig",
     "load_runtime_config",

@@ -10,12 +10,14 @@ from apollo_xarm7_core import Command, CommandResult, HeldState, ProfileStore
 
 from .bus import RuntimeBus
 from .config import RuntimeConfig
+from .devices.tracker import TrackerReader, TrackerSettings
 from .session.manager import SessionManager
 from .streams.hub import VideoHub
 
 
 class Runtime:
-    """Process-singleton: bus, video hub, profile store, session manager."""
+    """Process-singleton: bus, video hub, profile store, tracker reader,
+    session manager."""
 
     def __init__(self, cfg: RuntimeConfig) -> None:
         self.cfg = cfg
@@ -23,7 +25,16 @@ class Runtime:
         self.bus = RuntimeBus()
         self.hub = VideoHub(self.bus, jpeg_quality=cfg.video.jpeg_quality)
         self.profile_store = ProfileStore(cfg.profiles_dir)
-        self.manager = SessionManager(cfg, self.bus, self.hub, self.profile_store, self.epoch)
+        # Tracker device + live settings live for the whole process (13-tracker
+        # §4): telemetry shows the device before any session exists.
+        self.tracker_settings = TrackerSettings.from_config(cfg.tracker)
+        self.tracker = TrackerReader(cfg.tracker, self.bus.tracker)
+        if cfg.tracker.backend != "none":
+            self.tracker.start()
+        self.manager = SessionManager(
+            cfg, self.bus, self.hub, self.profile_store, self.epoch,
+            tracker_settings=self.tracker_settings,
+        )
         self.controller_connected = False  # maintained by server/ws_control
 
     # -- lifecycle (server lifespan) ------------------------------------------
@@ -45,6 +56,7 @@ class Runtime:
         self.manager.teardown()
         self.manager.stop_previews()
         self.hub.stop()
+        self.tracker.stop()
 
     # -- control-WS plumbing (no motion work here; 04-runtime §13.2) -------------
     def on_keys(self, seq: int, held: list[str]) -> None:

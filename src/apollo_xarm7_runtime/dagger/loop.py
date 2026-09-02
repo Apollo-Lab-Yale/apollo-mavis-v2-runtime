@@ -150,7 +150,7 @@ class GatedPolicyExecutor(ControlLoop):
                     self._finish_plan(arm_id, ok=True)
                 out[arm_id] = q
             elif arm_id == engaged:
-                out[arm_id] = self._teleop_step(arm_id, states[arm_id], q_last, held, scale)
+                out[arm_id] = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             elif engaged is not None:
                 out[arm_id] = None  # frozen: hold; ordinary policy frame (§2)
             elif policy_on:
@@ -158,7 +158,7 @@ class GatedPolicyExecutor(ControlLoop):
                 self._policy_drove = True
             elif self.session_mode == "dagger" and arm_id == self.active_arm:
                 # between episodes: plain teleop for scene staging
-                out[arm_id] = self._teleop_step(arm_id, states[arm_id], q_last, held, scale)
+                out[arm_id] = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             else:
                 out[arm_id] = None
         if engaged is not None:
@@ -327,6 +327,11 @@ class GatedPolicyExecutor(ControlLoop):
         if self.gate.engaged_arm() is not None:
             return CommandResult(cmd.corr_id, False, TAKEOVER_ACTIVE)
         return super()._op_switch_arm(cmd)
+
+    def _op_switch_arm_prev(self, cmd: Command) -> CommandResult:
+        if self.gate.engaged_arm() is not None:
+            return CommandResult(cmd.corr_id, False, TAKEOVER_ACTIVE)
+        return super()._op_switch_arm_prev(cmd)
 
 
 def make_obs_fn(bus, arms_meta: list[tuple[str, bool]], converter, kin):

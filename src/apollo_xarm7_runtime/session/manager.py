@@ -26,6 +26,8 @@ from apollo_xarm7_core.protocol import SessionInfo, SessionSpec
 
 from ..config import RuntimeConfig
 from ..control.loop import ControlLoop
+from ..control.tracker_teleop import TrackerTeleop
+from ..devices.tracker import TrackerSettings
 from ..errors import SessionError, SessionNotFoundError
 from ..safety.gate import NullGate, SafetyGate
 from ..safety.supervisor import SafetySupervisor
@@ -101,12 +103,14 @@ class SessionManager:
         hub: VideoHub,
         profile_store: ProfileStore,
         epoch: str,
+        tracker_settings: TrackerSettings | None = None,  # Runtime-owned live settings
     ) -> None:
         self.cfg = cfg
         self.bus = bus
         self.hub = hub
         self.profile_store = profile_store
         self.epoch = epoch
+        self.tracker_settings = tracker_settings or TrackerSettings.from_config(cfg.tracker)
         self.session: ActiveSession | None = None
         self._lock = threading.Lock()
         self._preview_service = None
@@ -129,6 +133,18 @@ class SessionManager:
             arms=list(s.spec.arms),
             streams=list(s.streams),
             state=s.state.value,
+        )
+
+    def _tracker_provider(self) -> TrackerTeleop:
+        """Per-session clutch/anchor state over the process-wide tracker slot
+        (13-tracker §4); built for every session so ``tracker_settings`` and
+        the clutch behave uniformly (no samples with backend ``none``)."""
+        return TrackerTeleop(
+            self.bus.tracker,
+            self.tracker_settings,
+            stale_s=self.cfg.tracker.stale_s,
+            leash_pos_m=self.cfg.control.leash.pos_m,
+            leash_rot_rad=self.cfg.control.leash.rot_rad,
         )
 
     # -- validation ---------------------------------------------------------------
@@ -260,6 +276,7 @@ class SessionManager:
                     workcell_kind="sim",
                     recorder=recorder_thread,
                     gripper_arms=_gripper_arms(scene, spec.arms),
+                    tracker=self._tracker_provider(),
                 )
         except Exception:
             workcell.stop()
@@ -512,7 +529,8 @@ class SessionManager:
         anchor = ActionAnchor(ik, kin, SlewLimits(window_s=dcfg.slew_window_s),
                               action_space=info.action_space)
         common = dict(ik=ik, kin=kin, planner=twin, profile_store=self.profile_store,
-                      workcell_kind="sim", gripper_arms=_gripper_arms(scene, spec.arms))
+                      workcell_kind="sim", gripper_arms=_gripper_arms(scene, spec.arms),
+                      tracker=self._tracker_provider())
         if spec.mode == "inference":
             loop = GatedPolicyExecutor(
                 workcell, self.cfg.control, self.bus, supervisor, list(spec.arms),

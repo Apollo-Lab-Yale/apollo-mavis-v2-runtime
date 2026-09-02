@@ -58,12 +58,15 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "xarm".msg = "runtime talks to hardware only via apollo_xarm7_hardware"
 "torch".msg = "torch is sanctioned only inside apollo_xarm7_runtime.dagger (policy + trainer)"
 "lerobot".msg = "lerobot is imported lazily inside apollo_xarm7_runtime.recorder only"
+"pysurvive".msg = "pysurvive is imported lazily inside apollo_xarm7_runtime.devices.tracker only"
 
 [tool.ruff.lint.per-file-ignores]
 # The recorder package and its tests are the one sanctioned lerobot import site.
 "src/apollo_xarm7_runtime/recorder/*" = ["TID251"]
 "tests/test_recorder*.py" = ["TID251"]
 "tests/test_e2e_collect.py" = ["TID251"]
+# The tracker device module is the one sanctioned (lazy) pysurvive import site.
+"src/apollo_xarm7_runtime/devices/tracker.py" = ["TID251"]
 # The dagger package owns the live Policy object (12-dagger §1) and the
 # trainer process; torch (and spool parquet reads) are sanctioned here.
 "src/apollo_xarm7_runtime/dagger/*" = ["TID251"]
