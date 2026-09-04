@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -25,7 +26,7 @@ from apollo_mavis_v2_core import (
 from apollo_mavis_v2_core.protocol import SessionInfo, SessionSpec
 
 from ..config import RuntimeConfig
-from ..control.loop import ControlLoop
+from ..control.loop import DEFAULT_ACTIVE_ARM, ControlLoop
 from ..control.pose_filter import PoseFilterConfig
 from ..control.tracker_teleop import TrackerTeleop
 from ..devices.tracker import TrackerSettings
@@ -38,6 +39,7 @@ from .types import SessionState
 
 if TYPE_CHECKING:
     from ..bus import RuntimeBus
+    from ..devices.hardware_probe import HardwareProbe
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,13 @@ def _servo_faithful_scene(scene_id: str):
     return BuiltScene(scene.meta, spec, model, spec.to_xml(), Addressing(model, scene.meta))
 
 
+def _manipulation_first(ids):
+    """Status-row order (``GET /api/workcell``): the Manipulation Arm
+    (``grip`` = :data:`DEFAULT_ACTIVE_ARM`, the default teleop arm) first, then
+    the scene / config order (stable sort)."""
+    return sorted(ids, key=lambda a: a != DEFAULT_ACTIVE_ARM)
+
+
 def _gripper_arms(scene, arm_ids: list[str]) -> list[str]:
     """Session arms that carry a gripper (the scene is the truth in sim;
     camera-only arms have no gripper actuator)."""
@@ -95,7 +104,8 @@ class ActiveSession:
 
 
 class SessionManager:
-    """Owns the singleton session + the pre-session camera previews."""
+    """Owns the singleton session + the pre-session camera previews (sim scene
+    renders AND the hardware workcell's cameras, phase-11)."""
 
     def __init__(
         self,
@@ -105,6 +115,7 @@ class SessionManager:
         profile_store: ProfileStore,
         epoch: str,
         tracker_settings: TrackerSettings | None = None,  # Runtime-owned live settings
+        hardware_probe: HardwareProbe | None = None,  # Runtime-owned reachability snapshot
     ) -> None:
         self.cfg = cfg
         self.bus = bus
@@ -112,12 +123,21 @@ class SessionManager:
         self.profile_store = profile_store
         self.epoch = epoch
         self.tracker_settings = tracker_settings or TrackerSettings.from_config(cfg.tracker)
+        self.hardware_probe = hardware_probe
         self.session: ActiveSession | None = None
         self._lock = threading.Lock()
         self._creating = False  # create() is validating / bringing a session up (under _lock)
         self._preview_service = None
+        self._preview_scene = None
         self._preview_sources: list[object] = []
         self._preview_ids: list[str] = []
+        # Hardware camera previews (phase-11): camera id -> started CameraInterface;
+        # cameras that failed to open are listed with live=False and retried on the
+        # next start_previews() (after every session). Test seam: camera_factory.
+        self._hw_cameras: dict[str, object] = {}
+        self._hw_camera_errors: dict[str, str] = {}
+        self.camera_factory: Callable[[object], object] | None = None
+        self._twin_scenes: dict[str, object] = {}  # digital-twin scene cache (status rows)
 
     # -- info ------------------------------------------------------------------
     @property
@@ -715,6 +735,15 @@ class SessionManager:
 
     # -- pre-session camera previews (~15 fps, 04-runtime §13.4) --------------------
     def start_previews(self) -> None:
+        """Sim scene previews (one static render source + one stream per scene
+        camera) and the hardware workcell's camera previews. The sim part is
+        torn down by :meth:`stop_previews` when a sim session starts; hardware
+        previews stay up across sim sessions (phase-11) and are stopped only by
+        :meth:`stop_hardware_previews` (process exit) or a hardware session."""
+        self._start_sim_previews()
+        self.start_hardware_previews()
+
+    def _start_sim_previews(self) -> None:
         if self._preview_service is not None:
             return
         wc = self.cfg.workcell_config("sim")
@@ -742,6 +771,8 @@ class SessionManager:
         self._preview_service = rs
 
     def stop_previews(self) -> None:
+        """Stop the SIM preview sources only; hardware camera previews are kept
+        (no side effect while no camera is connected)."""
         if self._preview_service is None:
             return
         for sid in self._preview_ids:
@@ -753,8 +784,72 @@ class SessionManager:
         self._preview_sources = []
         self._preview_ids = []
 
+    # -- hardware camera previews (phase-11; failure-isolated) ------------------------
+    def _default_camera_factory(self) -> Callable[[object], object]:
+        from apollo_mavis_v2_hardware.cameras import make_camera  # [hardware] extra
+
+        return make_camera
+
+    def start_hardware_previews(self) -> None:
+        """Try to open every hardware camera and stream it at ``preview_fps``.
+        Each camera is isolated: ``CameraInitError`` / any exception (device
+        absent, cv2 missing, hardware extra not installed, duplicate stream id)
+        marks that camera ``live: false`` and never touches the others or the
+        sim previews. A camera that failed mid-run (``failed``) is re-opened."""
+        wc = self.cfg.workcell_config("hardware")
+        if wc is None:
+            return
+        if self.session is not None and self.session.spec.kind == "hardware":
+            return  # the session owns the cameras (04-runtime §13.4)
+        fps = self.cfg.video.preview_fps
+        for cam_cfg in wc.cameras:
+            existing = self._hw_cameras.get(cam_cfg.id)
+            if existing is not None:
+                if not getattr(existing, "failed", False):
+                    continue
+                self._stop_hardware_camera(cam_cfg.id)
+            cam = None
+            try:
+                factory = self.camera_factory or self._default_camera_factory()
+                cam = factory(cam_cfg)
+                cam.start()
+                self.hub.add_stream(cam_cfg.id, cam, fps)
+            except Exception as e:  # noqa: BLE001 - isolation: absent -> live false
+                if cam is not None:
+                    try:
+                        cam.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._hw_camera_errors[cam_cfg.id] = f"{type(e).__name__}: {e}"
+                logger.info("hardware camera %r preview unavailable: %s", cam_cfg.id, e)
+                continue
+            self._hw_cameras[cam_cfg.id] = cam
+            self._hw_camera_errors.pop(cam_cfg.id, None)
+
+    def _stop_hardware_camera(self, cam_id: str) -> None:
+        cam = self._hw_cameras.pop(cam_id, None)
+        if cam is None:
+            return
+        self.hub.remove_stream(cam_id)
+        try:
+            cam.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("hardware camera %r did not stop cleanly", cam_id)
+
+    def stop_hardware_previews(self) -> None:
+        for cam_id in list(self._hw_cameras):
+            self._stop_hardware_camera(cam_id)
+
+    def hardware_camera_errors(self) -> dict[str, str]:
+        """Last open failure per hardware camera id (diagnostics)."""
+        return dict(self._hw_camera_errors)
+
     # -- REST discovery helpers (server/rest.py) -------------------------------------
     def camera_infos(self) -> list:
+        """``GET /api/cameras``: sim cameras (session or preview) + hardware cameras."""
+        return self.sim_camera_infos() + self.hardware_camera_infos()
+
+    def sim_camera_infos(self) -> list:
         from apollo_mavis_v2_core.protocol import CameraInfo
 
         out = []
@@ -772,7 +867,29 @@ class SessionManager:
             ))
         return out
 
+    def hardware_camera_infos(self) -> list:
+        """Every configured hardware camera; ``live`` iff its preview opened
+        (and has not failed since). The UI draws ``live: false`` as a black
+        "no signal" tile without opening a WebSocket."""
+        from apollo_mavis_v2_core.protocol import CameraInfo
+
+        wc = self.cfg.workcell_config("hardware")
+        if wc is None:
+            return []
+        out = []
+        for cam_cfg in wc.cameras:
+            cam = self._hw_cameras.get(cam_cfg.id)
+            live = cam is not None and not getattr(cam, "failed", False)
+            out.append(CameraInfo(
+                camera_id=cam_cfg.id, kind=cam_cfg.kind, label=cam_cfg.id,
+                resolution=tuple(cam_cfg.resolution), fps=int(cam_cfg.fps), live=live,
+            ))
+        return out
+
     def scene_infos(self, kind: str) -> list:
+        """``GET /api/scenes``: the registry's default listing (hidden scenes
+        filtered by the sim registry itself, phase-11), labelled by the scene's
+        display ``title`` when it has one, else its description."""
         from apollo_mavis_v2_core.protocol import SceneInfo
 
         try:
@@ -781,22 +898,55 @@ class SessionManager:
             return []
         out = []
         for meta in REGISTRY.list():
+            if getattr(meta, "hidden", False):  # defensive: older registries list all
+                continue
             if kind not in meta.suitable_for:
                 continue
             out.append(SceneInfo(
-                scene_id=meta.id, label=meta.description, num_arms=meta.n_arms,
+                scene_id=meta.id, label=getattr(meta, "title", None) or meta.description,
+                num_arms=meta.n_arms,
                 rail_flags=[meta.rail[a] for a in meta.arm_ids],
                 cameras=list(meta.cameras), kind=kind,  # type: ignore[arg-type]
             ))
         return out
 
-    def workcell_status(self):
+    def workcell_status(self, kind: str | None = None):
+        """``GET /api/workcell[?kind=hardware|sim]`` (phase-11).
+
+        ``kind=None`` keeps the legacy behaviour: the session's kind, else sim;
+        cameras = everything previewed. ``kind="sim"``: arms from the preview /
+        session scene, sim cameras. ``kind="hardware"``: arms from the hardware
+        config (``ip`` filled, ``reachable`` from the probe, ``connected`` =
+        a hardware session exists), hardware cameras (``live`` = preview
+        opened). ``hardware_ready`` (all configured hardware arms ``open``) is
+        reported on every response."""
         from apollo_mavis_v2_core.protocol import ArmStatusInfo, WorkcellStatus
 
+        from ..dagger.registry import scan_policies
+
         available = [k for k in ("hardware", "sim") if k in self.cfg.workcells]
-        kind = self.session.spec.kind if self.session else (
-            "sim" if "sim" in available else (available[0] if available else "sim")
+        requested = kind
+        if kind is None:
+            kind = self.session.spec.kind if self.session else (
+                "sim" if "sim" in available else (available[0] if available else "sim")
+            )
+        arms: list[ArmStatusInfo]
+        if kind == "hardware":
+            arms = self._hardware_arm_infos()
+            cameras = self.hardware_camera_infos()
+        else:
+            arms = self._sim_arm_infos()
+            cameras = self.camera_infos() if requested is None else self.sim_camera_infos()
+        probe = self.hardware_probe
+        return WorkcellStatus(
+            kind=kind, available_kinds=available, arms=arms, cameras=cameras,
+            policies_available=bool(scan_policies(self.cfg.checkpoints_root)),
+            hardware_ready=bool(probe is not None and probe.hardware_ready),
         )
+
+    def _sim_arm_infos(self) -> list:
+        from apollo_mavis_v2_core.protocol import ArmStatusInfo
+
         arms: list[ArmStatusInfo] = []
         scene = None
         connected = False
@@ -808,7 +958,7 @@ class SessionManager:
         elif self._preview_service is not None:
             scene = self._preview_scene
         if scene is not None:
-            for arm_id in scene.meta.arm_ids:
+            for arm_id in _manipulation_first(scene.meta.arm_ids):
                 limits = self._joint_limits(scene, arm_id)
                 arms.append(ArmStatusInfo(
                     arm_id=arm_id, ip=None, connected=connected,
@@ -818,13 +968,49 @@ class SessionManager:
                     error_code=states[arm_id].error_code if arm_id in states else 0,
                     joint_limits=limits,
                 ))
-        from ..dagger.registry import scan_policies
+        return arms
 
-        return WorkcellStatus(
-            kind=kind, available_kinds=available, arms=arms,
-            cameras=self.camera_infos(),
-            policies_available=bool(scan_policies(self.cfg.checkpoints_root)),
-        )
+    def _twin_scene(self, scene_id: str | None):
+        """Built digital-twin scene for the hardware status rows (rail flags,
+        joint limits): the sim preview scene when it is the same id, else a
+        one-off build cached per id; ``None`` when the sim extra / scene is missing."""
+        if not scene_id:
+            return None
+        preview = self._preview_scene
+        if preview is not None and preview.meta.id == scene_id:
+            return preview
+        if scene_id not in self._twin_scenes:
+            try:
+                from apollo_mavis_v2_sim import REGISTRY
+
+                self._twin_scenes[scene_id] = REGISTRY.build(scene_id)
+            except Exception as e:  # noqa: BLE001 - status rows degrade gracefully
+                logger.warning("digital twin scene %r unavailable for status: %r", scene_id, e)
+                self._twin_scenes[scene_id] = None
+        return self._twin_scenes[scene_id]
+
+    def _hardware_arm_infos(self) -> list:
+        from apollo_mavis_v2_core.protocol import ArmStatusInfo
+
+        wc = self.cfg.workcell_config("hardware")
+        if wc is None:
+            return []
+        connected = self.session is not None and self.session.spec.kind == "hardware"
+        probe = self.hardware_probe
+        twin = self._twin_scene(wc.digital_twin_scene)
+        arms: list[ArmStatusInfo] = []
+        for arm in sorted(wc.arms, key=lambda a: a.id != DEFAULT_ACTIVE_ARM):  # grip first
+            in_twin = twin is not None and arm.id in twin.meta.arm_ids
+            arms.append(ArmStatusInfo(
+                arm_id=arm.id, ip=arm.ip, connected=connected,
+                reachable=probe.reachable(arm.id) if probe is not None else "unknown",
+                has_rail=twin.meta.rail[arm.id] if in_twin else arm.expect_rail == "yes",
+                gripper=arm.gripper,
+                gripper_force_capable=arm.gripper == "xarm_g2",
+                error_code=0,
+                joint_limits=self._joint_limits(twin, arm.id) if in_twin else [],
+            ))
+        return arms
 
     @staticmethod
     def _joint_limits(scene, arm_id: str) -> list[tuple[float, float]]:

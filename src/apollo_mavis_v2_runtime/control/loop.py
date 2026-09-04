@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -51,6 +51,19 @@ RAIL_TRAVEL_M = se3.RAIL_TRAVEL_M
 GRIPPER_SEND_EVERY_N_TICKS = 10  # <= 10 Hz (modbus is slow)
 PLAN_STATUS_LINGER_TICKS = 100  # keep "done"/"failed" visible ~1 s
 DEVICE_ACTION_LINGER_S = 1.0  # telemetry shows the last device-sourced discrete action this long
+# The Manipulation Arm (arm id ``grip``: xArm Gripper G2 + wrist camera) is the
+# default teleop arm on every workcell, hardware and sim (user decision
+# 2026-09-04); the Perception Arm (``view``) is reached with Tab / switch_arm.
+DEFAULT_ACTIVE_ARM = "grip"
+
+
+def default_active_arm(arms: Sequence[str]) -> str | None:
+    """Initial ``active_arm`` of a session: :data:`DEFAULT_ACTIVE_ARM` when the
+    session includes it (whatever its position in ``arms``), else the first
+    session arm, else ``None`` (no arms)."""
+    if DEFAULT_ACTIVE_ARM in arms:
+        return DEFAULT_ACTIVE_ARM
+    return arms[0] if arms else None
 
 
 @dataclass(frozen=True)
@@ -130,7 +143,7 @@ class ControlLoop:
         self.dt = 1.0 / cfg.rate_hz
         self.sources = HeldSources()  # this tick's held codes by source (step 2)
 
-        self.active_arm: str | None = self.session_arms[0] if self.session_arms else None
+        self.active_arm: str | None = default_active_arm(self.session_arms)
         self.jog = JogState(cfg.jog)
         self.plans = PlanExecutor(cfg.jog)
         self.integrator = TargetIntegrator(cfg.leash.pos_m, cfg.leash.rot_rad)
@@ -890,8 +903,10 @@ class ControlLoop:
 
 __all__ = [
     "ControlLoop",
+    "DEFAULT_ACTIVE_ARM",
     "DEVICE_ACTION_LINGER_S",
     "GRIPPER_SEND_EVERY_N_TICKS",
     "HeldSources",
     "PLAN_STATUS_LINGER_TICKS",
+    "default_active_arm",
 ]

@@ -10,6 +10,7 @@ from apollo_mavis_v2_core.protocol import (
     ArmTelemetry,
     ClearanceItem,
     ControllerTelemetry,
+    MicrophoneTelemetry,
     PoseMsg,
     SessionTelemetry,
     TelemetryMsg,
@@ -19,6 +20,7 @@ from apollo_mavis_v2_core.protocol import (
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ..control.tracker_teleop import align_pose
+from ..devices.microphone import to_telemetry
 from ..devices.tracker import ControllerState
 
 
@@ -90,6 +92,15 @@ def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
     )
 
 
+def build_microphone_telemetry(runtime, now: float) -> MicrophoneTelemetry | None:
+    """Microphone block (phase-11): one frame per tick from the Runtime-owned
+    reader, pre-session too; ``None`` when no microphone is configured. The
+    same device status feeds ``GET /api/microphones``."""
+    if not runtime.cfg.microphone.enabled:
+        return None
+    return to_telemetry(runtime.microphone.status(now))
+
+
 def build_telemetry(runtime, seq: int) -> TelemetryMsg:
     """One frame from the latest StateSnapshot + session manager state."""
     got = runtime.bus.snapshot.get()
@@ -144,6 +155,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
             ),
         ),
         tracker=build_tracker_telemetry(runtime, snap, now),
+        microphone=build_microphone_telemetry(runtime, now),
     )
 
 
@@ -164,4 +176,9 @@ async def endpoint(websocket: WebSocket) -> None:
         pass
 
 
-__all__ = ["endpoint", "build_telemetry", "build_tracker_telemetry"]
+__all__ = [
+    "endpoint",
+    "build_telemetry",
+    "build_tracker_telemetry",
+    "build_microphone_telemetry",
+]

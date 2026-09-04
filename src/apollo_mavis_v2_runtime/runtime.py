@@ -7,9 +7,12 @@ import uuid
 from concurrent.futures import Future
 
 from apollo_mavis_v2_core import Command, CommandResult, HeldState, ProfileStore
+from apollo_mavis_v2_core.protocol import MicrophoneInfo
 
 from .bus import RuntimeBus
 from .config import RuntimeConfig
+from .devices.hardware_probe import HardwareProbe
+from .devices.microphone import MicrophoneReader, to_info
 from .devices.tracker import TrackerReader, TrackerSettings
 from .devices.tracker_calibration import TrackerCalibration, apply_persisted_yaw
 from .session.manager import SessionManager
@@ -18,7 +21,7 @@ from .streams.hub import VideoHub
 
 class Runtime:
     """Process-singleton: bus, video hub, profile store, tracker reader,
-    tracker calibration FSM, session manager."""
+    microphone reader, hardware probe, tracker calibration FSM, session manager."""
 
     def __init__(self, cfg: RuntimeConfig) -> None:
         self.cfg = cfg
@@ -35,10 +38,27 @@ class Runtime:
         self.tracker = TrackerReader(cfg.tracker, self.bus.tracker)
         if cfg.tracker.backend != "none":
             self.tracker.start()
+        # Perception Arm microphone (phase-11): Runtime-owned like the tracker so the
+        # Hardware tab shows the live waveform with no session and no arms.
+        # Frames are aligned to telemetry_hz (one new frame per telemetry tick).
+        self.microphone = MicrophoneReader(
+            cfg.microphone, self.bus.microphone, frame_hz=cfg.telemetry_hz
+        )
+        self.microphone.start()  # no-op unless enabled with a backend
+        # Hardware reachability probe (phase-11): TCP 502 connect-and-close per
+        # configured hardware arm; paused while a hardware session runs.
+        hw = cfg.workcell_config("hardware")
+        self.hardware_probe = HardwareProbe(
+            {a.id: a.ip for a in hw.arms} if hw is not None else {},
+            cfg.hardware_probe,
+            paused=self._hardware_session_active,
+        )
         self.manager = SessionManager(
             cfg, self.bus, self.hub, self.profile_store, self.epoch,
             tracker_settings=self.tracker_settings,
+            hardware_probe=self.hardware_probe,
         )
+        self.hardware_probe.start()  # no-op without a hardware workcell
         # Calibration wizard back end (13-tracker §4 "Calibration modes"): Runtime-
         # owned, session-less; REST /api/tracker/calibration + telemetry.
         self.tracker_calibration = TrackerCalibration(
@@ -65,9 +85,25 @@ class Runtime:
     def stop(self) -> None:
         self.manager.teardown()
         self.manager.stop_previews()
+        self.manager.stop_hardware_previews()
         self.hub.stop()
         self.tracker_calibration.close()  # restores normal libsurvive args if mid-calibration
         self.tracker.stop()
+        self.hardware_probe.stop()
+        self.microphone.stop()
+
+    def _hardware_session_active(self) -> bool:
+        session = self.manager.session
+        return session is not None and session.spec.kind == "hardware"
+
+    # -- session-less device discovery (REST; 04-runtime §13.1) -----------------------
+    def microphone_infos(self) -> list[MicrophoneInfo]:
+        """``GET /api/microphones``: the configured microphone is always listed
+        (``live: false`` while absent / stalled / erroring); empty when
+        ``microphone.enabled`` is false."""
+        if not self.cfg.microphone.enabled:
+            return []
+        return [to_info(self.microphone.status())]
 
     # -- control-WS plumbing (no motion work here; 04-runtime §13.2) -------------
     def on_keys(self, seq: int, held: list[str]) -> None:

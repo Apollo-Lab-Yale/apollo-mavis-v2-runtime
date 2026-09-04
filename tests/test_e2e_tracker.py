@@ -130,22 +130,22 @@ def test_clutch_keyc_moves_ee_then_release_holds(server, api, session, caplog):
     try:
         assert ctl.hello["role"] == "controller"
         msg = tele.latest()
-        assert msg["active_arm"] == "view"
-        p0 = msg["arms"][0]["ee_pose"]["position"]
+        assert msg["active_arm"] == "grip"  # the Manipulation Arm is the default teleop arm
+        p0 = msg["arms"][1]["ee_pose"]["position"]  # telemetry arms follow the spec: [view, grip]
         engaged_frames = 0
         end = time.monotonic() + 2.0
         while time.monotonic() < end:  # KeysMsg + 25 Hz heartbeat with the clutch held
             ctl.keys(["KeyC"])
             time.sleep(0.04)
             trk = tele.latest()["tracker"]
-            if trk["engaged_arm"] == "view":
+            if trk["engaged_arm"] == "grip":
                 engaged_frames += 1
                 assert trk["clutch"] is True
                 assert trk["anchor_tcp"] is not None and trk["target_tcp"] is not None
                 assert trk["status"] == "tracking"
         assert engaged_frames > 20, engaged_frames
         msg = tele.latest()
-        p1 = msg["arms"][0]["ee_pose"]["position"]
+        p1 = msg["arms"][1]["ee_pose"]["position"]
         assert _dist(p0, p1) > 0.03, (p0, p1)  # fake circle ~0.047 m/s for 2 s
         trk = msg["tracker"]
         # The target never leads the anchored hand by more than the hand moved.
@@ -156,13 +156,13 @@ def test_clutch_keyc_moves_ee_then_release_holds(server, api, session, caplog):
         trk = msg["tracker"]
         assert trk["clutch"] is False and trk["engaged_arm"] is None
         assert trk["anchor_tcp"] is None and trk["target_tcp"] is None
-        p2 = msg["arms"][0]["ee_pose"]["position"]
+        p2 = msg["arms"][1]["ee_pose"]["position"]
         time.sleep(0.5)
-        p3 = tele.latest()["arms"][0]["ee_pose"]["position"]
+        p3 = tele.latest()["arms"][1]["ee_pose"]["position"]
         assert _dist(p2, p3) < 2e-3  # stopped while the fake tracker keeps circling
-        # The non-active arm never moved.
-        assert _dist(msg["arms"][1]["ee_pose"]["position"],
-                     tele.latest()["arms"][1]["ee_pose"]["position"]) < 2e-3
+        # The non-active (view) arm never moved.
+        assert _dist(msg["arms"][0]["ee_pose"]["position"],
+                     tele.latest()["arms"][0]["ee_pose"]["position"]) < 2e-3
     finally:
         ctl.close()
         tele.close()
@@ -189,9 +189,9 @@ def test_tracker_settings_and_switch_arm_prev_over_ws(server, api, session):
         ack = ctl.action("tracker_settings", {"pos_scale": 1.0, "yaw_deg": 0.0})
         assert ack["ok"]
         ack = ctl.action("switch_arm_prev")
-        assert ack["ok"] and ack["detail"] == "grip"  # wraps from view
+        assert ack["ok"] and ack["detail"] == "view"  # (i - 1) from the default grip
         ack = ctl.action("switch_arm_prev")
-        assert ack["ok"] and ack["detail"] == "view"
+        assert ack["ok"] and ack["detail"] == "grip"  # wraps
         ack = ctl.action("switch_arm_prev", {"nope": 1})
         assert not ack["ok"] and "invalid args" in ack["detail"]
     finally:
@@ -223,6 +223,16 @@ def _wait_tracker(tele, pred, timeout_s=3.0):
     return trk
 
 
+def _wait_active(tele, arm: str, timeout_s: float = 3.0) -> dict:
+    """Latest telemetry frame once ``active_arm`` reads ``arm`` (asserts)."""
+    deadline = time.monotonic() + timeout_s
+    msg = tele.latest()
+    while msg["active_arm"] != arm and time.monotonic() < deadline:
+        msg = tele.latest()
+    assert msg["active_arm"] == arm, msg["active_arm"]
+    return msg
+
+
 def test_controller_trigger_moves_ee_without_any_keysmsg(server, api, session, caplog):
     caplog.set_level(logging.INFO)
     script = _script_controller(server)
@@ -230,17 +240,17 @@ def test_controller_trigger_moves_ee_without_any_keysmsg(server, api, session, c
     try:
         trk = _wait_tracker(tele, lambda t: t["status"] == "tracking")
         assert trk["controller"] is None and trk["device_held"] == []
-        p0 = tele.latest()["arms"][0]["ee_pose"]["position"]
+        p0 = tele.latest()["arms"][1]["ee_pose"]["position"]  # grip: the default active arm
         script["state"] = ControllerState(trigger=1.0, trigger_pressed=True)
-        trk = _wait_tracker(tele, lambda t: t["engaged_arm"] == "view")
-        assert trk["clutch"] is True and trk["engaged_arm"] == "view", trk
+        trk = _wait_tracker(tele, lambda t: t["engaged_arm"] == "grip")
+        assert trk["clutch"] is True and trk["engaged_arm"] == "grip", trk
         assert trk["device_held"] == ["KeyC"]
         c = trk["controller"]
         assert c["trigger"] == 1.0 and c["trigger_pressed"] is True
         assert c["trackpad_click"] is False and c["grip"] is False
         time.sleep(2.0)
         msg = tele.latest()
-        p1 = msg["arms"][0]["ee_pose"]["position"]
+        p1 = msg["arms"][1]["ee_pose"]["position"]
         assert _dist(p0, p1) > 0.03, (p0, p1)  # no /ws/control client ever connected
         assert msg["controller_connected"] is False
         assert msg["tracker"]["anchor_tcp"] is not None and msg["tracker"]["target_tcp"]
@@ -249,29 +259,31 @@ def test_controller_trigger_moves_ee_without_any_keysmsg(server, api, session, c
         assert trk["engaged_arm"] is None and trk["anchor_tcp"] is None
         assert trk["controller"]["trigger_pressed"] is False
         time.sleep(0.4)  # let the sim arm settle on the frozen command
-        p2 = tele.latest()["arms"][0]["ee_pose"]["position"]
+        p2 = tele.latest()["arms"][1]["ee_pose"]["position"]
         time.sleep(0.5)
-        assert _dist(p2, tele.latest()["arms"][0]["ee_pose"]["position"]) < 2e-3
-        # Trackpad click right / left / inside the deadzone -> ArrowRight / ArrowLeft /
+        assert _dist(p2, tele.latest()["arms"][1]["ee_pose"]["position"]) < 2e-3
+        # Trackpad click left / right / inside the deadzone -> ArrowLeft / ArrowRight /
         # nothing; each click is classified at its press edge, so release in between.
-        # The rail codes drive the rail of the active (view) arm with no /ws/control client.
-        r0 = tele.latest()["arms"][0]["rail_pos_m"]
-        script["state"] = _pad(x=0.9)
-        trk = _wait_tracker(tele, lambda t: t["device_held"] == ["ArrowRight"])
-        assert trk["device_held"] == ["ArrowRight"] and trk["controller"]["trackpad_click"]
-        time.sleep(0.5)
-        r1 = tele.latest()["arms"][0]["rail_pos_m"]
-        assert r1 > r0 + 0.02, (r0, r1)  # 0.10 m/s while held
-        script["state"] = _pad(x=0.9, click=False)
-        _wait_tracker(tele, lambda t: t["device_held"] == [])
-        time.sleep(0.3)
-        r2 = tele.latest()["arms"][0]["rail_pos_m"]
+        # The rail codes drive the rail of the active (grip) arm with no /ws/control
+        # client. Left first: the grip rail rests at the +q end of its travel.
+        r0 = tele.latest()["arms"][1]["rail_pos_m"]
         script["state"] = _pad(x=-0.9)
         trk = _wait_tracker(tele, lambda t: t["device_held"] == ["ArrowLeft"])
-        assert trk["device_held"] == ["ArrowLeft"] and trk["controller"]["trackpad_x"] == -0.9
+        assert trk["device_held"] == ["ArrowLeft"] and trk["controller"]["trackpad_click"]
+        assert trk["controller"]["trackpad_x"] == -0.9
         time.sleep(0.5)
-        assert tele.latest()["arms"][0]["rail_pos_m"] < r2 - 0.02
+        r1 = tele.latest()["arms"][1]["rail_pos_m"]
+        assert r1 < r0 - 0.02, (r0, r1)  # 0.10 m/s while held
         script["state"] = _pad(x=-0.9, click=False)
+        _wait_tracker(tele, lambda t: t["device_held"] == [])
+        time.sleep(0.3)
+        r2 = tele.latest()["arms"][1]["rail_pos_m"]
+        script["state"] = _pad(x=0.9)
+        trk = _wait_tracker(tele, lambda t: t["device_held"] == ["ArrowRight"])
+        assert trk["device_held"] == ["ArrowRight"] and trk["controller"]["trackpad_x"] == 0.9
+        time.sleep(0.5)
+        assert tele.latest()["arms"][1]["rail_pos_m"] > r2 + 0.02
+        script["state"] = _pad(x=0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
         script["state"] = _pad(x=0.1, y=0.1)
         time.sleep(0.3)
@@ -292,7 +304,7 @@ def test_controller_codes_survive_ws_deadman_latch(server, api, session):
     ctl = Ctl(server)
     tele = Tele(server)
     try:
-        assert ctl.action("switch_arm")["detail"] == "grip"  # the arm with a gripper
+        # grip (the arm with a gripper) is the default active arm: no switch needed.
         ctl.keys(["KeyW"])  # one KeysMsg, then silence: deadman trips and latches
         watchdog = server.runtime.manager.session.supervisor.watchdog
         deadline = time.monotonic() + 2.0
@@ -323,10 +335,12 @@ def test_controller_codes_survive_ws_deadman_latch(server, api, session):
 # -- 13-tracker §1.1 remap: trackpad up/down gripper, left/right rail, menu arm switch --------
 def test_trackpad_click_gripper_only_on_grip_arm_and_menu_switches_arm(server, api, session):
     script = _script_controller(server)
+    ctl = Ctl(server)
     tele = Tele(server)
     try:
-        msg = tele.latest()
-        assert msg["active_arm"] == "view"  # camera-only arm: gripper codes are ignored
+        assert tele.latest()["active_arm"] == "grip"  # default: the Manipulation Arm
+        assert ctl.action("switch_arm")["detail"] == "view"
+        msg = _wait_active(tele, "view")  # camera-only arm: gripper codes are ignored
         script["state"] = _pad(click=False)  # pad touched, not clicked: controller adopted
         _wait_tracker(tele, lambda t: t["controller"] is not None)
         g_grip0 = msg["arms"][1]["gripper_open_frac"]
@@ -376,6 +390,7 @@ def test_trackpad_click_gripper_only_on_grip_arm_and_menu_switches_arm(server, a
     finally:
         script["state"] = None
         server.runtime.tracker.controller_provider = None
+        ctl.close()
         tele.close()
 
 

@@ -187,3 +187,62 @@ def test_gripper_keys_and_targets_skip_gripperless_arm():
     assert loop.active_arm == "arm1"
     assert loop._grip_frac["arm1"] > 0.3 and len(senders["arm1"].puts) > 1
     assert senders["arm0"].puts == []
+
+
+# -- default active arm: the Manipulation Arm (grip) whatever its position ------------
+def _loop_over(tmp_path, arm_ids: list[str]):
+    """ControlLoop over FakeWorkcell for ``arm_ids`` (same wiring as ``fake_loop``)."""
+    from apollo_mavis_v2_core import ProfileStore
+    from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
+
+    from apollo_mavis_v2_runtime.bus import RuntimeBus
+    from apollo_mavis_v2_runtime.config import ControlConfig
+    from apollo_mavis_v2_runtime.control.loop import ControlLoop
+    from apollo_mavis_v2_runtime.safety.gate import NullGate
+    from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
+    from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
+
+    cell = FakeWorkcell({a: FakeArm(a, has_rail=True) for a in arm_ids})
+    cell.start()
+    bus = RuntimeBus()
+    loop = ControlLoop(
+        cell, ControlConfig(), bus, SafetySupervisor(NullGate(), InputWatchdog()),
+        list(arm_ids), profile_store=ProfileStore(tmp_path / "profiles"), workcell_kind="sim",
+    )
+    return cell, bus, loop
+
+
+def test_default_active_arm_helper():
+    from apollo_mavis_v2_runtime.control.loop import DEFAULT_ACTIVE_ARM, default_active_arm
+
+    assert DEFAULT_ACTIVE_ARM == "grip"
+    assert default_active_arm(["view", "grip"]) == "grip"  # not spec.arms[0]
+    assert default_active_arm(["grip", "view"]) == "grip"
+    assert default_active_arm(["grip"]) == "grip"
+    assert default_active_arm(["view"]) == "view"  # no grip: first arm
+    assert default_active_arm(["arm0", "arm1"]) == "arm0"
+    assert default_active_arm([]) is None
+
+
+def test_session_with_view_then_grip_starts_on_grip(tmp_path):
+    """A session created with arms ['view', 'grip'] reports active arm grip from the
+    first tick (telemetry snapshot included); Tab / switch_arm_prev cycle from there."""
+    cell, bus, loop = _loop_over(tmp_path, ["view", "grip"])
+    assert loop.active_arm == "grip"
+    run_ticks(loop, cell, 2)
+    assert bus.snapshot.get()[0].active_arm == "grip"
+    fut = submit(bus, "switch_arm")
+    run_ticks(loop, cell, 1)
+    assert fut.result(0).ok and fut.result(0).detail == "view" and loop.active_arm == "view"
+    fut = submit(bus, "switch_arm")
+    run_ticks(loop, cell, 1)
+    assert fut.result(0).ok and loop.active_arm == "grip"  # wraps back
+    fut = submit(bus, "switch_arm_prev")
+    run_ticks(loop, cell, 1)
+    assert fut.result(0).ok and loop.active_arm == "view"  # (i - 1) mod n
+    assert bus.snapshot.get()[0].active_arm == "view"
+
+
+def test_session_without_grip_starts_on_first_arm(tmp_path):
+    _, _, loop = _loop_over(tmp_path, ["view", "aux"])
+    assert loop.active_arm == "view"

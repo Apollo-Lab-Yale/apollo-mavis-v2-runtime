@@ -62,17 +62,32 @@ def test_workcell_status_reports_gripper_presence(runtime):
     assert not any(a.gripper_force_capable for a in m.workcell_status().arms)
 
 
+def test_session_starts_on_the_manipulation_arm(runtime):
+    """arms=[view, grip]: the Manipulation Arm (grip) is active from the first tick,
+    not spec.arms[0]; Tab cycles view -> grip -> ... from there."""
+    _create_running(runtime)
+    loop = runtime.manager.session.loop
+    assert loop.active_arm == "grip"
+    res = runtime.submit_action("switch_arm", {}).result(timeout=5.0)
+    assert res.ok and res.detail == "view" and loop.active_arm == "view"
+    res = runtime.submit_action("switch_arm", {}).result(timeout=5.0)
+    assert res.ok and res.detail == "grip" and loop.active_arm == "grip"
+
+
 def test_gripper_keys_on_camera_only_arm_send_nothing(runtime, caplog):
     _create_running(runtime)
     loop = runtime.manager.session.loop
-    assert loop.active_arm == "view" and loop.gripper_arms == {"grip"}
+    assert loop.active_arm == "grip" and loop.gripper_arms == {"grip"}  # default: Manipulation Arm
 
+    # Tab to the camera-only arm, then close: nothing is forwarded.
+    runtime.submit_action("switch_arm", {}).result(timeout=5.0)
+    assert loop.active_arm == "view"
     seq = _hold(runtime, ["KeyF"], 0.4, 0)  # close on the camera-only arm
     assert loop.tick_count > 20
     assert "view" not in loop._grip_frac
     assert loop._senders["view"]._last_grip is None  # nothing forwarded
 
-    # The gripper arm still works: Tab, then close.
+    # The gripper arm still works: Tab back, then close.
     runtime.submit_action("switch_arm", {}).result(timeout=5.0)
     assert loop.active_arm == "grip"
     frac0 = loop._grip_frac["grip"]

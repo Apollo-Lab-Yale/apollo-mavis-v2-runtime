@@ -1,9 +1,11 @@
 # apollo-mavis-v2-runtime
 
 Session engine, 100 Hz control loop, safety supervisor, recorder and FastAPI
-server for the MAVIS v2 cell (two xArm7 arms on linear tracks: grip arm with
-gripper + wrist camera, view arm with wrist camera only), in simulation
-(`apollo-mavis-v2-sim`) or on the real hardware (`apollo-mavis-v2-hardware`).
+server for the MAVIS v2 cell (two xArm7 arms on linear tracks: the
+**Manipulation Arm** `grip` with xArm Gripper G2 + wrist camera — the default
+teleop arm — and the **Perception Arm** `view` with wrist RealSense D435 +
+microphone), in simulation (`apollo-mavis-v2-sim`) or on the real hardware
+(`apollo-mavis-v2-hardware`; control boxes 192.168.1.201 / 192.168.2.219).
 Run: `uv run python -m apollo_mavis_v2_runtime --config <yaml>`; design in
 `docs/design/04-runtime.md`.
 

@@ -6,6 +6,7 @@ from apollo_mavis_v2_core import ProfileError, ProfileNotFoundError, StateProfil
 from apollo_mavis_v2_core.protocol import (
     KEYMAP,
     KeymapEntry,
+    MicrophoneInfo,
     ProfileInfo,
     SceneInfo,
     SessionInfo,
@@ -39,13 +40,24 @@ def health(request: Request) -> dict:
 
 
 @router.get("/workcell")
-def workcell(request: Request) -> WorkcellStatus:
-    return _runtime(request).manager.workcell_status()
+def workcell(request: Request, kind: str | None = None) -> WorkcellStatus:
+    """``?kind=hardware|sim`` selects the workcell described (phase-11 Welcome
+    tabs); omitted = the session's kind or sim (legacy behaviour)."""
+    if kind is not None and kind not in ("hardware", "sim"):
+        raise HTTPException(422, "kind must be hardware|sim")
+    return _runtime(request).manager.workcell_status(kind)
 
 
 @router.get("/cameras")
 def cameras(request: Request) -> list:
     return _runtime(request).manager.camera_infos()
+
+
+@router.get("/microphones")
+def microphones(request: Request) -> list[MicrophoneInfo]:
+    """Configured microphones with their live status (phase-11; the Hardware
+    tab renders the MicTile from this list and reads levels from telemetry)."""
+    return _runtime(request).microphone_infos()
 
 
 @router.get("/scenes")

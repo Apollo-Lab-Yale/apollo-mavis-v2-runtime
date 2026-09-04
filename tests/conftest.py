@@ -6,6 +6,9 @@ import os
 
 os.environ.setdefault("MUJOCO_GL", "egl")  # noqa: E402 - must precede mujoco GL init
 
+import socket
+import threading
+
 import numpy as np
 import pytest
 from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
@@ -77,6 +80,42 @@ def run_ticks(loop: ControlLoop, cell: FakeWorkcell, n: int, t0: float = 0.0) ->
 
 def q_of(cell: FakeWorkcell, arm_id: str) -> np.ndarray:
     return cell.arms[arm_id].get_state().q
+
+
+class AcceptingListener:
+    """Loopback TCP listener that accepts and immediately closes every connection
+    on a daemon thread. Use it wherever a poller (``HardwareProbe`` at 10 Hz x 2
+    arms in the API tests) hits a "control box" for longer than a few rounds: a
+    bare ``listen(N)`` socket holds only N+1 un-accepted connections, after which
+    the kernel drops SYNs and every probe times out -> ``unreachable``."""
+
+    def __init__(self, backlog: int = 8) -> None:
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(backlog)
+        self._srv.settimeout(0.2)  # so the acceptor notices close() promptly
+        self.port: int = self._srv.getsockname()[1]
+        self.accepted = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._drain, name="test-acceptor", daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:  # listener closed
+                return
+            self.accepted += 1
+            conn.close()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._srv.close()
 
 
 class LiveServer:

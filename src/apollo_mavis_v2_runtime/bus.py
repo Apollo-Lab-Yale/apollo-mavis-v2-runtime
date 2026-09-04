@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     import numpy as np
 
     from .control.snapshot import StateSnapshot
+    from .devices.microphone import MicFrame
     from .devices.tracker import TrackerSample
 
 
@@ -23,8 +24,9 @@ class RuntimeBus:
     Slots: ``held_keys`` (WS -> control), ``q_cmd[arm_id]`` (control ->
     senders), ``snapshot`` (control -> telemetry/recorder/twin-sync),
     ``policy_action`` (policy runner -> control, phase-08), ``tracker``
-    (TrackerReader -> control/telemetry, 13-tracker §2) and
-    ``encoded[stream_id]`` (encoders -> WS/MJPEG).
+    (TrackerReader -> control/telemetry, 13-tracker §2), ``microphone``
+    (MicrophoneReader -> telemetry, phase-11) and ``encoded[stream_id]``
+    (encoders -> WS/MJPEG).
     """
 
     def __init__(self) -> None:
@@ -34,6 +36,7 @@ class RuntimeBus:
         self.snapshot: LatestSlot[StateSnapshot] = LatestSlot()
         self.policy_action: LatestSlot[Any] = LatestSlot()
         self.tracker: LatestSlot[TrackerSample] = LatestSlot()
+        self.microphone: LatestSlot[MicFrame] = LatestSlot()
         self.encoded: dict[str, LatestSlot[bytes]] = {}
 
     def arm_slot(self, arm_id: str) -> LatestSlot:

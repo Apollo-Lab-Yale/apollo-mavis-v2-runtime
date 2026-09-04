@@ -52,23 +52,51 @@ def test_keymap_matches_core(client):
 
 
 def test_scenes_listing(client):
+    """Phase-11: the UI/API list only the lab scene (registry ``hidden`` filter)
+    and label it by its display title; hidden scenes stay buildable by id
+    (sessions and tests keep using ``single_rail``)."""
+    from apollo_mavis_v2_sim import REGISTRY
+    from apollo_mavis_v2_sim.scenes.descriptor import SceneMeta
+
     scenes = client.get("/api/scenes", params={"kind": "sim"}).json()
     ids = {s["scene_id"] for s in scenes}
-    assert "single_rail" in ids and "guardrail_env" in ids
-    row = next(s for s in scenes if s["scene_id"] == "single_rail")
-    assert row["num_arms"] == 1 and row["rail_flags"] == [True]
+    assert "mavis_v2" in ids
+    row = next(s for s in scenes if s["scene_id"] == "mavis_v2")
+    assert row["num_arms"] == 2 and row["rail_flags"] == [True, True]
+    assert {"view", "grip"} <= set(REGISTRY.meta("mavis_v2").arm_ids)
+    meta = REGISTRY.meta("mavis_v2")
+    if "hidden" in getattr(SceneMeta, "__dataclass_fields__", {}):  # sim phase-11 landed
+        assert ids == {"mavis_v2"}, ids
+        assert row["label"] == meta.title == "APOLLO MAVIS V2 Digital Twin"
+        twin = client.get("/api/scenes", params={"kind": "twin"}).json()
+        assert {s["scene_id"] for s in twin} == {"mavis_v2"}
+    else:  # older registry: full listing, description label
+        assert "single_rail" in ids
+        assert row["label"] == meta.description
+    # Hidden scenes are still addressable by id (sessions validate via REGISTRY.meta).
+    assert REGISTRY.meta("single_rail").n_arms == 1
     assert client.get("/api/scenes", params={"kind": "nope"}).status_code == 422
 
 
 def test_workcell_and_cameras_pre_session(client):
     ws = client.get("/api/workcell").json()
     assert ws["kind"] == "sim" and ws["available_kinds"] == ["sim"]
+    assert ws["hardware_ready"] is False  # no hardware workcell configured
     arm = ws["arms"][0]
     assert arm["has_rail"] and len(arm["joint_limits"]) == 8
     assert arm["joint_limits"][7] == [0.0, 0.65]
+    assert arm["reachable"] == "unknown" and arm["ip"] is None  # sim rows are not probed
     cams = client.get("/api/cameras").json()
     assert {c["camera_id"] for c in cams} == {"cam_front", "arm0_wrist_cam"}
     assert all(c["live"] for c in cams)
+    # ?kind= selects the workcell described; sim == legacy rows here.
+    assert client.get("/api/workcell", params={"kind": "sim"}).json()["arms"] == ws["arms"]
+    hw = client.get("/api/workcell", params={"kind": "hardware"}).json()
+    assert hw["kind"] == "hardware" and hw["arms"] == [] and hw["cameras"] == []
+    assert hw["available_kinds"] == ["sim"] and hw["hardware_ready"] is False
+    assert client.get("/api/workcell", params={"kind": "nope"}).status_code == 422
+    # No microphone configured -> empty list, no telemetry block.
+    assert client.get("/api/microphones").json() == []
 
 
 def test_session_404_then_lifecycle(client):
@@ -159,3 +187,4 @@ def test_telemetry_pre_session_idle(client):
             "filter_enabled": True, "filter_min_cutoff_hz": 1.0, "filter_beta": 0.05,
         }
         assert trk["pose_filtered"] is None and trk["device_action"] is None
+        assert msg["microphone"] is None  # microphone.enabled false in this config

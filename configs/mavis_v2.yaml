@@ -8,14 +8,40 @@ workcells:
     kind: sim
     sim_scene: mavis_v2     # POST /api/session may override
     arms:
-      - id: view            # front, camera-only arm
+      - id: view            # Perception Arm (camera-only: wrist RealSense + microphone), outer rail
         base_in_world: {}   # sim arm placement comes from the scene descriptor
         gripper: none
-      - id: grip            # back, xArm gripper + wrist camera
+      - id: grip            # Manipulation Arm (xArm gripper + wrist camera), inner rail; default teleop arm
         base_in_world: {}
     cameras: []
     safety:
       safety_debug: false   # true = full hardware safety stack vs the sim cell
+  # Real cell (phase-11): lets the Welcome page's Hardware tab open with no arm
+  # connected. Exactly TWO control boxes (2026-09-04): Manipulation Arm `grip`
+  # at 192.168.1.201 and Perception Arm `view` at 192.168.2.219, one NIC each.
+  # Only the camera paths are still PLACEHOLDERS until the user supplies the
+  # /dev/v4l/by-id mappings: those previews report `live: false` (pure-black
+  # tiles) -- no other side effect; a box that is off shows `reachable:
+  # unreachable`. Sessions on this workcell land with phase-09
+  # (`_bringup_hardware`); POST /api/session kind=hardware is 409.
+  hardware:
+    kind: hardware
+    digital_twin_scene: mavis_v2   # same cell as the sim scene; the Perception Arm carries the microphone body
+    arms:
+      - id: grip                  # Manipulation Arm: xArm Gripper G2 + wrist camera (inner rail); default teleop arm
+        ip: 192.168.1.201         # control box 1
+        base_in_world: {}         # rail origin in world; measured in phase-09 (03-sim §4.3)
+        gripper: xarm_g2          # force-capable Gripper G2 (ArmStatusInfo.gripper_force_capable)
+      - id: view                  # Perception Arm: wrist RealSense D435 + RØDE NT-USB Mini (outer rail, nearest the operator)
+        ip: 192.168.2.219         # control box 2
+        base_in_world: {}
+        gripper: none
+        microphone: true          # RØDE NT-USB Mini ahead of the wrist camera -> twin collision body
+    cameras:                      # v4l2 by-id paths TODO: user supplies the real camera1/camera2 mapping
+      - {id: camera1, kind: v4l2, device_path: /dev/v4l/by-id/TODO-camera1, resolution: [640, 480], fps: 30}
+      - {id: camera2, kind: v4l2, device_path: /dev/v4l/by-id/TODO-camera2, resolution: [640, 480], fps: 30}
+    safety:
+      enabled: true               # hardware refuses to start without the safety gate
 profiles_dir: ~/apollo/profiles
 datasets_root: ~/apollo/datasets
 checkpoints_root: ~/apollo/checkpoints
@@ -31,6 +57,30 @@ control:
 telemetry_hz: 25
 video: {preview_fps: 15, session_fps: 30, jpeg_quality: 80}
 egl_device_id: 0
+# Perception Arm (`view`) microphone preview (phase-11; 04-runtime §13.3/§14). Captured THROUGH
+# PulseAudio only (the daemon owns the RØDE NT-USB Mini; a direct hw: open fails
+# with EBUSY and stalls every other Pulse client). backend: auto = sounddevice
+# (PortAudio ALSA `pulse` plugin, PULSE_SOURCE pinned) -> parec subprocess;
+# fake = synthetic AM sine (tests); none = listed but not captured. Frame rate
+# follows telemetry_hz (25 Hz -> 1920 samples = 64 bins x 30). Absent device ->
+# status absent, live false (the Hardware tab still opens).
+microphone:
+  enabled: true
+  mic_id: mic_view
+  label: Perception Arm microphone   # user-facing (landing page, telemetry); the device itself is picked by source_match
+  backend: auto                 # auto | sounddevice | parec | fake | none
+  source_match: NT-USB Mini     # substring of the Pulse source name/description (pactl list sources)
+  sample_rate: 48000            # the NT-USB Mini is 48 kHz mono only
+  bins: 64                      # int8 min/max envelope points per frame
+  stale_s: 0.5                  # no frame for this long -> stalled
+# Hardware reachability probe (phase-11): TCP connect-and-close on <arm ip>:port
+# every period_s (never writes; paused while a hardware session runs) ->
+# ArmStatusInfo.reachable and WorkcellStatus.hardware_ready.
+hardware_probe:
+  enabled: true
+  period_s: 2.0
+  timeout_s: 1.0
+  port: 502                     # xArm control port; 30001-30003 report streams are never probed
 tracker:
   # Vive-tracker teleop (13-tracker §4). backend: none | fake | libsurvive.
   # `fake` = scripted 0.15 m circle at 100 Hz so the UI/pipeline can be

@@ -72,6 +72,43 @@ class VideoConfig(BaseModel):
     jpeg_quality: int = 80
 
 
+class MicrophoneConfig(BaseModel):
+    """Runtime-owned microphone preview (phase-11; 04-runtime §13.3/§14).
+
+    The RØDE NT-USB Mini on the Perception Arm (arm id ``view``) is captured
+    THROUGH PulseAudio (never ``hw:``: Pulse owns the card, a direct open fails
+    with EBUSY and stalls every other Pulse client). ``backend`` ``auto`` tries
+    ``sounddevice`` (PortAudio's ALSA ``pulse`` plugin, source pinned via
+    ``PULSE_SOURCE``), then a ``parec`` subprocess; ``fake`` synthesizes an
+    amplitude-modulated sine for tests; ``none`` disables capture while the
+    microphone stays listed. Frame rate = ``RuntimeConfig.telemetry_hz`` so
+    every telemetry tick carries exactly one new frame (25 Hz -> 1920 samples
+    = 64 bins x 30 samples).
+    """
+
+    enabled: bool = False  # list + capture the microphone (Hardware tab)
+    mic_id: str = "mic_view"
+    label: str = "Perception Arm microphone"  # user-facing; the id stays mic_view
+    backend: Literal["auto", "sounddevice", "parec", "fake", "none"] = "auto"
+    source_match: str = "NT-USB Mini"  # substring of the Pulse source name/description
+    sample_rate: int = Field(default=48000, gt=0)
+    bins: int = Field(default=64, ge=1, le=1024)  # envelope bins per frame (int8 min/max)
+    stale_s: float = Field(default=0.5, gt=0.0)  # no frame for this long -> "stalled"
+
+
+class HardwareProbeConfig(BaseModel):
+    """Reachability probe for the configured hardware arms (phase-11): a
+    background thread does a TCP connect-and-close on ``ip:port`` (xArm control
+    port 502; never writes a byte) every ``period_s`` and publishes
+    ``ArmStatusInfo.reachable`` / ``WorkcellStatus.hardware_ready``. Paused
+    while a hardware session runs."""
+
+    enabled: bool = True
+    period_s: float = Field(default=2.0, gt=0.0)
+    timeout_s: float = Field(default=1.0, gt=0.0)
+    port: int = Field(default=502, ge=1, le=65535)
+
+
 class ExtrinsicsTolerance(BaseModel):
     pos_m: float
     rot_rad: float
@@ -281,6 +318,8 @@ class RuntimeConfig(BaseModel):
     recorder: RecorderConfig = RecorderConfig()
     dagger: DaggerConfig = DaggerConfig()
     tracker: TrackerConfig = TrackerConfig()
+    microphone: MicrophoneConfig = MicrophoneConfig()  # phase-11 (04-runtime §14)
+    hardware_probe: HardwareProbeConfig = HardwareProbeConfig()  # phase-11
     telemetry_hz: float = 25.0
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
@@ -344,6 +383,8 @@ __all__ = [
     "TrackerCalibrationConfig",
     "TrackerConfig",
     "VideoConfig",
+    "MicrophoneConfig",
+    "HardwareProbeConfig",
     "RuntimeConfig",
     "load_runtime_config",
 ]
