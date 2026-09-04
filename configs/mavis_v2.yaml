@@ -38,12 +38,11 @@ workcells:
     # Both wrist cameras are Intel RealSense D435i used as plain UVC colour
     # cameras (kind v4l2, no depth): addressed by USB serial (sysfs lookup)
     # because the /dev/v4l/by-id symlinks collide between the depth and colour
-    # interfaces, and the colour stream is YUYV only (fourcc). The serial -> arm
-    # mapping is PROVISIONAL (2026-09-04): swap the two serials if the Hardware
-    # tab shows the tiles crossed.
+    # interfaces, and the colour stream is YUYV only (fourcc). Serial -> arm
+    # mapping CONFIRMED by the user on 2026-09-04 from the Hardware-tab tiles.
     cameras:
-      - {id: grip_wrist, kind: v4l2, serial: "322143060792", fourcc: YUYV, resolution: [640, 480], fps: 30}
-      - {id: view_wrist, kind: v4l2, serial: "349643062582", fourcc: YUYV, resolution: [640, 480], fps: 30}
+      - {id: grip_wrist, kind: v4l2, serial: "349643062582", fourcc: YUYV, resolution: [640, 480], fps: 30}
+      - {id: view_wrist, kind: v4l2, serial: "322143060792", fourcc: YUYV, resolution: [640, 480], fps: 30}
     safety:
       enabled: true               # hardware refuses to start without the safety gate
 profiles_dir: ~/apollo/profiles
