@@ -6,15 +6,15 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import CameraFrame, CollisionReport, GripperState, Pose, se3
-from apollo_xarm7_core.state import ArmState
+from apollo_mavis_v2_core import CameraFrame, CollisionReport, GripperState, Pose, se3
+from apollo_mavis_v2_core.state import ArmState
 
-from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.control.snapshot import StateSnapshot
-from apollo_xarm7_runtime.recorder.features import ArmMeta
-from apollo_xarm7_runtime.recorder.frames import RecordingFrameConverter
-from apollo_xarm7_runtime.recorder.sidecars import SidecarWriter
-from apollo_xarm7_runtime.recorder.thread import RecorderThread
+from apollo_mavis_v2_runtime.bus import RuntimeBus
+from apollo_mavis_v2_runtime.control.snapshot import StateSnapshot
+from apollo_mavis_v2_runtime.recorder.features import ArmMeta
+from apollo_mavis_v2_runtime.recorder.frames import RecordingFrameConverter
+from apollo_mavis_v2_runtime.recorder.sidecars import SidecarWriter
+from apollo_mavis_v2_runtime.recorder.thread import RecorderThread
 
 
 class FakeRecorder:

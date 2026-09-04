@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import numpy as np
-from apollo_xarm7_core import Pose, se3
+from apollo_mavis_v2_core import Pose, se3
 
-from apollo_xarm7_runtime.config import TeleopRates
-from apollo_xarm7_runtime.control.teleop import (
+from apollo_mavis_v2_runtime.config import TeleopRates
+from apollo_mavis_v2_runtime.control.teleop import (
     TargetIntegrator,
     held_to_twist,
     twist_to_control_frame,

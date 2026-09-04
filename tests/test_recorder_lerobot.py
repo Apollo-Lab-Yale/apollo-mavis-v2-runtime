@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from apollo_xarm7_runtime.config import RecorderConfig
-from apollo_xarm7_runtime.recorder.episode_recorder import (
+from apollo_mavis_v2_runtime.config import RecorderConfig
+from apollo_mavis_v2_runtime.recorder.episode_recorder import (
     DEFAULT_PROBE_SIZE,
     STATE_FILENAME,
     LeRobotEpisodeRecorder,
@@ -24,7 +24,7 @@ from apollo_xarm7_runtime.recorder.episode_recorder import (
     resolve_vcodec_for_dataset,
     stored_video_codec,
 )
-from apollo_xarm7_runtime.recorder.features import ArmMeta, build_features
+from apollo_mavis_v2_runtime.recorder.features import ArmMeta, build_features
 
 REPO_ID = "apollo/xarm7_test_1arm_dee-base"
 FRAMES = {"arm0": "arm_base:arm0"}

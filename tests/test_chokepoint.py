@@ -5,9 +5,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import apollo_xarm7_runtime
+import apollo_mavis_v2_runtime
 
-SRC = Path(apollo_xarm7_runtime.__file__).parent
+SRC = Path(apollo_mavis_v2_runtime.__file__).parent
 COMMANDS = {"command_joints", "command_rail", "command_gripper"}
 
 # The chokepoint dispatch path only: the ControlLoop resolves + gates every

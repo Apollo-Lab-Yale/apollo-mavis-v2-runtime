@@ -1,6 +1,6 @@
 """Runtime CI wires phase-03's guardrail regression (11-safety §5.1).
 
-``python -m apollo_xarm7_sim.tools.guardrail_check --all`` must exit 0. The
+``python -m apollo_mavis_v2_sim.tools.guardrail_check --all`` must exit 0. The
 runtime SafetyGate is behaviorally consistent with that reference gate; this
 test pins the dependency so a gate regression fails runtime CI too.
 """
@@ -12,13 +12,13 @@ import sys
 
 import pytest
 
-pytest.importorskip("apollo_xarm7_sim")
+pytest.importorskip("apollo_mavis_v2_sim")
 
 
 @pytest.mark.egl
 def test_guardrail_check_all_passes():
     proc = subprocess.run(
-        [sys.executable, "-m", "apollo_xarm7_sim.tools.guardrail_check", "--all"],
+        [sys.executable, "-m", "apollo_mavis_v2_sim.tools.guardrail_check", "--all"],
         capture_output=True,
         text=True,
         timeout=300,

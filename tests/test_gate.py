@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import CollisionEvent, CollisionReport, SafetyConfig
+from apollo_mavis_v2_core import CollisionEvent, CollisionReport, SafetyConfig
 
-from apollo_xarm7_runtime.safety.gate import NullGate, SafetyGate
+from apollo_mavis_v2_runtime.safety.gate import NullGate, SafetyGate
 
 PAIR = ("arm0_link5", "table")
 

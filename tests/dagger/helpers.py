@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from apollo_xarm7_core.dagger import CheckpointInfo
+from apollo_mavis_v2_core.dagger import CheckpointInfo
 
 STATE_DIM = 16  # 1 arm + rail: 7 joints + grip + rail + ee pos3 + quat4
 ACTION_DIM = 8  # [dx dy dz drx dry drz grip rail.dpos]
@@ -25,7 +25,7 @@ def free_port() -> int:
 def make_net(seed: int = 0, state_dim: int = STATE_DIM, action_dim: int = ACTION_DIM):
     import torch
 
-    from apollo_xarm7_runtime.dagger.policies import MLPNet
+    from apollo_mavis_v2_runtime.dagger.policies import MLPNet
 
     torch.manual_seed(seed)
     return MLPNet(state_dim, action_dim, hidden=32)
@@ -45,8 +45,8 @@ def write_checkpoint(
     advance_latest: bool = True,
 ) -> CheckpointInfo:
     """A valid bundle + manifest; returns the CheckpointInfo written."""
-    from apollo_xarm7_runtime.dagger.policies import save_policy_bundle
-    from apollo_xarm7_runtime.dagger.trainer.checkpoints import (
+    from apollo_mavis_v2_runtime.dagger.policies import save_policy_bundle
+    from apollo_mavis_v2_runtime.dagger.trainer.checkpoints import (
         STATE_DICT,
         CheckpointStore,
         sha256_file,
@@ -127,7 +127,7 @@ def make_spool(
 
 
 def make_summary(index: int, n_frames: int, n_human: int):
-    from apollo_xarm7_core.dagger import EpisodeSummary
+    from apollo_mavis_v2_core.dagger import EpisodeSummary
 
     return EpisodeSummary(
         episode_index=index, n_frames=n_frames,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
-from apollo_xarm7_core import Command, HeldState, PlanResult
+from apollo_mavis_v2_core import Command, HeldState, PlanResult
 from conftest import run_ticks
 
 
@@ -140,14 +140,14 @@ class _Sender:
 def test_gripper_keys_and_targets_skip_gripperless_arm():
     """arm0 is camera-only (no gripper): F/H, execute_plan gripper targets
     and the snapshot never touch it; the same inputs drive arm1 normally."""
-    from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+    from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 
-    from apollo_xarm7_runtime.bus import RuntimeBus
-    from apollo_xarm7_runtime.config import ControlConfig
-    from apollo_xarm7_runtime.control.loop import ControlLoop
-    from apollo_xarm7_runtime.safety.gate import NullGate
-    from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
-    from apollo_xarm7_runtime.safety.watchdog import InputWatchdog
+    from apollo_mavis_v2_runtime.bus import RuntimeBus
+    from apollo_mavis_v2_runtime.config import ControlConfig
+    from apollo_mavis_v2_runtime.control.loop import ControlLoop
+    from apollo_mavis_v2_runtime.safety.gate import NullGate
+    from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
+    from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 
     cell = FakeWorkcell({"arm0": FakeArm("arm0"), "arm1": FakeArm("arm1")})
     cell.start()

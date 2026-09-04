@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import se3
+from apollo_mavis_v2_core import se3
 
-from apollo_xarm7_runtime.recorder.kinematics import RecorderKinematics
+from apollo_mavis_v2_runtime.recorder.kinematics import RecorderKinematics
 
 
 @pytest.fixture(scope="module")
 def scene():
-    from apollo_xarm7_sim import REGISTRY
+    from apollo_mavis_v2_sim import REGISTRY
 
     return REGISTRY.build("single_rail")
 
@@ -33,7 +33,7 @@ def test_base_world_translates_with_rail_only(kin):
 
 
 def test_tcp_base_composes_to_world_site(kin, scene):
-    from apollo_xarm7_runtime.control.fk import SceneKinematics
+    from apollo_mavis_v2_runtime.control.fk import SceneKinematics
 
     world = SceneKinematics(scene).tcp_world("arm0", Q)
     composed = se3.pose_mul(kin.base_world("arm0", Q), kin.tcp_base("arm0", Q))
@@ -67,14 +67,14 @@ def test_camera_world_is_opencv_convention(kin, scene):
 def test_collect_session_rejects_moving_camera_frame(tmp_path):
     """camera:<wrist> as a recording frame -> SessionError before any lerobot
     import (10-frames §5.1: T_W_C must be static over the session)."""
-    from apollo_xarm7_core import ProfileStore
-    from apollo_xarm7_core.protocol import SessionSpec
+    from apollo_mavis_v2_core import ProfileStore
+    from apollo_mavis_v2_core.protocol import SessionSpec
     from conftest import make_runtime_config
 
-    from apollo_xarm7_runtime.bus import RuntimeBus
-    from apollo_xarm7_runtime.errors import SessionError
-    from apollo_xarm7_runtime.session.manager import SessionManager
-    from apollo_xarm7_runtime.streams.hub import VideoHub
+    from apollo_mavis_v2_runtime.bus import RuntimeBus
+    from apollo_mavis_v2_runtime.errors import SessionError
+    from apollo_mavis_v2_runtime.session.manager import SessionManager
+    from apollo_mavis_v2_runtime.streams.hub import VideoHub
 
     cfg = make_runtime_config(tmp_path)
     bus = RuntimeBus()

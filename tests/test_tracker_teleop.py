@@ -9,24 +9,24 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import Command, HeldState, Pose, se3
-from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+from apollo_mavis_v2_core import Command, HeldState, Pose, se3
+from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 from pydantic import ValidationError
 
-from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.config import ControlConfig, TargetRateConfig
-from apollo_xarm7_runtime.control.loop import ControlLoop
-from apollo_xarm7_runtime.control.tracker_teleop import (
+from apollo_mavis_v2_runtime.bus import RuntimeBus
+from apollo_mavis_v2_runtime.config import ControlConfig, TargetRateConfig
+from apollo_mavis_v2_runtime.control.loop import ControlLoop
+from apollo_mavis_v2_runtime.control.tracker_teleop import (
     TRACKER_CLUTCH_CODE,
     TrackerTeleop,
     align_pose,
     interp_pose,
     yaw_quat,
 )
-from apollo_xarm7_runtime.devices.tracker import TrackerSample, TrackerSettings
-from apollo_xarm7_runtime.safety.gate import NullGate
-from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
-from apollo_xarm7_runtime.safety.watchdog import InputWatchdog
+from apollo_mavis_v2_runtime.devices.tracker import TrackerSample, TrackerSettings
+from apollo_mavis_v2_runtime.safety.gate import NullGate
+from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
+from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 
 IDENT = np.array([1.0, 0.0, 0.0, 0.0])
 CLUTCH = TRACKER_CLUTCH_CODE  # "KeyC"

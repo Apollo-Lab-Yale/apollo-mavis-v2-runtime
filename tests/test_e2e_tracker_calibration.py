@@ -14,13 +14,13 @@ import time
 import httpx
 import numpy as np
 import pytest
-from apollo_xarm7_core.protocol import TrackerCalibrationCommand
+from apollo_mavis_v2_core.protocol import TrackerCalibrationCommand
 from conftest import LiveServer, make_runtime_config
 from websockets.sync.client import connect as ws_connect
 
-from apollo_xarm7_runtime.config import TrackerConfig
-from apollo_xarm7_runtime.control.tracker_teleop import yaw_quat
-from apollo_xarm7_runtime.runtime import Runtime
+from apollo_mavis_v2_runtime.config import TrackerConfig
+from apollo_mavis_v2_runtime.control.tracker_teleop import yaw_quat
+from apollo_mavis_v2_runtime.runtime import Runtime
 
 SPEC = {
     "mode": "teleop",
@@ -82,7 +82,7 @@ def _post(api, kind, op, point=None):
 def _gesture_raw() -> np.ndarray:
     """The lab gesture (left=+X, forward=-Y, 25 cm legs) as libsurvive sees it:
     ``p_world = Rz(YAW_TRUE) p_raw``."""
-    from apollo_xarm7_core import se3
+    from apollo_mavis_v2_core import se3
 
     leg = 0.25
     world = [np.array([0.3, 0.1, 0.2])]
@@ -96,7 +96,7 @@ def _move_to(reader, frm, to, *, step_m=0.04, dwell=20):
     """Publish a sample path from ``frm`` to ``to`` (steps below max_jump_m so no
     sample is flagged as a jump), then ``dwell`` still samples at ``to`` (20 ms
     apart: longer than the 0.3 s capture averaging window)."""
-    from apollo_xarm7_core import Pose
+    from apollo_mavis_v2_core import Pose
 
     n = max(1, int(np.ceil(np.linalg.norm(to - frm) / step_m)))
     for i in range(1, n + 1):

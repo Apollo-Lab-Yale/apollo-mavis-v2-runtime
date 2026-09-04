@@ -16,7 +16,7 @@ import time
 import numpy as np
 import pytest
 
-pytest.importorskip("apollo_xarm7_sim")
+pytest.importorskip("apollo_mavis_v2_sim")
 
 
 @pytest.mark.egl
@@ -25,10 +25,10 @@ def test_control_tick_budget_and_rate():
     import tempfile
     from pathlib import Path
 
-    from apollo_xarm7_core.protocol import SessionSpec
+    from apollo_mavis_v2_core.protocol import SessionSpec
 
-    from apollo_xarm7_runtime.config import RuntimeConfig, VideoConfig
-    from apollo_xarm7_runtime.runtime import Runtime
+    from apollo_mavis_v2_runtime.config import RuntimeConfig, VideoConfig
+    from apollo_mavis_v2_runtime.runtime import Runtime
 
     wc = {
         "kind": "sim",
@@ -42,7 +42,7 @@ def test_control_tick_budget_and_rate():
         profiles_dir=Path(tempfile.mkdtemp()),
         video=VideoConfig(preview_fps=15, session_fps=30),
     )
-    from apollo_xarm7_core import HeldState
+    from apollo_mavis_v2_core import HeldState
 
     rt = Runtime(cfg)
     rt.start()

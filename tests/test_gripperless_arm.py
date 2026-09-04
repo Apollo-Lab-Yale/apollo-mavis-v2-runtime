@@ -8,11 +8,11 @@ import logging
 import time
 
 import pytest
-from apollo_xarm7_core.protocol import SessionSpec
+from apollo_mavis_v2_core.protocol import SessionSpec
 from conftest import make_runtime_config
 
-from apollo_xarm7_runtime.runtime import Runtime
-from apollo_xarm7_runtime.session.types import SessionState
+from apollo_mavis_v2_runtime.runtime import Runtime
+from apollo_mavis_v2_runtime.session.types import SessionState
 
 SPEC = SessionSpec(
     mode="teleop", kind="sim", arms=["view", "grip"],

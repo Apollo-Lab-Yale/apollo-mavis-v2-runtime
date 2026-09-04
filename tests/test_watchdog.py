@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from apollo_xarm7_core import HeldState
+from apollo_mavis_v2_core import HeldState
 
-from apollo_xarm7_runtime.safety.watchdog import InputWatchdog, WatchdogState
+from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog, WatchdogState
 
 
 def keys(seq: int, t: float, held: list[str] | None = None) -> HeldState:

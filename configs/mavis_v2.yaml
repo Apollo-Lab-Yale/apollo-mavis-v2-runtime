@@ -1,5 +1,5 @@
-# MAVIS v2 lab cell in simulation (scene apollo-xarm7-sim scenes/mavis_v2.yaml).
-# Run: uv run python -m apollo_xarm7_runtime --config configs/mavis_v2.yaml
+# MAVIS v2 lab cell in simulation (scene apollo-mavis-v2-sim scenes/mavis_v2.yaml).
+# Run: uv run python -m apollo_mavis_v2_runtime --config configs/mavis_v2.yaml
 host: 127.0.0.1
 port: 8765
 ui_dist: null              # path to built SPA; null = API-only (Vite dev proxy)

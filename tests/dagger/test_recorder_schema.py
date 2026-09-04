@@ -7,21 +7,21 @@ import json
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
-from apollo_xarm7_core import CollisionReport
+from apollo_mavis_v2_core import CollisionReport
 from helpers import ACTION_DIM
 from test_recorder_thread import FakeCam, FakeKin, FakeRecorder, make_state
 
-from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.control.snapshot import StateSnapshot
-from apollo_xarm7_runtime.dagger.gate import TakeoverGateImpl
-from apollo_xarm7_runtime.dagger.recorder import (
+from apollo_mavis_v2_runtime.bus import RuntimeBus
+from apollo_mavis_v2_runtime.control.snapshot import StateSnapshot
+from apollo_mavis_v2_runtime.dagger.gate import TakeoverGateImpl
+from apollo_mavis_v2_runtime.dagger.recorder import (
     CONTROL_MODE_LABELS,
     DaggerRecorderThread,
     dagger_features,
 )
-from apollo_xarm7_runtime.recorder.features import ArmMeta, build_features
-from apollo_xarm7_runtime.recorder.frames import RecordingFrameConverter
-from apollo_xarm7_runtime.recorder.sidecars import SidecarWriter
+from apollo_mavis_v2_runtime.recorder.features import ArmMeta, build_features
+from apollo_mavis_v2_runtime.recorder.frames import RecordingFrameConverter
+from apollo_mavis_v2_runtime.recorder.sidecars import SidecarWriter
 
 Q0 = np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.0, 0.10])
 

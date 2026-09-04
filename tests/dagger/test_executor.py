@@ -7,21 +7,21 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import Command, Pose
-from apollo_xarm7_core.dagger import ControlMode, TrainerStatus
-from apollo_xarm7_core.interfaces.policy import Observation, PolicySpec
-from apollo_xarm7_core.protocol import EpisodeStatus
-from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+from apollo_mavis_v2_core import Command, Pose
+from apollo_mavis_v2_core.dagger import ControlMode, TrainerStatus
+from apollo_mavis_v2_core.interfaces.policy import Observation, PolicySpec
+from apollo_mavis_v2_core.protocol import EpisodeStatus
+from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 
-from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.config import ControlConfig
-from apollo_xarm7_runtime.dagger.gate import TakeoverGateImpl
-from apollo_xarm7_runtime.dagger.loop import GatedPolicyExecutor
-from apollo_xarm7_runtime.dagger.policies import ScriptedPolicy
-from apollo_xarm7_runtime.dagger.policy_runner import ActionAnchor, PolicyRunner, SlewLimits
-from apollo_xarm7_runtime.safety.gate import NullGate
-from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
-from apollo_xarm7_runtime.safety.watchdog import InputWatchdog
+from apollo_mavis_v2_runtime.bus import RuntimeBus
+from apollo_mavis_v2_runtime.config import ControlConfig
+from apollo_mavis_v2_runtime.dagger.gate import TakeoverGateImpl
+from apollo_mavis_v2_runtime.dagger.loop import GatedPolicyExecutor
+from apollo_mavis_v2_runtime.dagger.policies import ScriptedPolicy
+from apollo_mavis_v2_runtime.dagger.policy_runner import ActionAnchor, PolicyRunner, SlewLimits
+from apollo_mavis_v2_runtime.safety.gate import NullGate
+from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
+from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 
 ARMS_META = [("arm0", True), ("arm1", False)]
 DIM = 8 + 7

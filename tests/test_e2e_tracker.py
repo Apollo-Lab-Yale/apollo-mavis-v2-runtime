@@ -17,8 +17,8 @@ import pytest
 from conftest import LiveServer, make_runtime_config
 from websockets.sync.client import connect as ws_connect
 
-from apollo_xarm7_runtime.config import TrackerConfig
-from apollo_xarm7_runtime.devices.tracker import ControllerState
+from apollo_mavis_v2_runtime.config import TrackerConfig
+from apollo_mavis_v2_runtime.devices.tracker import ControllerState
 
 SPEC = {
     "mode": "teleop",

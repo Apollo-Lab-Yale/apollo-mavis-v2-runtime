@@ -21,17 +21,17 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import LatestSlot, Pose
-from apollo_xarm7_core.protocol import KEYMAP
+from apollo_mavis_v2_core import LatestSlot, Pose
+from apollo_mavis_v2_core.protocol import KEYMAP
 
-import apollo_xarm7_runtime.devices.tracker as tracker_mod
-from apollo_xarm7_runtime.config import (
+import apollo_mavis_v2_runtime.devices.tracker as tracker_mod
+from apollo_mavis_v2_runtime.config import (
     CONTROLLER_DISCRETE_ACTIONS,
     CONTROLLER_HELD_ACTIONS,
     ControllerMapConfig,
     TrackerConfig,
 )
-from apollo_xarm7_runtime.devices.tracker import (
+from apollo_mavis_v2_runtime.devices.tracker import (
     AXIS_TRACKPAD_X,
     AXIS_TRACKPAD_Y,
     AXIS_TRIGGER,
@@ -256,7 +256,8 @@ def test_controller_map_action_tables_agree_across_config_and_reader():
     assert set(ControllerMapConfig.model_fields) == set(CONTROLLER_HELD_ACTIONS) | set(
         CONTROLLER_DISCRETE_ACTIONS
     )
-    assert not hasattr(__import__("apollo_xarm7_runtime.config", fromlist=["x"]), "TRACKPAD_INPUTS")
+    cfg_mod = __import__("apollo_mavis_v2_runtime.config", fromlist=["x"])
+    assert not hasattr(cfg_mod, "TRACKPAD_INPUTS")
 
 
 # -- controller_map config ----------------------------------------------------------------------
@@ -504,7 +505,7 @@ def test_on_button_event_reads_pysurvive_like_struct():
 
 
 def test_edge_republish_never_refreshes_pose_age_rate_or_status(caplog):
-    caplog.set_level(logging.DEBUG, logger="apollo_xarm7_runtime.devices.tracker")
+    caplog.set_level(logging.DEBUG, logger="apollo_mavis_v2_runtime.devices.tracker")
     reader, slot, clock = _reader()  # stale_s 0.2, max_jump_m 0.1
     reader._publish(Pose(np.array([0.1, 0.0, 0.0]), IDENT), np.zeros(3), np.zeros(3), 0.0)
     st0 = reader.status()
@@ -723,7 +724,7 @@ def test_libsurvive_event_loop_routes_pose_and_button_events_by_object():
 
 
 def test_libsurvive_loop_survives_bad_events(caplog):
-    caplog.set_level(logging.WARNING, logger="apollo_xarm7_runtime.devices.tracker")
+    caplog.set_level(logging.WARNING, logger="apollo_mavis_v2_runtime.devices.tracker")
     wm0 = _obj("WM0")
     broken = SimpleNamespace(kind=StubPS.SurviveSimpleObject_OBJECT)  # no .name -> raises
     ps = StubPS([
@@ -807,7 +808,7 @@ def test_rate_hz_decays_to_zero_when_samples_stop():
 
 
 def test_libsurvive_warnings_are_rate_limited_per_message_class(caplog):
-    caplog.set_level(logging.DEBUG, logger="apollo_xarm7_runtime.devices.tracker")
+    caplog.set_level(logging.DEBUG, logger="apollo_mavis_v2_runtime.devices.tracker")
     reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
     for i in range(10):
         reader._on_survive_log(None, 1, f"Dropped {i} packets from WM0".encode())
@@ -872,7 +873,7 @@ def test_libsurvive_loop_snapshots_lighthouse_objects_by_ps_constants():
 
 
 def test_info_lines_are_kept_ansi_free_and_handed_to_on_info(caplog):
-    caplog.set_level(logging.DEBUG, logger="apollo_xarm7_runtime.devices.tracker")
+    caplog.set_level(logging.DEBUG, logger="apollo_mavis_v2_runtime.devices.tracker")
     reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
     seen = []
     reader.on_info = lambda t, text: seen.append((t, text))
@@ -992,7 +993,7 @@ def test_restart_swaps_libsurvive_args_after_a_clean_close(monkeypatch):
         deadline = time.monotonic() + 3.0
         while stub.inits < 1 and time.monotonic() < deadline:
             time.sleep(0.005)
-        assert stub.argvs == [["apollo-xarm7-runtime", "--lighthousecount", "3"]]
+        assert stub.argvs == [["apollo-mavis-v2-runtime", "--lighthousecount", "3"]]
         assert reader.status().status == "searching"
         reader.restart(["--lighthousecount", "3", "--configfile", "/tmp/bs.json",
                         "--force-calibrate", "1", "--globalscenesolver", "1"])
@@ -1001,7 +1002,7 @@ def test_restart_swaps_libsurvive_args_after_a_clean_close(monkeypatch):
             time.sleep(0.005)
         assert stub.closes == 1 and stub.inits == 2  # closed BEFORE the new init (dongle owner)
         assert stub.argvs[1] == [
-            "apollo-xarm7-runtime", "--lighthousecount", "3", "--configfile", "/tmp/bs.json",
+            "apollo-mavis-v2-runtime", "--lighthousecount", "3", "--configfile", "/tmp/bs.json",
             "--force-calibrate", "1", "--globalscenesolver", "1",
         ]
         assert cfg.libsurvive_args == ["--lighthousecount", "3"]  # shared config untouched

@@ -11,14 +11,14 @@ import time
 from pathlib import Path
 
 import numpy as np
-from apollo_xarm7_core.dagger import ControlMode
+from apollo_mavis_v2_core.dagger import ControlMode
 from helpers import FRAME, free_port, make_net, make_spool, make_summary
 
-from apollo_xarm7_runtime.dagger.client import AsyncTrainerClientImpl, TrainerConfig
-from apollo_xarm7_runtime.dagger.policies import MLPPolicy, save_policy_bundle
-from apollo_xarm7_runtime.dagger.reloader import PolicyReloaderImpl
-from apollo_xarm7_runtime.dagger.trainer.checkpoints import sha256_file
-from apollo_xarm7_runtime.dagger.trainer.trainer import clip_burst_steps
+from apollo_mavis_v2_runtime.dagger.client import AsyncTrainerClientImpl, TrainerConfig
+from apollo_mavis_v2_runtime.dagger.policies import MLPPolicy, save_policy_bundle
+from apollo_mavis_v2_runtime.dagger.reloader import PolicyReloaderImpl
+from apollo_mavis_v2_runtime.dagger.trainer.checkpoints import sha256_file
+from apollo_mavis_v2_runtime.dagger.trainer.trainer import clip_burst_steps
 
 
 def make_client(tmp_path, run_id="runT", lr=1e-3, push_period_s=1.0):

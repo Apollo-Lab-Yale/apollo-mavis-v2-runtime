@@ -8,14 +8,14 @@ os.environ.setdefault("MUJOCO_GL", "egl")  # noqa: E402 - must precede mujoco GL
 
 import numpy as np
 import pytest
-from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 
-from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.config import ControlConfig, RuntimeConfig, TrackerConfig, VideoConfig
-from apollo_xarm7_runtime.control.loop import ControlLoop
-from apollo_xarm7_runtime.safety.gate import NullGate
-from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
-from apollo_xarm7_runtime.safety.watchdog import InputWatchdog
+from apollo_mavis_v2_runtime.bus import RuntimeBus
+from apollo_mavis_v2_runtime.config import ControlConfig, RuntimeConfig, TrackerConfig, VideoConfig
+from apollo_mavis_v2_runtime.control.loop import ControlLoop
+from apollo_mavis_v2_runtime.safety.gate import NullGate
+from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
+from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 
 SIM_WORKCELL_YAML = {
     "kind": "sim",
@@ -45,7 +45,7 @@ def make_runtime_config(
 @pytest.fixture
 def fake_loop(tmp_path):
     """ControlLoop over FakeWorkcell with a NullGate; deterministic ticks."""
-    from apollo_xarm7_core import ProfileStore
+    from apollo_mavis_v2_core import ProfileStore
 
     cell = FakeWorkcell(
         {"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")}
@@ -88,8 +88,8 @@ class LiveServer:
 
         import uvicorn
 
-        from apollo_xarm7_runtime.runtime import Runtime
-        from apollo_xarm7_runtime.server.app import create_app
+        from apollo_mavis_v2_runtime.runtime import Runtime
+        from apollo_mavis_v2_runtime.server.app import create_app
 
         self.runtime = Runtime(cfg)
         self._server = uvicorn.Server(

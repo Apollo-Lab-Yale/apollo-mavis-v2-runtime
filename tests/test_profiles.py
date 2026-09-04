@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
-from apollo_xarm7_core import Command, ProfileStore
-from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+from apollo_mavis_v2_core import Command, ProfileStore
+from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 from conftest import run_ticks
 
-from apollo_xarm7_runtime.profiles.store import (
+from apollo_mavis_v2_runtime.profiles.store import (
     INITIAL_PROFILE_NAME,
     save_from_states,
     save_initial_overwrite,

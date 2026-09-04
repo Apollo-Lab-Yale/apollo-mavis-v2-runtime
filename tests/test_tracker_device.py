@@ -13,11 +13,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import LatestSlot, Pose
+from apollo_mavis_v2_core import LatestSlot, Pose
 
-import apollo_xarm7_runtime
-from apollo_xarm7_runtime.config import TrackerConfig
-from apollo_xarm7_runtime.devices.tracker import (
+import apollo_mavis_v2_runtime
+from apollo_mavis_v2_runtime.config import TrackerConfig
+from apollo_mavis_v2_runtime.devices.tracker import (
     FAKE_CENTER,
     FAKE_PERIOD_S,
     FAKE_RADIUS_M,
@@ -25,7 +25,7 @@ from apollo_xarm7_runtime.devices.tracker import (
     TrackerSettings,
 )
 
-SRC = Path(apollo_xarm7_runtime.__file__).parent
+SRC = Path(apollo_mavis_v2_runtime.__file__).parent
 
 
 def _wait(pred, timeout_s: float = 3.0) -> bool:

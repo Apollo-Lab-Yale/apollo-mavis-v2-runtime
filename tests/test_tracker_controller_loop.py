@@ -20,12 +20,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import Pose, se3
+from apollo_mavis_v2_core import Pose, se3
 from test_tracker_teleop import CLUTCH, DT, IDENT, Rig
 
-from apollo_xarm7_runtime.config import ControllerMapConfig, TrackerConfig
-from apollo_xarm7_runtime.control.loop import HeldSources
-from apollo_xarm7_runtime.devices.tracker import (
+from apollo_mavis_v2_runtime.config import ControllerMapConfig, TrackerConfig
+from apollo_mavis_v2_runtime.control.loop import HeldSources
+from apollo_mavis_v2_runtime.devices.tracker import (
     GRIPPER_CLOSE_CODE,
     GRIPPER_OPEN_CODE,
     RAIL_NEG_CODE,
@@ -36,7 +36,7 @@ from apollo_xarm7_runtime.devices.tracker import (
     derive_held_codes,
     note_edges,
 )
-from apollo_xarm7_runtime.safety.watchdog import WatchdogState
+from apollo_mavis_v2_runtime.safety.watchdog import WatchdogState
 
 OPEN, CLOSE = GRIPPER_OPEN_CODE, GRIPPER_CLOSE_CODE  # KeyH / KeyF
 RAIL_NEG, RAIL_POS = RAIL_NEG_CODE, RAIL_POS_CODE  # ArrowLeft / ArrowRight

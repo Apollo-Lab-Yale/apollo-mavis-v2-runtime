@@ -6,7 +6,7 @@ import time
 
 import httpx
 import pytest
-from apollo_xarm7_core.protocol import HEADER_SIZE, unpack_header
+from apollo_mavis_v2_core.protocol import HEADER_SIZE, unpack_header
 from conftest import LiveServer, make_runtime_config
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect

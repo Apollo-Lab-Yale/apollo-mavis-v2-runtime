@@ -19,22 +19,22 @@ from collections import deque
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import LatestSlot, Pose, se3
-from apollo_xarm7_core.protocol import TrackerCalibrationCommand
+from apollo_mavis_v2_core import LatestSlot, Pose, se3
+from apollo_mavis_v2_core.protocol import TrackerCalibrationCommand
 
-from apollo_xarm7_runtime.config import (
+from apollo_mavis_v2_runtime.config import (
     RuntimeConfig,
     TrackerCalibrationConfig,
     TrackerConfig,
 )
-from apollo_xarm7_runtime.control.tracker_teleop import yaw_quat
-from apollo_xarm7_runtime.devices.tracker import (
+from apollo_mavis_v2_runtime.control.tracker_teleop import yaw_quat
+from apollo_mavis_v2_runtime.devices.tracker import (
     ControllerState,
     LighthouseSnapshot,
     TrackerSample,
     TrackerSettings,
 )
-from apollo_xarm7_runtime.devices.tracker_calibration import (
+from apollo_mavis_v2_runtime.devices.tracker_calibration import (
     YAW_POINT_ORDER,
     CalibrationError,
     PersistedCalibration,
@@ -544,7 +544,7 @@ def test_base_station_abort_restores_normal_args_and_keeps_tmp(tmp_path):
 
 
 def test_base_station_validation_without_tracking_times_out(tmp_path, monkeypatch):
-    import apollo_xarm7_runtime.devices.tracker_calibration as mod
+    import apollo_mavis_v2_runtime.devices.tracker_calibration as mod
 
     monkeypatch.setattr(mod, "VALIDATION_TRACKING_TIMEOUT_S", 0.5)
     h = Harness(tmp_path)
@@ -744,9 +744,9 @@ def test_session_active_covers_bringup_so_calibration_cannot_slip_in(tmp_path, m
     lock before validation/bringup and cleared even when bringup fails."""
     from conftest import make_runtime_config
 
-    from apollo_xarm7_runtime.runtime import Runtime
-    from apollo_xarm7_runtime.session.manager import SessionError
-    from apollo_xarm7_runtime.session.types import SessionSpec
+    from apollo_mavis_v2_runtime.runtime import Runtime
+    from apollo_mavis_v2_runtime.session.manager import SessionError
+    from apollo_mavis_v2_runtime.session.types import SessionSpec
 
     cfg = make_runtime_config(tmp_path, scene="mavis_v2", tracker=TrackerConfig(backend="none"))
     rt = Runtime(cfg)

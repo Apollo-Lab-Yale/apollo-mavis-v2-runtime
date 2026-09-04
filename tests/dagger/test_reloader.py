@@ -5,12 +5,12 @@ from __future__ import annotations
 import dataclasses
 
 import torch
-from apollo_xarm7_core.dagger import ControlMode
+from apollo_mavis_v2_core.dagger import ControlMode
 from helpers import FRAME, make_net, write_checkpoint
 
-from apollo_xarm7_runtime.dagger.policies import MLPPolicy
-from apollo_xarm7_runtime.dagger.reloader import PolicyReloaderImpl
-from apollo_xarm7_runtime.dagger.trainer.checkpoints import CheckpointStore
+from apollo_mavis_v2_runtime.dagger.policies import MLPPolicy
+from apollo_mavis_v2_runtime.dagger.reloader import PolicyReloaderImpl
+from apollo_mavis_v2_runtime.dagger.trainer.checkpoints import CheckpointStore
 
 
 def make_rig(tmp_path, on_rollback=None):

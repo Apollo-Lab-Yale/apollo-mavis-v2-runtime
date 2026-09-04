@@ -18,29 +18,29 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import CommandSource, LatestSlot, Pose, se3
-from apollo_xarm7_core.interfaces.policy import Observation, PolicySpec
-from apollo_xarm7_core.testing import FakeArm, FakeWorkcell
+from apollo_mavis_v2_core import CommandSource, LatestSlot, Pose, se3
+from apollo_mavis_v2_core.interfaces.policy import Observation, PolicySpec
+from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 from test_tracker_teleop import CLUTCH, DT, IDENT, PoseIK, PoseKin, Rig
 
-from apollo_xarm7_runtime.bus import RuntimeBus
-from apollo_xarm7_runtime.config import ControlConfig, TargetRateConfig
-from apollo_xarm7_runtime.control.loop import DEVICE_ACTION_LINGER_S
-from apollo_xarm7_runtime.control.pose_filter import PoseFilterConfig
-from apollo_xarm7_runtime.control.tracker_teleop import TrackerTeleop, align_pose
-from apollo_xarm7_runtime.dagger.gate import TakeoverGateImpl
-from apollo_xarm7_runtime.dagger.loop import GatedPolicyExecutor
-from apollo_xarm7_runtime.dagger.policies import ScriptedPolicy
-from apollo_xarm7_runtime.dagger.policy_runner import ActionAnchor, PolicyRunner, SlewLimits
-from apollo_xarm7_runtime.devices.tracker import (
+from apollo_mavis_v2_runtime.bus import RuntimeBus
+from apollo_mavis_v2_runtime.config import ControlConfig, TargetRateConfig
+from apollo_mavis_v2_runtime.control.loop import DEVICE_ACTION_LINGER_S
+from apollo_mavis_v2_runtime.control.pose_filter import PoseFilterConfig
+from apollo_mavis_v2_runtime.control.tracker_teleop import TrackerTeleop, align_pose
+from apollo_mavis_v2_runtime.dagger.gate import TakeoverGateImpl
+from apollo_mavis_v2_runtime.dagger.loop import GatedPolicyExecutor
+from apollo_mavis_v2_runtime.dagger.policies import ScriptedPolicy
+from apollo_mavis_v2_runtime.dagger.policy_runner import ActionAnchor, PolicyRunner, SlewLimits
+from apollo_mavis_v2_runtime.devices.tracker import (
     GRIPPER_OPEN_CODE,
     ControllerState,
     TrackerSettings,
     note_edges,
 )
-from apollo_xarm7_runtime.safety.gate import NullGate
-from apollo_xarm7_runtime.safety.supervisor import SafetySupervisor
-from apollo_xarm7_runtime.safety.watchdog import InputWatchdog
+from apollo_mavis_v2_runtime.safety.gate import NullGate
+from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
+from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 
 
 def _pad_state(x: float, y: float, prev: ControllerState | None = None, click: bool = True):
@@ -176,7 +176,7 @@ class DaggerRig:
         self.click_actions: tuple = ()
 
     def sample(self, pos, age=0.0):
-        from apollo_xarm7_runtime.devices.tracker import TrackerSample
+        from apollo_mavis_v2_runtime.devices.tracker import TrackerSample
 
         self.sample_seq += 1
         self.bus.tracker.put(TrackerSample(
@@ -205,7 +205,7 @@ class DaggerRig:
             self.cell.step(DT)
 
     def act(self, op, args=None):
-        from apollo_xarm7_core import Command
+        from apollo_mavis_v2_core import Command
 
         fut = self.bus.commands.submit(Command(op=op, args=args or {}, source="ws"))
         self.tick()
@@ -540,7 +540,7 @@ def test_entry_point_configures_logging_only_when_unconfigured(monkeypatch):
     import logging
     import sys
 
-    from apollo_xarm7_runtime.__main__ import LOG_FORMAT, configure_logging
+    from apollo_mavis_v2_runtime.__main__ import LOG_FORMAT, configure_logging
 
     root = logging.getLogger()
     monkeypatch.setattr(root, "handlers", [])  # pretend nothing configured logging yet

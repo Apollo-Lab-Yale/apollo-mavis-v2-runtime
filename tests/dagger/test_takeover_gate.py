@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from apollo_xarm7_core.dagger import ControlMode
+from apollo_mavis_v2_core.dagger import ControlMode
 
-from apollo_xarm7_runtime.dagger.gate import TakeoverGateImpl
+from apollo_mavis_v2_runtime.dagger.gate import TakeoverGateImpl
 
 ARMS = ["arm0", "arm1"]
 

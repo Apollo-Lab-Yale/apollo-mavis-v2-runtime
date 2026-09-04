@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from apollo_xarm7_core import CommandSource
+from apollo_mavis_v2_core import CommandSource
 
-from apollo_xarm7_runtime.recorder.features import (
+from apollo_mavis_v2_runtime.recorder.features import (
     ACTION_SOURCE_LABELS,
     ArmMeta,
     arm_action_names,

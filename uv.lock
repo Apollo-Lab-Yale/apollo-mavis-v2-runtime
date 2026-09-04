@@ -175,9 +175,9 @@ wheels = [
 ]
 
 [[package]]
-name = "apollo-xarm7-core"
+name = "apollo-mavis-v2-core"
 version = "0.1.0"
-source = { editable = "../apollo-xarm7-core" }
+source = { editable = "../apollo-mavis-v2-core" }
 dependencies = [
     { name = "numpy" },
     { name = "pydantic" },
@@ -201,11 +201,11 @@ dev = [
 ]
 
 [[package]]
-name = "apollo-xarm7-hardware"
+name = "apollo-mavis-v2-hardware"
 version = "0.1.0"
-source = { editable = "../apollo-xarm7-hardware" }
+source = { editable = "../apollo-mavis-v2-hardware" }
 dependencies = [
-    { name = "apollo-xarm7-core" },
+    { name = "apollo-mavis-v2-core" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pydantic" },
@@ -214,7 +214,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apollo-xarm7-core", editable = "../apollo-xarm7-core" },
+    { name = "apollo-mavis-v2-core", editable = "../apollo-mavis-v2-core" },
     { name = "numpy", specifier = ">=1.24,<3" },
     { name = "opencv-python", specifier = ">=4.8" },
     { name = "pydantic", specifier = ">=2.5,<3" },
@@ -233,11 +233,11 @@ dev = [
 ]
 
 [[package]]
-name = "apollo-xarm7-runtime"
+name = "apollo-mavis-v2-runtime"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "apollo-xarm7-core" },
+    { name = "apollo-mavis-v2-core" },
     { name = "fastapi" },
     { name = "lerobot", extra = ["dataset"] },
     { name = "numpy" },
@@ -251,10 +251,10 @@ dependencies = [
 
 [package.optional-dependencies]
 hardware = [
-    { name = "apollo-xarm7-hardware" },
+    { name = "apollo-mavis-v2-hardware" },
 ]
 sim = [
-    { name = "apollo-xarm7-sim" },
+    { name = "apollo-mavis-v2-sim" },
 ]
 
 [package.dev-dependencies]
@@ -268,9 +268,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apollo-xarm7-core", editable = "../apollo-xarm7-core" },
-    { name = "apollo-xarm7-hardware", marker = "extra == 'hardware'", editable = "../apollo-xarm7-hardware" },
-    { name = "apollo-xarm7-sim", marker = "extra == 'sim'", editable = "../apollo-xarm7-sim" },
+    { name = "apollo-mavis-v2-core", editable = "../apollo-mavis-v2-core" },
+    { name = "apollo-mavis-v2-hardware", marker = "extra == 'hardware'", editable = "../apollo-mavis-v2-hardware" },
+    { name = "apollo-mavis-v2-sim", marker = "extra == 'sim'", editable = "../apollo-mavis-v2-sim" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "lerobot", extras = ["dataset"], specifier = ">=0.6.1,<0.7" },
     { name = "numpy", specifier = ">=1.24,<3" },
@@ -293,11 +293,11 @@ dev = [
 ]
 
 [[package]]
-name = "apollo-xarm7-sim"
+name = "apollo-mavis-v2-sim"
 version = "0.1.0"
-source = { editable = "../apollo-xarm7-sim" }
+source = { editable = "../apollo-mavis-v2-sim" }
 dependencies = [
-    { name = "apollo-xarm7-core" },
+    { name = "apollo-mavis-v2-core" },
     { name = "mink" },
     { name = "mujoco" },
     { name = "numpy" },
@@ -307,7 +307,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apollo-xarm7-core", editable = "../apollo-xarm7-core" },
+    { name = "apollo-mavis-v2-core", editable = "../apollo-mavis-v2-core" },
     { name = "mink", specifier = "==1.3.0" },
     { name = "mujoco", specifier = "==3.12.0" },
     { name = "numpy", specifier = ">=1.24,<3" },

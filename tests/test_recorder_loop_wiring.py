@@ -3,8 +3,8 @@ flows to the snapshot, joint_target is nacked while recording (04-runtime §10).
 
 from __future__ import annotations
 
-from apollo_xarm7_core import Command
-from apollo_xarm7_core.protocol import EpisodeStatus
+from apollo_mavis_v2_core import Command
+from apollo_mavis_v2_core.protocol import EpisodeStatus
 from conftest import run_ticks
 
 

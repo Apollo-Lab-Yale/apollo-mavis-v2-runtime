@@ -7,8 +7,8 @@ from conftest import make_runtime_config
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from apollo_xarm7_runtime.runtime import Runtime
-from apollo_xarm7_runtime.server.app import create_app
+from apollo_mavis_v2_runtime.runtime import Runtime
+from apollo_mavis_v2_runtime.server.app import create_app
 
 SPEC = {
     "mode": "teleop",
@@ -42,7 +42,7 @@ def test_health_and_epoch(client):
 
 
 def test_keymap_matches_core(client):
-    from apollo_xarm7_core.protocol import KEYMAP
+    from apollo_mavis_v2_core.protocol import KEYMAP
 
     served = client.get("/api/keymap").json()
     assert served == [e.model_dump() for e in KEYMAP]

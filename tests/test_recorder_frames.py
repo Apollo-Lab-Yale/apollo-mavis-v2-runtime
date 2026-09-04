@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from apollo_xarm7_core import Pose, se3
+from apollo_mavis_v2_core import Pose, se3
 
-from apollo_xarm7_runtime.recorder.frames import (
+from apollo_mavis_v2_runtime.recorder.frames import (
     RecordingFrameConverter,
     delta_from_frame,
     delta_to_frame,

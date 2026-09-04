@@ -1,5 +1,5 @@
 # Example sim-only runtime config (04-runtime §14).
-# Run: uv run python -m apollo_xarm7_runtime --config configs/sim.yaml
+# Run: uv run python -m apollo_mavis_v2_runtime --config configs/sim.yaml
 host: 127.0.0.1
 port: 8765
 ui_dist: null              # path to built SPA; null = API-only (Vite dev proxy)

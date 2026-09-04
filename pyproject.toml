@@ -1,12 +1,12 @@
 [project]
-name = "apollo-xarm7-runtime"
+name = "apollo-mavis-v2-runtime"
 version = "0.1.0"
-description = "Session engine, control loop, and server for the apollo-xarm7 stack"
+description = "Session engine, control loop, and server for the apollo-mavis-v2 stack"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "BSD-3-Clause" }
 dependencies = [
-    "apollo-xarm7-core",
+    "apollo-mavis-v2-core",
     "numpy>=1.24,<3",
     "pydantic>=2.5,<3",
     "PyYAML>=6.0",
@@ -22,8 +22,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-sim = ["apollo-xarm7-sim"]
-hardware = ["apollo-xarm7-hardware"]
+sim = ["apollo-mavis-v2-sim"]
+hardware = ["apollo-mavis-v2-hardware"]
 trainer = []
 
 [dependency-groups]
@@ -36,16 +36,16 @@ dev = [
 ]
 
 [tool.uv.sources]
-apollo-xarm7-core = { path = "../apollo-xarm7-core", editable = true }
-apollo-xarm7-sim = { path = "../apollo-xarm7-sim", editable = true }
-apollo-xarm7-hardware = { path = "../apollo-xarm7-hardware", editable = true }
+apollo-mavis-v2-core = { path = "../apollo-mavis-v2-core", editable = true }
+apollo-mavis-v2-sim = { path = "../apollo-mavis-v2-sim", editable = true }
+apollo-mavis-v2-hardware = { path = "../apollo-mavis-v2-hardware", editable = true }
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/apollo_xarm7_runtime"]
+packages = ["src/apollo_mavis_v2_runtime"]
 
 [tool.ruff]
 line-length = 100
@@ -55,22 +55,22 @@ target-version = "py310"
 select = ["E", "F", "I", "UP", "B", "TID251"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-"xarm".msg = "runtime talks to hardware only via apollo_xarm7_hardware"
-"torch".msg = "torch is sanctioned only inside apollo_xarm7_runtime.dagger (policy + trainer)"
-"lerobot".msg = "lerobot is imported lazily inside apollo_xarm7_runtime.recorder only"
-"pysurvive".msg = "pysurvive is imported lazily inside apollo_xarm7_runtime.devices.tracker only"
+"xarm".msg = "runtime talks to hardware only via apollo_mavis_v2_hardware"
+"torch".msg = "torch is sanctioned only inside apollo_mavis_v2_runtime.dagger (policy + trainer)"
+"lerobot".msg = "lerobot is imported lazily inside apollo_mavis_v2_runtime.recorder only"
+"pysurvive".msg = "pysurvive is imported lazily inside apollo_mavis_v2_runtime.devices.tracker only"
 
 [tool.ruff.lint.per-file-ignores]
 # The recorder package and its tests are the one sanctioned lerobot import site.
-"src/apollo_xarm7_runtime/recorder/*" = ["TID251"]
+"src/apollo_mavis_v2_runtime/recorder/*" = ["TID251"]
 "tests/test_recorder*.py" = ["TID251"]
 "tests/test_e2e_collect.py" = ["TID251"]
 # The tracker device module is the one sanctioned (lazy) pysurvive import site.
-"src/apollo_xarm7_runtime/devices/tracker.py" = ["TID251"]
+"src/apollo_mavis_v2_runtime/devices/tracker.py" = ["TID251"]
 # The dagger package owns the live Policy object (12-dagger §1) and the
 # trainer process; torch (and spool parquet reads) are sanctioned here.
-"src/apollo_xarm7_runtime/dagger/*" = ["TID251"]
-"src/apollo_xarm7_runtime/dagger/trainer/*" = ["TID251"]
+"src/apollo_mavis_v2_runtime/dagger/*" = ["TID251"]
+"src/apollo_mavis_v2_runtime/dagger/trainer/*" = ["TID251"]
 "tests/dagger/*" = ["TID251"]
 
 [tool.pytest.ini_options]
