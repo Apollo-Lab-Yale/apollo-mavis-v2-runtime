@@ -10,6 +10,8 @@ from apollo_xarm7_core.protocol import (
     SceneInfo,
     SessionInfo,
     SessionSpec,
+    TrackerCalibrationCommand,
+    TrackerCalibrationStatus,
     WorkcellStatus,
 )
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -17,6 +19,7 @@ from pydantic import BaseModel
 
 import apollo_xarm7_runtime
 
+from ..devices.tracker_calibration import CalibrationError
 from ..errors import SessionError, SessionNotFoundError
 
 router = APIRouter()
@@ -136,16 +139,45 @@ def get_session(request: Request) -> SessionInfo:
 
 @router.post("/session")
 def post_session(request: Request, spec: SessionSpec) -> SessionInfo:
+    rt = _runtime(request)
+    if rt.tracker_calibration.active:  # reader restarts / trigger clicks must not hit a session
+        raise HTTPException(409, "tracker calibration in progress")
     try:
-        return _runtime(request).manager.create(spec)
+        info = rt.manager.create(spec)
     except SessionError as e:
         raise HTTPException(409, str(e)) from None
+    # The calibration's own guard reads manager.session_active, which create() raises
+    # under its lock; a calibration that started between the check above and that
+    # moment passed both guards, so re-check and give way to it (13-tracker §4).
+    if rt.tracker_calibration.active:
+        rt.manager.teardown()
+        raise HTTPException(409, "tracker calibration in progress")
+    return info
 
 
 @router.delete("/session", status_code=204)
 def delete_session(request: Request) -> Response:
     _runtime(request).manager.teardown()  # idempotent
     return Response(status_code=204)
+
+
+# -- tracker calibration (13-tracker §4; phase-10) ---------------------------------------
+# Session-less device management rides REST (binding supplement to 04-runtime §13.1:
+# /ws/control nacks actions without a session and AckMsg carries no payload);
+# progress is broadcast on telemetry as ``tracker.calibration``.
+@router.get("/tracker/calibration")
+def get_tracker_calibration(request: Request) -> TrackerCalibrationStatus:
+    return _runtime(request).tracker_calibration.status()
+
+
+@router.post("/tracker/calibration")
+def post_tracker_calibration(
+    request: Request, cmd: TrackerCalibrationCommand
+) -> TrackerCalibrationStatus:
+    try:
+        return _runtime(request).tracker_calibration.command(cmd)
+    except CalibrationError as e:  # illegal transition / precondition
+        raise HTTPException(409, str(e)) from None
 
 
 __all__ = ["router"]

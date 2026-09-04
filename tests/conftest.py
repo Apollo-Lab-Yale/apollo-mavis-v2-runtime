@@ -36,6 +36,7 @@ def make_runtime_config(
         profiles_dir=tmp_path / "profiles",
         datasets_root=tmp_path / "datasets",
         checkpoints_root=tmp_path / "ckpts",
+        calibration_dir=tmp_path / "calibration",  # never read ~/apollo/calibration in tests
         video=VideoConfig(preview_fps=15, session_fps=30),
         tracker=tracker or TrackerConfig(),
     )

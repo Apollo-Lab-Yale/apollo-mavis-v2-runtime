@@ -140,6 +140,8 @@ class ControlLoop:
         self._grip_frac: dict[str, float] = {}
         self._states: dict[str, ArmState] = {}
         self._teleop_seeded: set[str] = set()
+        # Arm of the current clutch session (clutch PRESS-edge tracking).
+        self._clutch_arm: str | None = None
         self._arm_source: dict[str, CommandSource] = {}  # per-arm last resolving source
         self._edge_seq_seen: int | None = None  # controller.edge_seq adopted last tick
         self._device_action: tuple[str, float] | None = None  # (label, show until)
@@ -235,6 +237,8 @@ class ControlLoop:
         held = self.sources.held  # held_eff = held ∪ device_codes (13-tracker §1.1)
         if self.tracker is not None:
             self.tracker.clutch = TRACKER_CLUTCH_CODE in held
+            if TRACKER_CLUTCH_CODE not in held:
+                self._clutch_arm = None  # clutch up -> next press is a rising edge
 
         states = self.workcell.states()  # 3 (driver caches; never blocks)
         self._states = states
@@ -381,7 +385,13 @@ class ControlLoop:
         existing seed, because the base slides under the frozen world-frame
         target (13-tracker §4 re-seed rule (d)): the next translate or clutch
         tick re-seeds from the measured TCP instead of stepping up to a leash
-        toward the stale target.
+        toward the stale target. A rail input held TOGETHER with translate
+        keys or a live clutch slides the whole arm too: the integrator target
+        and the tracker anchors ride along by the base displacement of this
+        tick's rail step (``_ride_rail``) and the IK is seeded with the new
+        rail value, so the joints keep tracking the hand instead of folding to
+        hold the target in place (2026-09-03; ``control.rail_in_ik`` false =
+        the IK never moves the rail on its own either).
         """
         if self.ik is None or self.kin is None:
             return None
@@ -394,9 +404,45 @@ class ControlLoop:
         if scale <= 0.0 and clutch_scale <= 0.0 and not rail_moving:
             return None  # every live source is latched/stale: hold (anchors clear in end_tick)
         measured_tcp = self.kin.tcp_world(arm_id, state.q)
+        rail_new: float | None = None  # this tick's rail slot when a rail code moves it
+        d_rail = np.zeros(3)  # base (= TCP at held posture) displacement of that step
+        if rail_moving:
+            rail_new = min(max(float(q_last[7]) + rail_v * self.dt, 0.0), RAIL_TRAVEL_M)
+            q_rail = np.array(q_last, dtype=np.float64)
+            q_rail[7] = rail_new
+            d_rail = self.kin.tcp_world(arm_id, q_rail).position - self.kin.tcp_world(
+                arm_id, q_last
+            ).position
+
+        def with_rail(q: np.ndarray) -> np.ndarray:
+            q = np.array(q, dtype=np.float64)
+            if rail_new is not None:
+                q[7] = rail_new
+            return q
+
         if self.tracker is not None and TRACKER_CLUTCH_CODE in held:
             if clutch_scale > 0.0:
+                if self._clutch_arm != arm_id:
+                    # True clutch PRESS edge (clutch was up last tick; not a brief
+                    # stale-sample gap, which keeps the session — 13-tracker §4
+                    # "zero delta on engage"): re-anchor to where the arm ACTUALLY
+                    # is. The commanded state (_last_cmd / integrator target / IK
+                    # warm state) tracks the *commanded* pose; if the arm drifted,
+                    # faulted+recovered or was nudged while the clutch was up, that
+                    # pose is stale and the engage tick would command a leash-sized
+                    # step toward it (the "first-clutch flail"). Snap all three to
+                    # measured so A_ee == measured TCP and the first clutched tick
+                    # is a no-op. q_last MUST move too, else _solve_target re-seeds
+                    # IK from the stale commanded q (ik.solve reseed_threshold) and
+                    # undoes this.
+                    self._clutch_arm = arm_id
+                    q_last = np.array(state.q, dtype=np.float64)
+                    self._last_cmd[arm_id] = q_last
+                    self._teleop_seeded.discard(arm_id)
+                    if self.ik is not None:
+                        self.ik.reset(arm_id, state.q)
                 self._seed_teleop(arm_id, measured_tcp)
+                self._ride_rail(arm_id, d_rail)
                 target = self._tracker_target(arm_id, measured_tcp, clutch_scale, now)
             else:
                 target = None  # clutch held only by a latched source: hold
@@ -408,6 +454,7 @@ class ControlLoop:
             w = tw.w * scale
             if np.any(v) or np.any(w):
                 self._seed_teleop(arm_id, measured_tcp)
+                self._ride_rail(arm_id, d_rail)
                 from apollo_xarm7_core import Twist
 
                 tw_world = twist_to_control_frame(
@@ -426,14 +473,27 @@ class ControlLoop:
             # leash-sized step toward the stale target).
             self._teleop_seeded.discard(arm_id)
         else:
-            q = self._solve_target(arm_id, target, q_last, measured_tcp)
+            # IK seeded with this tick's rail value: a locked-rail solver adopts
+            # it and solves the joints at the new base position.
+            q = self._solve_target(arm_id, target, with_rail(q_last), measured_tcp)
             if q is None:
                 return None
-        if has_rail:
-            # Rail keys integrate the rail slot directly (ignored w/o rail).
-            base = q_last[7] if rail_v else q[7]
-            q[7] = min(max(base + rail_v * self.dt, 0.0), RAIL_TRAVEL_M)
+        if rail_new is not None:
+            q[7] = rail_new  # rail codes own the rail slot (ignored w/o rail)
         return q
+
+    def _ride_rail(self, arm_id: str, d_rail: np.ndarray) -> None:
+        """A rail step under a driven tick: slide the world-frame integrator
+        target and the tracker anchors by the base displacement so the TCP
+        rides the rail while the joints keep tracking the hand / keys
+        (04-runtime §6 "Rail"). No-op without a rail step."""
+        if not np.any(d_rail):
+            return
+        prev = self.integrator.get(arm_id)
+        if prev is not None:
+            self.integrator.reanchor(arm_id, Pose(prev.position + d_rail, prev.orientation))
+        if self.tracker is not None:
+            self.tracker.translate_anchor(d_rail)
 
     def _rail_rate(self, sources: HeldSources) -> float:
         """Rail rate (m/s) from the held rail codes, per source at that source's

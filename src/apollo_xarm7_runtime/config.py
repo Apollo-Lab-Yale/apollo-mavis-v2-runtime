@@ -59,6 +59,11 @@ class ControlConfig(BaseModel):
     watchdog: WatchdogConfig = WatchdogConfig()
     residual_max_pos_m: float = 0.01  # IK residual: freeze target back (glide)
     residual_max_rot_rad: float = 0.1
+    # Rail in the differential IK? False (default, 2026-09-03): the IK never moves
+    # the rail to reach a target; only rail inputs (arrow keys / controller
+    # trackpad) do, and they slide the WHOLE arm (the world-frame target and the
+    # tracker anchors ride along). True: the rail is an (expensive) IK dof.
+    rail_in_ik: bool = False
 
 
 class VideoConfig(BaseModel):
@@ -206,6 +211,26 @@ class TrackerFilterConfig(BaseModel):
     deadband_rad: float = Field(default=0.005, ge=0.0)  # rest deadband, orientation
 
 
+class TrackerCalibrationConfig(BaseModel):
+    """Tracker calibration wizard tuning (13-tracker §4 "Calibration modes";
+    phase-10). Base-station validation acceptance comes from the 2026-09-03
+    measurements (multi-spot calibration: std <= 0.1 mm, max step 0.1 mm;
+    single-spot: std ~60 mm, steps up to 248 mm): **std < 5 mm and max step
+    < 20 mm**. The yaw gesture checks reject legs shorter than
+    ``yaw_min_leg_m`` and fits worse than ``yaw_max_residual_deg``."""
+
+    min_scenes: int = 6  # GSS scenes (max over stations) before validation is allowed
+    validation_seconds: float = 10.0  # stationary sample window measured
+    validation_skip_seconds: float = 3.0  # convergence window dropped first
+    validation_std_mm: float = 5.0  # per-axis position std threshold
+    validation_step_mm: float = 20.0  # adjacent-sample max step threshold
+    still_window_s: float = 0.5  # controller_still: sample window
+    still_threshold_mm: float = 3.0  # controller_still: position std below this
+    yaw_min_leg_m: float = 0.10  # each horizontal gesture leg at least this long
+    yaw_max_residual_deg: float = 15.0  # mean leg misalignment after the fit
+    yaw_capture_average_s: float = 0.3  # a click averages the raw positions of this window
+
+
 class TrackerConfig(BaseModel):
     """Vive-tracker teleop device + defaults (13-tracker §4).
 
@@ -213,12 +238,16 @@ class TrackerConfig(BaseModel):
     defaults; the ``tracker_settings`` action mutates the live values.
     ``controller_map`` / ``trackpad_deadzone`` bind the paired controller's
     buttons to device-held key codes (clutch, gripper, rail) and to the
-    discrete arm-switch actions (13-tracker §1.1).
+    discrete arm-switch actions (13-tracker §1.1). ``libsurvive_config_path``
+    is the file libsurvive reads/writes its lighthouse calibration from; the
+    base-station wizard (``calibration``) never points libsurvive at it
+    directly — it works on a temporary copy and replaces it only on install.
     """
 
     backend: Literal["none", "fake", "libsurvive"] = "none"
     object_name: str = "WM0"  # libsurvive codename of the dongle-paired tracker
     libsurvive_args: list[str] = Field(default_factory=lambda: ["--lighthousecount", "2"])
+    libsurvive_config_path: Path = Path("~/.config/libsurvive/config.json")
     yaw_deg: float = 0.0  # lighthouse world -> MJCF world (both z-up; yaw only)
     pos_scale: float = Field(default=1.0, ge=0.1, le=3.0)
     follow_rotation: bool = True
@@ -227,6 +256,12 @@ class TrackerConfig(BaseModel):
     controller_map: ControllerMapConfig = ControllerMapConfig()
     trackpad_deadzone: float = Field(default=0.3, ge=0.0, le=1.0)  # |x|,|y| <= dz: click ignored
     filter: TrackerFilterConfig = TrackerFilterConfig()
+    calibration: TrackerCalibrationConfig = TrackerCalibrationConfig()
+
+    def model_post_init(self, __context) -> None:
+        object.__setattr__(
+            self, "libsurvive_config_path", Path(self.libsurvive_config_path).expanduser()
+        )
 
 
 class RuntimeConfig(BaseModel):
@@ -239,6 +274,9 @@ class RuntimeConfig(BaseModel):
     profiles_dir: Path = Path("~/apollo/profiles")
     datasets_root: Path = Path("~/apollo/datasets")
     checkpoints_root: Path = Path("~/apollo/checkpoints")
+    # Tracker calibration artefacts (phase-10): tracker_calibration.json (persisted
+    # yaw / install state), temporary + installed libsurvive config copies.
+    calibration_dir: Path = Path("~/apollo/calibration")
     control: ControlConfig = ControlConfig()
     recorder: RecorderConfig = RecorderConfig()
     dagger: DaggerConfig = DaggerConfig()
@@ -248,7 +286,7 @@ class RuntimeConfig(BaseModel):
     egl_device_id: int = 0
 
     def model_post_init(self, __context) -> None:
-        for name in ("profiles_dir", "datasets_root", "checkpoints_root"):
+        for name in ("profiles_dir", "datasets_root", "checkpoints_root", "calibration_dir"):
             object.__setattr__(self, name, Path(getattr(self, name)).expanduser())
         if self.ui_dist is not None:
             object.__setattr__(self, "ui_dist", Path(self.ui_dist).expanduser())
@@ -303,6 +341,7 @@ __all__ = [
     "CONTROLLER_DISCRETE_ACTIONS",
     "ControllerMapConfig",
     "TrackerFilterConfig",
+    "TrackerCalibrationConfig",
     "TrackerConfig",
     "VideoConfig",
     "RuntimeConfig",

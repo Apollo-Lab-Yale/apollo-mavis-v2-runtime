@@ -244,6 +244,23 @@ class TrackerTeleop:
     def set_target(self, target: Pose | None) -> None:
         self._target = target
 
+    def translate_anchor(self, dpos: np.ndarray) -> None:
+        """Slide the EE anchor (and the derived still-hand target) by ``dpos``
+        (world): a rail input carried the base under the hand, so the TCP rides
+        along instead of the IK folding the arm to hold the world target
+        (04-runtime §6 "Rail"). The hand<->arm offset is unchanged. No-op while
+        not engaged."""
+        if self._a_ee is None:
+            return
+        d = np.asarray(dpos, dtype=np.float64)
+        if not np.any(d):
+            return
+        self._a_ee = Pose(self._a_ee.position + d, self._a_ee.orientation)
+        if self._intent is not None:
+            self._intent = Pose(self._intent.position + d, self._intent.orientation)
+        if self._target is not None:
+            self._target = Pose(self._target.position + d, self._target.orientation)
+
     # -- telemetry ----------------------------------------------------------------------
     def telemetry_extra(self) -> dict:
         """``session_extra["tracker"]`` payload (poses as core ``Pose``)."""

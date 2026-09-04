@@ -11,13 +11,14 @@ from apollo_xarm7_core import Command, CommandResult, HeldState, ProfileStore
 from .bus import RuntimeBus
 from .config import RuntimeConfig
 from .devices.tracker import TrackerReader, TrackerSettings
+from .devices.tracker_calibration import TrackerCalibration, apply_persisted_yaw
 from .session.manager import SessionManager
 from .streams.hub import VideoHub
 
 
 class Runtime:
     """Process-singleton: bus, video hub, profile store, tracker reader,
-    session manager."""
+    tracker calibration FSM, session manager."""
 
     def __init__(self, cfg: RuntimeConfig) -> None:
         self.cfg = cfg
@@ -26,7 +27,10 @@ class Runtime:
         self.hub = VideoHub(self.bus, jpeg_quality=cfg.video.jpeg_quality)
         self.profile_store = ProfileStore(cfg.profiles_dir)
         # Tracker device + live settings live for the whole process (13-tracker
-        # §4): telemetry shows the device before any session exists.
+        # §4): telemetry shows the device before any session exists. A persisted,
+        # still-valid yaw alignment (calibration_dir/tracker_calibration.json)
+        # overrides the YAML default before the settings are seeded (phase-10).
+        apply_persisted_yaw(cfg)
         self.tracker_settings = TrackerSettings.from_config(cfg.tracker)
         self.tracker = TrackerReader(cfg.tracker, self.bus.tracker)
         if cfg.tracker.backend != "none":
@@ -34,6 +38,12 @@ class Runtime:
         self.manager = SessionManager(
             cfg, self.bus, self.hub, self.profile_store, self.epoch,
             tracker_settings=self.tracker_settings,
+        )
+        # Calibration wizard back end (13-tracker §4 "Calibration modes"): Runtime-
+        # owned, session-less; REST /api/tracker/calibration + telemetry.
+        self.tracker_calibration = TrackerCalibration(
+            self.tracker, self.tracker_settings, cfg, self.bus.tracker,
+            lambda: self.manager.session_active,  # True during bringup too (rest.py re-checks)
         )
         self.controller_connected = False  # maintained by server/ws_control
 
@@ -56,6 +66,7 @@ class Runtime:
         self.manager.teardown()
         self.manager.stop_previews()
         self.hub.stop()
+        self.tracker_calibration.close()  # restores normal libsurvive args if mid-calibration
         self.tracker.stop()
 
     # -- control-WS plumbing (no motion work here; 04-runtime §13.2) -------------

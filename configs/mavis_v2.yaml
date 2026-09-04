@@ -19,6 +19,7 @@ workcells:
 profiles_dir: ~/apollo/profiles
 datasets_root: ~/apollo/datasets
 checkpoints_root: ~/apollo/checkpoints
+calibration_dir: ~/apollo/calibration   # tracker_calibration.json (applied yaw, base-station install) + libsurvive config copies (phase-10 wizard)
 control:
   rate_hz: 100
   teleop: {linear_mps: 0.12, angular_rps: 0.6, rail_mps: 0.10, gripper_frac_ps: 1.2}
@@ -39,8 +40,9 @@ tracker:
   # stations visible on first start (~10-20 s), then set `backend: libsurvive`.
   backend: fake
   object_name: WM0                            # dongle-paired tracker codename
-  libsurvive_args: ["--lighthousecount", "4"]
-  yaw_deg: 0.0                                # lighthouse -> MJCF world yaw (calibrate)
+  libsurvive_args: ["--lighthousecount", "4", "--globalscenesolver", "0", "--disable-calibrate", "1"]  # freeze the lighthouse calibration during teleop (2026-09-03: the online scene solver moved a station 32 cm mid-session)
+  libsurvive_config_path: ~/.config/libsurvive/config.json  # replaced ONLY by the base-station wizard's install step (backup .bak-<ts> next to it)
+  yaw_deg: 0.0                                # lighthouse -> MJCF world yaw; first-start default only: a yaw applied by the wizard (calibration_dir/tracker_calibration.json, yaw_valid) overrides it
   pos_scale: 1.0                              # tracker -> EE displacement gain (0.1-3)
   follow_rotation: true                       # apply tracker orientation deltas
   stale_s: 0.2                                # sample age above this -> hold
@@ -86,3 +88,19 @@ tracker:
     d_cutoff_hz: 1.0                          # cutoff of the velocity estimate
     deadband_m: 0.002                         # rest deadband, position (m)
     deadband_rad: 0.005                       # rest deadband, orientation (rad)
+  # Calibration wizard (Devices page; 13-tracker §4 "Calibration modes"). Base
+  # station: capture >= min_scenes GSS scenes (controller parked still >= 3 s per
+  # spot) on a temporary config copy, validate with the frozen solution and the
+  # moving-mode sensor window (2026-09-03 acceptance: std < 5 mm, max step < 20 mm),
+  # install. Yaw: 7-click gesture (start, left, forward, right, back, up, down).
+  calibration:
+    min_scenes: 6
+    validation_seconds: 10.0                  # still-controller window measured
+    validation_skip_seconds: 3.0              # convergence window dropped first
+    validation_std_mm: 5.0                    # per-axis position std threshold
+    validation_step_mm: 20.0                  # adjacent-sample max step threshold
+    still_window_s: 0.5                       # controller_still indicator window
+    still_threshold_mm: 3.0                   # ... position std below this = still
+    yaw_min_leg_m: 0.10                       # each horizontal gesture leg at least this long
+    yaw_max_residual_deg: 15.0                # mean leg misalignment after the fit
+    yaw_capture_average_s: 0.3                # a click averages the raw positions of this window

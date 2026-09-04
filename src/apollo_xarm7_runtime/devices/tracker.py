@@ -29,6 +29,14 @@ one tick both fire). A controller edge re-publishes the last pose so the loop
 sees it within a tick, but never refreshes the pose's age: a pose older than
 ``stale_s`` is re-published invalid and status / age / rate follow the real
 pose stream only.
+
+Calibration hooks (13-tracker §4 "Calibration modes"; used by
+``devices.tracker_calibration``): :meth:`TrackerReader.restart` swaps the
+libsurvive arguments (a per-reader ``TrackerConfig`` copy, never the shared
+one) after a clean ``simple_close``; libsurvive INFO lines are kept ANSI-free
+in ``info_lines`` (and handed to an optional ``on_info`` callback); and the
+reader thread refreshes a :class:`LighthouseSnapshot` list every
+``LIBSURVIVE_LIGHTHOUSE_POLL_S`` from libsurvive's LIGHTHOUSE objects.
 """
 
 from __future__ import annotations
@@ -68,6 +76,12 @@ LIBSURVIVE_RESTART_BACKOFF_S = (0.5, 5.0)  # (first, max) delay before restartin
 LIBSURVIVE_RESTART_RESET_S = 30.0  # a run longer than this resets the backoff
 RATE_WINDOW_S = 1.0  # rate_hz is measured over this window; decays to 0 when samples stop
 LOG_RATE_LIMIT_S = 1.0  # forwarded libsurvive warnings: <= 1 line/s per message class
+CHARGE_POLL_S = 2.0  # re-read simple_object_charging at most this often (cheap device read)
+LIBSURVIVE_LIGHTHOUSE_POLL_S = 0.5  # refresh the lighthouse snapshot (name/serial/pose) this often
+INFO_LINES_MAX = 256  # libsurvive INFO lines kept for the calibration FSM (ANSI stripped)
+STOP_JOIN_TIMEOUT_S = 5.0  # stop(): wait this long for the backend thread (simple_close)
+RESTART_JOIN_TIMEOUT_S = 20.0  # restart(): a slow simple_close (USB stall) gets this long
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")  # libsurvive colours its log text
 QUAT_NORM_TOL = 1e-2  # |‖q‖ - 1| above this -> bad event
 EDGE_HISTORY = 8  # press edges remembered on ControllerState.edges (lossless up to 8 per tick)
 
@@ -434,6 +448,21 @@ class TrackerSettings:
 
 
 @dataclass(frozen=True)
+class LighthouseSnapshot:
+    """One libsurvive LIGHTHOUSE object as last enumerated by the reader thread
+    (13-tracker §4 "Calibration modes"). ``pose`` is the lighthouse-world pose
+    (m, wxyz) or ``None`` while unsolved (libsurvive reports an all-zero
+    quaternion then); ``serial`` is ``simple_serial_number`` (``None`` when the
+    build does not expose it or OOTX has not decoded yet)."""
+
+    index: int  # trailing number of the object name ("LH2" -> 2), else enumeration order
+    name: str
+    serial: str | None
+    pose: Pose | None
+    t_mono: float  # time.monotonic() of the enumeration
+
+
+@dataclass(frozen=True)
 class TrackerDeviceStatus:
     """Device-side telemetry fields (available without a session)."""
 
@@ -449,6 +478,7 @@ class TrackerDeviceStatus:
     device_held: frozenset[str] = frozenset()  # newest sample's codes; empty when stale
     bad_events: int = 0  # libsurvive events dropped by the per-event guard
     restarts: int = 0  # libsurvive loop auto-restarts so far
+    charging: bool | None = None  # controller on external (USB) power; None = not reported
 
 
 class TrackerReader:
@@ -496,12 +526,23 @@ class TrackerReader:
         self._rx_times: deque[float] = deque(maxlen=64)  # real poses only (rate feed)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # start()/stop()/restart() are serialised: a restart must never interleave
+        # with another start (two libsurvive contexts = LIBUSB_ERROR_BUSY).
+        self._lifecycle = threading.RLock()
         self._last_error_log = ""  # newest libsurvive error/warn line
         self._log_cb = None  # keep the ctypes callback alive for the ctx lifetime
         self._log_last: dict[str, float] = {}  # message class -> last forwarded time
         self._log_suppressed: dict[str, int] = {}
         self.bad_events = 0  # dropped libsurvive events (guard)
         self.restarts = 0  # libsurvive loop auto-restarts
+        self._charging: bool | None = None  # controller USB-power flag (simple_object_charging)
+        self._charging_next = 0.0  # next monotonic time to re-poll charging
+        # Calibration hooks: libsurvive INFO lines (ANSI stripped) newest last, the
+        # optional per-line callback (runs on libsurvive's C thread; exceptions are
+        # swallowed) and the lighthouse snapshot refreshed by the reader thread.
+        self.info_lines: deque[tuple[float, str]] = deque(maxlen=INFO_LINES_MAX)
+        self.on_info: Callable[[float, str], None] | None = None
+        self._lighthouses: list[LighthouseSnapshot] = []
 
     @property
     def backend(self) -> str:
@@ -509,15 +550,20 @@ class TrackerReader:
 
     # -- lifecycle -----------------------------------------------------------------
     def start(self) -> None:
-        if self.cfg.backend == "none" or self._thread is not None:
-            return
-        self._stop.clear()
-        self._set_status("starting", "")
-        target = self._run_fake if self.cfg.backend == "fake" else self._run_libsurvive
-        self._thread = threading.Thread(
-            target=self._thread_main, args=(target,), name="tracker-reader", daemon=True
-        )
-        self._thread.start()
+        """Spawn the backend thread; a no-op for backend ``none`` and while a
+        thread is still alive (including one whose ``simple_close`` is pending
+        after a timed-out :meth:`stop` — it keeps its handle so no second
+        libsurvive context is ever opened)."""
+        with self._lifecycle:
+            if self.cfg.backend == "none" or self._thread is not None:
+                return
+            self._stop.clear()
+            self._set_status("starting", "")
+            target = self._run_fake if self.cfg.backend == "fake" else self._run_libsurvive
+            self._thread = threading.Thread(
+                target=self._thread_main, args=(target,), name="tracker-reader", daemon=True
+            )
+            self._thread.start()
 
     def _thread_main(self, target: Callable[[], None]) -> None:
         try:
@@ -526,14 +572,71 @@ class TrackerReader:
             logger.exception("tracker reader thread crashed")
             self._set_status("error", self._error_detail("tracker reader crashed"))
         finally:
-            self._thread = None  # start() may spawn a fresh thread
+            # Only the thread that owns the handle clears it: a lingering thread
+            # must never orphan a newer one (start() may spawn a fresh thread).
+            if self._thread is threading.current_thread():
+                self._thread = None
 
-    def stop(self) -> None:
-        self._stop.set()
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=5.0)
+    def stop(self, timeout: float = STOP_JOIN_TIMEOUT_S) -> bool:
+        """Signal the backend thread and join it for up to ``timeout`` s.
+
+        Returns True once the thread is gone — for libsurvive that means
+        ``simple_close`` ran and the dongle is free. On a timeout the handle is
+        KEPT (False): the thread is still inside the old libsurvive context, so
+        a later :meth:`start`/:meth:`restart` stays a no-op / refuses instead of
+        opening a second context (LIBUSB_ERROR_BUSY, 13-tracker §6); the
+        thread clears the handle itself when it finally exits."""
+        with self._lifecycle:
+            self._stop.set()
+            thread = self._thread
+            if thread is None:
+                return True
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning(
+                    "tracker reader thread did not stop within %.1f s (libsurvive close pending)",
+                    timeout,
+                )
+                return False
             self._thread = None
+            return True
+
+    def restart(
+        self, libsurvive_args: list[str], *, timeout: float = RESTART_JOIN_TIMEOUT_S
+    ) -> None:
+        """Stop the backend thread (joined: ``simple_close`` must release the
+        dongle before the next ``simple_init``, else LIBUSB_ERROR_BUSY), swap
+        the libsurvive arguments on a per-reader COPY of the config (the
+        ``TrackerConfig`` handed in is shared with the Runtime / SessionManager
+        and is never mutated) and start again. ``status()`` goes through
+        ``starting`` / ``searching`` meanwhile; the control loop holds on the
+        aged-out sample. The lighthouse snapshot is cleared (it belongs to the
+        old libsurvive context).
+
+        Raises ``RuntimeError`` (status ``error``) when the old thread is still
+        alive after ``timeout`` s: nothing is restarted, the arguments stay as
+        they were, and the old thread keeps owning the handle until its close
+        completes (the calibration FSM reports the failure; a later restart
+        recovers once the close has finished)."""
+        with self._lifecycle:
+            if not self.stop(timeout=timeout):
+                detail = (
+                    f"tracker reader did not stop within {timeout:.0f} s "
+                    "(libsurvive close pending; not restarted)"
+                )
+                self._set_status("error", detail)
+                raise RuntimeError(detail)
+            self.cfg = self.cfg.model_copy(update={"libsurvive_args": list(libsurvive_args)})
+            with self._lock:
+                self._lighthouses = []
+            self.start()
+
+    def lighthouses(self) -> list[LighthouseSnapshot]:
+        """Newest LIGHTHOUSE-object snapshot (refreshed by the reader thread every
+        ``LIBSURVIVE_LIGHTHOUSE_POLL_S`` while the libsurvive loop runs; empty for
+        the other backends and right after a (re)start)."""
+        with self._lock:
+            return list(self._lighthouses)
 
     # -- status ----------------------------------------------------------------------
     def _set_status(self, status: TrackerStatus, detail: str) -> None:
@@ -548,6 +651,7 @@ class TrackerReader:
             pose_rx = self._last_pose_rx
             rx = [t for t in self._rx_times if t > now - RATE_WINDOW_S]
             controller = self._controller
+            charging = self._charging
         # Pose age: the last REAL pose (an edge re-publish carries an old pose).
         age = None if pose_rx is None else max(0.0, now - pose_rx)
         if status == "tracking" and age is not None and age > self.cfg.stale_s:
@@ -570,6 +674,7 @@ class TrackerReader:
             device_held=last.held_codes if codes_fresh else frozenset(),
             bad_events=self.bad_events,
             restarts=self.restarts,
+            charging=charging,
         )
 
     # -- publishing (backend threads) ----------------------------------------------------
@@ -705,8 +810,18 @@ class TrackerReader:
                 with self._lock:
                     self._last_error_log = text
                 self._forward_warning(text)
-            else:
+            else:  # SURVIVE_LOG_LEVEL_INFO and up: keep for the calibration FSM
                 logger.debug("libsurvive: %s", text)
+                text = _ANSI_RE.sub("", text).strip()
+                now = self._clock()
+                with self._lock:
+                    self.info_lines.append((now, text))
+                cb = self.on_info
+                if cb is not None:
+                    try:
+                        cb(now, text)
+                    except Exception:
+                        logger.debug("on_info callback failed", exc_info=True)
         except Exception:  # never raise into C
             return
 
@@ -793,12 +908,16 @@ class TrackerReader:
         t_start = self._clock()
         seen_pose = False
         next_check = t_start + LIBSURVIVE_NO_OBJECT_GRACE_S
+        next_lh = t_start  # first lighthouse snapshot right away, then every poll period
         while not self._stop.is_set():
             et = ps.simple_next_event(ptr, ctypes.byref(ev))
             if et == ps.SurviveSimpleEventType_Shutdown:
                 if not self._stop.is_set():
                     self._set_status("error", self._error_detail("libsurvive shut down"))
                 return
+            if (now := self._clock()) >= next_lh:
+                next_lh = now + LIBSURVIVE_LIGHTHOUSE_POLL_S
+                self._refresh_lighthouses(ps, ptr, ctypes, now)
             if et == ps.SurviveSimpleEventType_None:
                 if not seen_pose and self._clock() >= next_check:
                     self._report_no_pose(ps, ptr)
@@ -813,6 +932,7 @@ class TrackerReader:
                 elif et == ps.SurviveSimpleEventType_PoseUpdateEvent:
                     pe = getattr(ev.d, "__private_pose_event")  # noqa: B009 - name-mangling guard
                     if self._is_tracked_object(ps, pe.object):  # not lighthouses/HMD/others
+                        self._poll_charging(ps, pe.object)
                         seen_pose = self._on_pose_event(pe) or seen_pose
             except Exception:
                 self.bad_events += 1
@@ -835,6 +955,73 @@ class TrackerReader:
         vel_ang = np.nan_to_num(np.array(pe.velocity.AxisAngleRot[:3], dtype=np.float64))
         self._publish(Pose(pos, rot / np.linalg.norm(rot)), vel_lin, vel_ang, float(pe.time))
         return True
+
+    def _poll_charging(self, ps, obj) -> None:
+        """Throttled read of the controller's USB-power (charging) flag.
+
+        The only battery-related datum this libsurvive build exposes through
+        the simple API: a bool, whether the controller is on external power.
+        The charge *level* lives on the opaque ``SurviveObject`` behind the
+        simple handle and ``simple_object_charge_percet`` is not compiled in,
+        so a percentage is not available here. Polled at most every
+        ``CHARGE_POLL_S`` and guarded: a failure keeps the last value and
+        never kills the reader thread."""
+        now = self._clock()
+        if now < self._charging_next:
+            return
+        self._charging_next = now + CHARGE_POLL_S
+        try:
+            charging = bool(ps.simple_object_charging(obj))
+        except Exception:
+            self._forward_warning("simple_object_charging read failed: dropped")
+            return
+        with self._lock:
+            self._charging = charging
+
+    def _refresh_lighthouses(self, ps, ptr, ctypes, now: float) -> None:
+        """Enumerate libsurvive's LIGHTHOUSE objects (``ps.<constant>`` comparison
+        only: the test stub's enum values differ from the real library) into the
+        lock-protected snapshot. Every accessor is guarded so a missing symbol or
+        a half-initialised station degrades to ``None``, never kills the thread."""
+        try:
+            out: list[LighthouseSnapshot] = []
+            obj = ps.simple_get_first_object(ptr)
+            order = 0
+            while obj:
+                if ps.simple_object_get_type(obj) == ps.SurviveSimpleObject_LIGHTHOUSE:
+                    name = ps.simple_object_name(obj)
+                    name = name.decode(errors="replace") if isinstance(name, bytes) else str(name)
+                    m = re.search(r"(\d+)$", name)
+                    index = int(m.group(1)) if m else order
+                    serial: str | None = None
+                    try:
+                        raw = ps.simple_serial_number(obj)
+                        if raw:
+                            serial = (
+                                raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+                            )
+                    except Exception:
+                        serial = None
+                    pose: Pose | None = None
+                    try:
+                        lp = ps.SurvivePose()
+                        ps.simple_object_get_latest_pose(obj, ctypes.byref(lp))
+                        pos = np.array(lp.Pos[:3], dtype=np.float64)
+                        rot = np.array(lp.Rot[:4], dtype=np.float64)  # wxyz
+                        if (
+                            np.all(np.isfinite(pos)) and np.all(np.isfinite(rot))
+                            and abs(float(np.linalg.norm(rot)) - 1.0) <= QUAT_NORM_TOL
+                        ):
+                            pose = Pose(pos, rot)
+                    except Exception:
+                        pose = None
+                    out.append(LighthouseSnapshot(index, name, serial, pose, now))
+                    order += 1
+                obj = ps.simple_get_next_object(ptr, obj)
+            with self._lock:
+                self._lighthouses = out
+        except Exception:
+            logger.debug("lighthouse enumeration failed", exc_info=True)
 
     def _object_names(self, ps, ptr) -> list[str]:
         """Codenames of every OBJECT-type libsurvive object (trackers/controllers/
@@ -915,6 +1102,7 @@ __all__ = [
     "RAIL_NEG_CODE",
     "RAIL_POS_CODE",
     "ControllerState",
+    "LighthouseSnapshot",
     "TrackerDeviceStatus",
     "TrackerReader",
     "TrackerSample",

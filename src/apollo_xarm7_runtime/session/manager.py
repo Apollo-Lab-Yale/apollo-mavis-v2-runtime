@@ -114,6 +114,7 @@ class SessionManager:
         self.tracker_settings = tracker_settings or TrackerSettings.from_config(cfg.tracker)
         self.session: ActiveSession | None = None
         self._lock = threading.Lock()
+        self._creating = False  # create() is validating / bringing a session up (under _lock)
         self._preview_service = None
         self._preview_sources: list[object] = []
         self._preview_ids: list[str] = []
@@ -122,6 +123,15 @@ class SessionManager:
     @property
     def state(self) -> SessionState:
         return self.session.state if self.session else SessionState.IDLE
+
+    @property
+    def session_active(self) -> bool:
+        """A session exists OR :meth:`create` is bringing one up. ``session`` is
+        assigned only after bringup returns (seconds of MuJoCo/bringup under
+        ``_lock``), so a guard reading it alone — the tracker calibration's
+        "stop the session first" (13-tracker §4) — could pass while a session is
+        coming up; ``_creating`` is raised under ``_lock`` before validation."""
+        return self._creating or self.session is not None
 
     def info(self) -> SessionInfo:
         s = self.session
@@ -192,9 +202,13 @@ class SessionManager:
     # -- create (BRINGUP; returns while START_FROM runs) ---------------------------
     def create(self, spec: SessionSpec) -> SessionInfo:
         with self._lock:
-            wc = self._validate(spec)
-            session = self._bringup_sim(spec, wc)
-            self.session = session
+            self._creating = True  # session_active() is True from here on
+            try:
+                wc = self._validate(spec)
+                session = self._bringup_sim(spec, wc)
+                self.session = session
+            finally:
+                self._creating = False
         threading.Thread(
             target=self._start_from_worker, args=(session,), name="start-from", daemon=True
         ).start()
@@ -240,7 +254,10 @@ class SessionManager:
             pairs = None
         ik = MinkIKSolver(
             twin.scene,
-            IKParams(min_distance_m=safety.geom_inflation_m + 0.002),
+            IKParams(
+                min_distance_m=safety.geom_inflation_m + 0.002,
+                lock_rail=not self.cfg.control.rail_in_ik,  # 04-runtime §6 "Rail"
+            ),
             collision_pairs=pairs,
         )
         kin = SceneKinematics(twin.scene)

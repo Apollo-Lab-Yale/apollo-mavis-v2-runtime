@@ -7,13 +7,15 @@ fixed at the press edge), press-edge accounting (the ``edges`` history with
 re-publish (never refreshing the pose's age / rate / status), the fake backend's
 scripted controller hook, and the libsurvive event loop driven by a stub ``ps``
 module incl. the robustness rules (bad events, error-vs-searching status, rate
-decay, log rate limit, auto-restart)."""
+decay, log rate limit, auto-restart) and the calibration hooks (lighthouse
+snapshot, INFO-line queue, ``restart`` with new libsurvive arguments)."""
 
 from __future__ import annotations
 
 import ctypes
 import logging
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -52,6 +54,7 @@ from apollo_xarm7_runtime.devices.tracker import (
     RAIL_NEG_CODE,
     RAIL_POS_CODE,
     ControllerState,
+    LighthouseSnapshot,
     TrackerReader,
     active_inputs,
     apply_button_event,
@@ -623,6 +626,22 @@ class StubPS:
     def simple_object_name(self, obj):
         return obj.name.encode()
 
+    class SurvivePose:  # LinmathPose: Pos[3] + Rot[4] (wxyz); zeros until solved
+        def __init__(self):
+            self.Pos = [0.0, 0.0, 0.0]
+            self.Rot = [0.0, 0.0, 0.0, 0.0]
+
+    def simple_serial_number(self, obj):
+        serial = getattr(obj, "serial", None)
+        return serial.encode() if serial is not None else None
+
+    def simple_object_get_latest_pose(self, obj, pose):
+        lh_pose = getattr(obj, "pose", None)
+        if lh_pose is not None:
+            pose.Pos[:] = list(lh_pose[0])
+            pose.Rot[:] = list(lh_pose[1])
+        return 1.5
+
     def simple_get_object_count(self, ptr):
         return len(self.objects)
 
@@ -638,8 +657,8 @@ NONE_EV = (StubPS.SurviveSimpleEventType_None, None)
 FAKE_CTYPES = SimpleNamespace(byref=lambda x: x)
 
 
-def _obj(name, kind=StubPS.SurviveSimpleObject_OBJECT):
-    return SimpleNamespace(name=name, kind=kind)
+def _obj(name, kind=StubPS.SurviveSimpleObject_OBJECT, serial=None, pose=None):
+    return SimpleNamespace(name=name, kind=kind, serial=serial, pose=pose)
 
 
 def _pose(obj, pos, t, rot=(1.0, 0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0)):
@@ -807,6 +826,78 @@ def test_libsurvive_warnings_are_rate_limited_per_message_class(caplog):
     assert any("info line" in r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG)
 
 
+# -- calibration hooks: lighthouse snapshot, INFO lines, restart -----------------------------------
+def test_libsurvive_loop_snapshots_lighthouse_objects_by_ps_constants():
+    lh0 = _obj("LH0", StubPS.SurviveSimpleObject_LIGHTHOUSE, serial="2684858188",
+               pose=([3.8, 1.2, 1.8], [0.5, 0.5, 0.5, 0.5]))
+    lh1 = _obj("LH1", StubPS.SurviveSimpleObject_LIGHTHOUSE)  # unsolved: zero quaternion
+    wm0 = _obj("WM0", serial="LHR-FFFFFFFF", pose=([0.1, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]))
+    reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
+    assert reader.lighthouses() == []
+
+    def poll():
+        clock.t += 0.3  # 3 polls: snapshot at t0, not at t0+0.3, again at t0+0.6
+        if not ps.events:
+            reader._stop.set()
+
+    ps = StubPS([NONE_EV] * 3, objects=[lh0, wm0, lh1], on_poll=poll)
+    reader._libsurvive_events(ps, object(), FAKE_CTYPES)
+    snap = reader.lighthouses()
+    assert [type(s) for s in snap] == [LighthouseSnapshot, LighthouseSnapshot]
+    assert [(s.index, s.name, s.serial) for s in snap] == [
+        (0, "LH0", "2684858188"), (1, "LH1", None)
+    ]
+    assert snap[0].pose is not None and np.allclose(snap[0].pose.position, [3.8, 1.2, 1.8])
+    assert np.allclose(snap[0].pose.orientation, [0.5, 0.5, 0.5, 0.5])
+    assert snap[1].pose is None  # zero quaternion = not solved
+    assert snap[0].t_mono == snap[1].t_mono == clock.t - 0.3  # the latest refresh
+    assert reader.bad_events == 0  # the snapshot path never counts as a bad event
+    # An enumeration failure degrades to the previous snapshot, never an exception.
+    ps = StubPS([NONE_EV], objects=[SimpleNamespace(kind=2)], on_poll=poll)  # no .name
+    reader._stop.clear()
+    reader._libsurvive_events(ps, object(), FAKE_CTYPES)
+    assert len(reader.lighthouses()) == 2 and reader.bad_events == 0
+    # restart() with the fake backend clears the snapshot and swaps the args on a COPY.
+    reader.stop()
+    cfg = reader.cfg
+    reader.restart(["--configfile", "/tmp/x.json"])
+    try:
+        assert reader.lighthouses() == []
+        assert reader.cfg is not cfg
+        assert reader.cfg.libsurvive_args == ["--configfile", "/tmp/x.json"]
+        assert cfg.libsurvive_args == ["--lighthousecount", "2"]  # shared config untouched
+        assert reader._thread is not None and reader._thread.is_alive()
+    finally:
+        reader.stop()
+
+
+def test_info_lines_are_kept_ansi_free_and_handed_to_on_info(caplog):
+    caplog.set_level(logging.DEBUG, logger="apollo_xarm7_runtime.devices.tracker")
+    reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
+    seen = []
+    reader.on_info = lambda t, text: seen.append((t, text))
+    reader._on_survive_log(None, 2, b"\x1b[0;32mInfo: Global solve with 3 scenes for 1\x1b[0m")
+    reader._on_survive_log(None, 1, b"Lighthouse 2 not seen")  # warning: not an INFO line
+    reader._on_survive_log(
+        None, 3, "Using LH 2 (\x1b[0;31m596c9a8b\x1b[0m) as reference lighthouse"  # str, level 3
+    )
+    assert list(reader.info_lines) == [
+        (clock.t, "Info: Global solve with 3 scenes for 1"),
+        (clock.t, "Using LH 2 (596c9a8b) as reference lighthouse"),
+    ]
+    assert seen == list(reader.info_lines)
+    assert reader._last_error_log == "Lighthouse 2 not seen"
+    # A raising callback never propagates into the C caller and the line is still kept.
+    reader.on_info = lambda t, text: 1 / 0
+    reader._on_survive_log(None, 2, b"Info: Force calibrate flag set")
+    assert reader.info_lines[-1][1] == "Info: Force calibrate flag set"
+    reader.on_info = None
+    for i in range(300):
+        reader._on_survive_log(None, 2, f"line {i}".encode())
+    assert len(reader.info_lines) == 256 and reader.info_lines[-1][1] == "line 299"
+    assert any("Global solve with 3 scenes" in r.getMessage() for r in caplog.records)
+
+
 class RestartStubModule:
     """A ``pysurvive`` stand-in whose event loop shuts down immediately."""
 
@@ -865,3 +956,115 @@ def test_libsurvive_loop_auto_restarts_with_backoff_and_start_is_restartable(mon
     finally:
         reader.stop()
     assert reader._thread is None and stub.closes == stub.inits
+
+
+class IdleStubModule(RestartStubModule):
+    """A ``pysurvive`` stand-in whose event loop idles (None events) until the
+    reader stops; records the argv of every ``simple_init_with_logger``."""
+
+    SurviveSimpleObject_LIGHTHOUSE = 2
+
+    def __init__(self):
+        super().__init__()
+        self.argvs: list[list[str]] = []
+
+    def simple_init_with_logger(self, argc, argv, cb):
+        self.argvs.append(
+            [ctypes.cast(argv[i], ctypes.c_char_p).value.decode() for i in range(argc)]
+        )
+        return super().simple_init_with_logger(argc, argv, cb)
+
+    def simple_next_event(self, ptr, ev):
+        time.sleep(0.001)
+        return self.SurviveSimpleEventType_None
+
+    def simple_get_first_object(self, ptr):
+        return None
+
+
+def test_restart_swaps_libsurvive_args_after_a_clean_close(monkeypatch):
+    stub = IdleStubModule()
+    monkeypatch.setitem(sys.modules, "pysurvive", stub)
+    cfg = TrackerConfig(backend="libsurvive", libsurvive_args=["--lighthousecount", "3"])
+    reader = TrackerReader(cfg, LatestSlot())
+    reader.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while stub.inits < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert stub.argvs == [["apollo-xarm7-runtime", "--lighthousecount", "3"]]
+        assert reader.status().status == "searching"
+        reader.restart(["--lighthousecount", "3", "--configfile", "/tmp/bs.json",
+                        "--force-calibrate", "1", "--globalscenesolver", "1"])
+        deadline = time.monotonic() + 3.0
+        while stub.inits < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert stub.closes == 1 and stub.inits == 2  # closed BEFORE the new init (dongle owner)
+        assert stub.argvs[1] == [
+            "apollo-xarm7-runtime", "--lighthousecount", "3", "--configfile", "/tmp/bs.json",
+            "--force-calibrate", "1", "--globalscenesolver", "1",
+        ]
+        assert cfg.libsurvive_args == ["--lighthousecount", "3"]  # shared config untouched
+        assert reader.cfg is not cfg and reader.restarts == 0  # operator restarts are not failures
+        assert reader.status().status == "searching"
+    finally:
+        reader.stop()
+    assert stub.closes == stub.inits == 2 and reader._thread is None
+
+
+class BlockingCloseStubModule(IdleStubModule):
+    """``simple_close`` blocks until ``release`` is set (a USB stall on close)."""
+
+    def __init__(self):
+        super().__init__()
+        self.closing = threading.Event()
+        self.release = threading.Event()
+
+    def simple_close(self, ptr):
+        self.closing.set()
+        self.release.wait(5.0)
+        super().simple_close(ptr)
+
+
+def test_restart_refuses_while_the_old_libsurvive_close_is_pending(monkeypatch):
+    """A restart must never open a second libsurvive context while the old one is
+    still closing (LIBUSB_ERROR_BUSY, 13-tracker §6): a timed-out join keeps the
+    thread handle, refuses the restart (status ``error``), leaves the arguments
+    alone and lets the thread clear its own handle when the close completes."""
+    stub = BlockingCloseStubModule()
+    monkeypatch.setitem(sys.modules, "pysurvive", stub)
+    cfg = TrackerConfig(backend="libsurvive", libsurvive_args=["--lighthousecount", "3"])
+    reader = TrackerReader(cfg, LatestSlot())
+    reader.start()
+    try:
+        deadline = time.monotonic() + 3.0
+        while stub.inits < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        old = reader._thread
+        assert old is not None and stub.inits == 1
+        with pytest.raises(RuntimeError, match="did not stop within 0 s"):
+            reader.restart(["--lighthousecount", "3", "--configfile", "/tmp/bs.json"], timeout=0.05)
+        assert stub.closing.wait(1.0)  # the old thread is inside simple_close
+        assert stub.inits == 1 and stub.closes == 0  # no second context
+        assert reader._thread is old and old.is_alive()  # handle kept by the stuck thread
+        assert reader.cfg.libsurvive_args == ["--lighthousecount", "3"]  # args not swapped
+        st = reader.status()
+        assert st.status == "error" and "did not stop" in st.detail and "close pending" in st.detail
+        reader.start()  # a no-op while the old thread lives
+        assert stub.inits == 1 and reader._thread is old
+        assert reader.stop(timeout=0.05) is False
+        stub.release.set()  # the close completes: the thread clears its own handle
+        deadline = time.monotonic() + 3.0
+        while reader._thread is not None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert reader._thread is None and stub.closes == 1
+        reader.restart(["--lighthousecount", "3", "--configfile", "/tmp/bs.json"])
+        deadline = time.monotonic() + 3.0
+        while stub.inits < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert stub.inits == 2 and stub.argvs[1][-2:] == ["--configfile", "/tmp/bs.json"]
+        assert reader.status().status == "searching"
+    finally:
+        stub.release.set()
+        reader.stop()
+    assert reader._thread is None and stub.closes == stub.inits == 2

@@ -601,3 +601,60 @@ def test_touch_edges_on_a_dead_pose_stream_release_the_clutch_and_never_jump(tap
     _pose(reader, rig, 0.09)
     rig.tick()
     assert rig.cmd()[0] == pytest.approx(q_hold[0] + 0.01)
+
+
+# -- rail inputs slide the WHOLE arm while driven (04-runtime §6 "Rail", 2026-09-03) ------------
+def test_keyboard_translate_plus_rail_code_rides_the_rail_no_ik_fold_back():
+    rig = _rail_rig()
+    rig.hold("KeyW")
+    rig.tick(5)
+    q0 = rig.cmd()
+    rig.hold("KeyW", RAIL_POS)
+    rig.tick(10)
+    q = rig.cmd()
+    assert q[7] == pytest.approx(q0[7] + 10 * RAIL_STEP)
+    # joints carry the translate steps only: no compensation of the rail travel
+    assert q[0] == pytest.approx(q0[0] + 10 * LIN_STEP, abs=1e-9)
+    tcp = rig.loop.kin.tcp_world("arm0", q)
+    assert tcp.position[0] == pytest.approx(q0[0] + q0[7] + 10 * (LIN_STEP + RAIL_STEP), abs=1e-9)
+    tgt = rig.loop.integrator.get("arm0")
+    assert tgt.position[0] == pytest.approx(tcp.position[0], abs=1e-9)  # target rode along
+    assert "arm0" in rig.loop._teleop_seeded  # a driven tick keeps its seed
+    rig.hold("KeyW")
+    rig.tick()
+    assert rig.cmd()[0] == pytest.approx(q[0] + LIN_STEP, abs=1e-9)  # continues seamlessly
+    assert rig.cmd()[7] == pytest.approx(q[7])
+
+
+def test_clutched_rail_code_slides_arm_and_keeps_hand_offset():
+    rig = _rail_rig()
+    rig.sample([0.0, 0.0, 0.0])
+    rig.hold(CLUTCH)
+    rig.tick()  # engage with a still hand
+    q0 = rig.cmd()
+    rig.hold(CLUTCH, RAIL_POS)
+    rig.tick(50)
+    q = rig.cmd()
+    assert q[7] == pytest.approx(q0[7] + 50 * RAIL_STEP)
+    assert np.allclose(q[:7], q0[:7], atol=1e-9)  # posture held: the anchor rode the rail
+    assert rig.extra()["engaged_arm"] == "arm0"  # the clutch session survived the rail move
+    anchor = rig.extra()["anchor_tcp"]
+    assert anchor.position[0] == pytest.approx(q0[0] + q0[7] + 50 * RAIL_STEP, abs=1e-9)
+    rig.hold(CLUTCH)
+    rig.sample([0.02, 0.0, 0.0])
+    rig.tick()
+    q2 = rig.cmd()
+    assert q2[0] == pytest.approx(q0[0] + 0.02, abs=1e-9)  # hand delta 1:1 from the ridden anchor
+    assert q2[7] == pytest.approx(q[7])
+
+
+def test_rail_bound_caps_the_ride_along_shift():
+    rig = _rail_rig()
+    rig.hold("KeyW")
+    rig.tick()
+    rig.hold("KeyW", RAIL_NEG)  # rail already at 0: the step is clamped, so no shift
+    rig.tick(5)
+    q = rig.cmd()
+    assert q[7] == 0.0
+    assert q[0] == pytest.approx(6 * LIN_STEP, abs=1e-9)
+    assert rig.loop.integrator.get("arm0").position[0] == pytest.approx(6 * LIN_STEP, abs=1e-9)

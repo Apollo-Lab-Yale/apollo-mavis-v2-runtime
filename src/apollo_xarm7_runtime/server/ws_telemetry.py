@@ -52,7 +52,8 @@ def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
     13-tracker §1.1) from the Runtime-owned reader (pre-session too); clutch/
     anchor/target/filtered pose/last device action from
     ``session_extra["tracker"]`` (13-tracker §3.5/§4); settings incl. the live
-    filter fields from the Runtime-owned ``TrackerSettings``."""
+    filter fields from the Runtime-owned ``TrackerSettings``; the calibration
+    wizard snapshot from the Runtime-owned ``TrackerCalibration`` (phase-10)."""
     dev = runtime.tracker.status(now)
     settings = runtime.tracker_settings.get()
     extra = (snap.session_extra.get("tracker") if snap is not None else None) or {}
@@ -84,6 +85,8 @@ def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
         controller=_controller_msg(dev.controller),
         device_held=sorted(dev.device_held),
         device_action=extra.get("device_action"),
+        charging=dev.charging,
+        calibration=runtime.tracker_calibration.status(),
     )
 
 
