@@ -23,8 +23,10 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
     assert (by_id["grip"].ip, by_id["grip"].gripper) == ("192.168.1.201", "xarm_g2")
     assert (by_id["view"].ip, by_id["view"].gripper) == ("192.168.2.219", "none")
     assert by_id["view"].microphone is True and by_id["grip"].microphone is False
-    assert [c.id for c in hw.cameras] == ["camera1", "camera2"]  # placeholders kept
-    assert all(str(c.device_path).startswith("/dev/v4l/by-id/TODO-") for c in hw.cameras)
+    assert [c.id for c in hw.cameras] == ["grip_wrist", "view_wrist"]
+    # RealSense D435i colour over UVC: by USB serial (no by-id path), YUYV only.
+    assert all(c.kind == "v4l2" and c.device_path is None and c.serial for c in hw.cameras)
+    assert {c.fourcc for c in hw.cameras} == {"YUYV"}
     assert cfg.microphone.enabled and cfg.microphone.mic_id == "mic_view"
     assert cfg.microphone.label == "Perception Arm microphone"
     assert cfg.hardware_probe.enabled and cfg.hardware_probe.port == 502

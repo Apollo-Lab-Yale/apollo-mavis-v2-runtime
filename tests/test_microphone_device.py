@@ -91,7 +91,14 @@ def test_frame_stats_sine_levels_envelope_and_clipping():
     assert env_min.dtype.kind == "i" and env_max.dtype.kind == "i"
     assert env_min.min() >= -127 and env_max.max() <= 127
     assert np.all(env_max >= env_min)
-    assert env_max.max() == 64 and env_min.min() == -64  # 0.5 * 127 rounded, time-ordered bins
+    # Relative to the frame peak: the 0.5 sine still spans the full +-127 range.
+    assert env_max.max() == 127 and env_min.min() == -127
+    # Quiet room (-58 dBFS rms) keeps its shape instead of rounding to zeros...
+    quiet = (0.002 * np.sin(2 * math.pi * 1000.0 * t)).astype(np.float32)
+    pq, _, _, loq, hiq = frame_stats(quiet, bins)
+    assert pq < -50 and hiq.max() == 127 and loq.min() == -127
+    # ...and the absolute value is recoverable from peak_dbfs.
+    assert abs(hiq.max() / 127 * 10 ** (pq / 20) - 0.002) < 1e-4
     # Full-scale -> clipping; int8 saturates at +-127.
     loud = np.clip(x * 3.0, -1.0, 1.0)
     p, _, clip, lo, hi = frame_stats(loud, bins)

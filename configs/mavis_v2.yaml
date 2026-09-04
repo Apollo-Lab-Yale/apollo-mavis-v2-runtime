@@ -19,10 +19,8 @@ workcells:
   # Real cell (phase-11): lets the Welcome page's Hardware tab open with no arm
   # connected. Exactly TWO control boxes (2026-09-04): Manipulation Arm `grip`
   # at 192.168.1.201 and Perception Arm `view` at 192.168.2.219, one NIC each.
-  # Only the camera paths are still PLACEHOLDERS until the user supplies the
-  # /dev/v4l/by-id mappings: those previews report `live: false` (pure-black
-  # tiles) -- no other side effect; a box that is off shows `reachable:
-  # unreachable`. Sessions on this workcell land with phase-09
+  # An unplugged camera reports `live: false` (pure-black tile) -- no other
+  # side effect; a box that is off shows `reachable: unreachable`. Sessions on this workcell land with phase-09
   # (`_bringup_hardware`); POST /api/session kind=hardware is 409.
   hardware:
     kind: hardware
@@ -37,9 +35,15 @@ workcells:
         base_in_world: {}
         gripper: none
         microphone: true          # RØDE NT-USB Mini ahead of the wrist camera -> twin collision body
-    cameras:                      # v4l2 by-id paths TODO: user supplies the real camera1/camera2 mapping
-      - {id: camera1, kind: v4l2, device_path: /dev/v4l/by-id/TODO-camera1, resolution: [640, 480], fps: 30}
-      - {id: camera2, kind: v4l2, device_path: /dev/v4l/by-id/TODO-camera2, resolution: [640, 480], fps: 30}
+    # Both wrist cameras are Intel RealSense D435i used as plain UVC colour
+    # cameras (kind v4l2, no depth): addressed by USB serial (sysfs lookup)
+    # because the /dev/v4l/by-id symlinks collide between the depth and colour
+    # interfaces, and the colour stream is YUYV only (fourcc). The serial -> arm
+    # mapping is PROVISIONAL (2026-09-04): swap the two serials if the Hardware
+    # tab shows the tiles crossed.
+    cameras:
+      - {id: grip_wrist, kind: v4l2, serial: "322143060792", fourcc: YUYV, resolution: [640, 480], fps: 30}
+      - {id: view_wrist, kind: v4l2, serial: "349643062582", fourcc: YUYV, resolution: [640, 480], fps: 30}
     safety:
       enabled: true               # hardware refuses to start without the safety gate
 profiles_dir: ~/apollo/profiles

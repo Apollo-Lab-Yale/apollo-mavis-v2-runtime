@@ -5,8 +5,11 @@ daemon thread owned by ``Runtime`` for the process lifetime publishes one
 :class:`MicFrame` per telemetry tick (frame length = ``sample_rate /
 frame_hz``; 1920 samples at 48 kHz / 25 Hz) carrying peak / RMS (dBFS), a
 clipping flag and a ``bins``-point int8 min/max envelope for the UI's
-scrolling oscilloscope. ``status(now)`` derives ``stalled`` from the age of
-the last frame exactly like the tracker derives ``stale``.
+scrolling oscilloscope. The envelope is quantised RELATIVE TO THE FRAME PEAK
+(the peak sample maps to +-127) so a quiet room at -58 dBFS still has shape;
+absolute values are ``env / 127 * 10 ** (peak_dbfs / 20)``. ``status(now)``
+derives ``stalled`` from the age of the last frame exactly like the tracker
+derives ``stale``.
 
 Capture ALWAYS goes through PulseAudio (the lab's PulseAudio 15.99 owns the
 RØDE NT-USB Mini; opening ``hw:CARD=Mini`` fails with EBUSY and silently
@@ -96,7 +99,7 @@ class MicFrame:
     rms_dbfs: float
     peak_dbfs: float
     clipping: bool
-    env_min: tuple[int, ...]  # bins x int8 (-127..127), time-ordered
+    env_min: tuple[int, ...]  # bins x int8 (-127..127) relative to the frame peak, time-ordered
     env_max: tuple[int, ...]
 
 
@@ -151,7 +154,12 @@ def frame_stats(
     The envelope splits the frame into ``bins`` contiguous time slices
     (``arange(bins) * n // bins`` edges, exact when ``n`` is a multiple of
     ``bins``) and keeps each slice's min and max, quantised to int8
-    (-127..127) for the wire. Frames shorter than ``bins`` are sampled.
+    (-127..127) **relative to the frame peak** for the wire: the loudest
+    sample of the frame maps to +-127 whatever its level, so the oscilloscope
+    keeps its shape at -58 dBFS (a full-scale int8 would round a quiet room to
+    all zeros). ``peak_dbfs`` carries the scale back: absolute = ``env / 127 *
+    10 ** (peak_dbfs / 20)``. Frames shorter than ``bins`` are sampled; a
+    digitally silent frame yields an all-zero envelope.
     """
     x = np.asarray(samples, dtype=np.float32).reshape(-1)
     n = int(x.shape[0])
@@ -167,8 +175,9 @@ def frame_stats(
     else:
         idx = (np.arange(bins) * n) // bins
         mn = mx = x[idx]
-    env_min = np.clip(np.rint(mn * INT8_MAX), -INT8_MAX, INT8_MAX).astype(np.int64)
-    env_max = np.clip(np.rint(mx * INT8_MAX), -INT8_MAX, INT8_MAX).astype(np.int64)
+    scale = INT8_MAX / peak if peak > 0.0 else 0.0  # peak -> +-127 (relative envelope)
+    env_min = np.clip(np.rint(mn * scale), -INT8_MAX, INT8_MAX).astype(np.int64)
+    env_max = np.clip(np.rint(mx * scale), -INT8_MAX, INT8_MAX).astype(np.int64)
     peak_dbfs = dbfs(peak)
     return peak_dbfs, dbfs(rms), peak_dbfs >= CLIP_DBFS, env_min, env_max
 
