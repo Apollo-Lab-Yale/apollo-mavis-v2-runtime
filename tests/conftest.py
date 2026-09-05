@@ -9,7 +9,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")  # noqa: E402 - must precede mujoco GL
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pytest
@@ -180,13 +180,57 @@ class FakeMonitorSample:
     rail_raw_mm: float | None = 0.0
     gripper_open_frac: float | None = None
     gripper_raw: float | None = None
+    # phase-09b safety read-backs (rich report frame; None / () until read)
+    collision_sensitivity: int | None = None
+    tcp_load_kg: float | None = None
+    tcp_load_cog_mm: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class FakeMaintenanceOutcome:
+    """Duck-typed ``apollo_mavis_v2_hardware.MaintenanceOutcome`` (same field names)."""
+
+    arm_id: str
+    op: str
+    ok: bool
+    detail: str = ""
+    sdk_codes: dict[str, int] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    before: object | None = None
+    after: object | None = None
+
+
+# backstops.BACKSTOP_SDK_METHODS order (the reduced-mode pair only with a boundary);
+# tests/test_maintenance_api.py pins this against the hardware package when importable.
+BACKSTOP_SEQUENCE: tuple[str, ...] = (
+    "set_tcp_load",
+    "set_gravity_direction",
+    "set_collision_sensitivity",
+    "set_self_collision_detection",
+    "set_collision_tool_model",
+    "set_collision_rebound",
+)
+
+
+def fake_backstop_sequence(driver_cfg) -> tuple[str, ...]:
+    seq = list(BACKSTOP_SEQUENCE)
+    if getattr(driver_cfg, "reduced_tcp_boundary_mm", None) is not None:
+        seq[-1:-1] = ["set_reduced_tcp_boundary", "set_reduced_mode"]
+    return tuple(seq)
 
 
 @dataclass
 class FakeArmMonitor:
     """``ArmStateMonitor`` surface with a call log; ``status`` / ``sample`` are set
     by the test. ``start()`` -> status ``running`` (unless the test pinned one),
-    ``disconnect()`` -> ``paused``, ``stop()`` -> ``off``."""
+    ``disconnect()`` -> ``paused``, ``stop()`` -> ``off``.
+
+    ``maintenance()`` (phase-09b) mirrors the hardware monitor's contract: refusals
+    for ``recover`` / a missing driver config / a disconnected monitor;
+    ``clear_errors`` writes exactly ``clean_error`` + ``clean_warn`` and zeroes the
+    codes of the newest sample; ``apply_backstops`` writes the ``backstops.py``
+    sequence and echoes the driver config into the read-back fields. A test can
+    pin ``scripted_outcome`` (returned verbatim) or ``maintenance_busy``."""
 
     arm_id: str
     ip: str
@@ -199,6 +243,9 @@ class FakeArmMonitor:
     sample: object | None = None
     forced_status: str | None = None  # e.g. "stale" / "error" pinned by a test
     detail_text: str = ""
+    maintenance_busy: bool = False
+    maintenance_calls: list[tuple[str, object, float]] = field(default_factory=list)
+    scripted_outcome: object | None = None
     _status: str = "off"
 
     def start(self) -> None:
@@ -215,6 +262,59 @@ class FakeArmMonitor:
 
     def snapshot(self):
         return self.sample
+
+    def maintenance(self, op: str, driver_cfg=None, timeout_s: float = 10.0):
+        self.maintenance_calls.append((op, driver_cfg, timeout_s))
+        if op not in ("clear_errors", "apply_backstops", "recover"):
+            raise ValueError(f"unknown maintenance op {op!r}")
+        if op == "recover":
+            return FakeMaintenanceOutcome(self.arm_id, op, False, "recover needs a session")
+        if op == "apply_backstops" and driver_cfg is None:
+            return FakeMaintenanceOutcome(
+                self.arm_id, op, False, "apply_backstops needs the arm's driver config"
+            )
+        if self._status != "running":
+            return FakeMaintenanceOutcome(
+                self.arm_id, op, False, f"not connected to {self.ip} (monitor {self._status})"
+            )
+        if self.scripted_outcome is not None:
+            return self.scripted_outcome
+        before = self.sample
+        if op == "clear_errors":
+            codes = {"clean_error": 0, "clean_warn": 0}
+            err = getattr(before, "error_code", 0) if before is not None else 0
+            detail = (
+                f"cleared controller error {err}"
+                if err
+                else "no controller error or warning was latched; clean_error + clean_warn sent"
+            )
+            after = (
+                replace(before, error_code=0, warn_code=0, seq=before.seq + 2)
+                if before is not None
+                else None
+            )
+        else:
+            codes = dict.fromkeys(fake_backstop_sequence(driver_cfg), 0)
+            cog = tuple(float(v) for v in driver_cfg.tcp_load_cog_mm)
+            detail = (
+                f"safety settings applied: sensitivity {driver_cfg.collision_sensitivity}, "
+                f"payload {driver_cfg.tcp_load_kg:.2f} kg at "
+                f"({', '.join(f'{v:g}' for v in cog)}) mm"
+            )
+            after = (
+                replace(
+                    before,
+                    seq=before.seq + 2,
+                    collision_sensitivity=int(driver_cfg.collision_sensitivity),
+                    tcp_load_kg=float(driver_cfg.tcp_load_kg),
+                    tcp_load_cog_mm=cog,
+                )
+                if before is not None
+                else None
+            )
+        if after is not None:
+            self.sample = after  # the monitor's newest sample reflects the op
+        return FakeMaintenanceOutcome(self.arm_id, op, True, detail, codes, (), before, after)
 
     @property
     def status(self) -> str:

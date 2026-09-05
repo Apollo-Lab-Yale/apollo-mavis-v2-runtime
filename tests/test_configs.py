@@ -23,6 +23,13 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
     assert (by_id["grip"].ip, by_id["grip"].gripper) == ("192.168.1.201", "xarm_g2")
     assert (by_id["view"].ip, by_id["view"].gripper) == ("192.168.2.219", "none")
     assert by_id["view"].microphone is True and by_id["grip"].microphone is False
+    # Phase-09b controller-side backstops (PROVISIONAL payloads until the tools are
+    # weighed): Manipulation Arm = Gripper G2 + D435i + mount, Perception Arm = D435i +
+    # RØDE NT-USB Mini + mount; collision sensitivity 3 on both, no reduced-mode box.
+    assert (by_id["grip"].tcp_load_kg, by_id["grip"].tcp_load_cog_mm) == (0.95, (0.0, 0.0, 60.0))
+    assert (by_id["view"].tcp_load_kg, by_id["view"].tcp_load_cog_mm) == (0.55, (0.0, 0.0, 90.0))
+    assert by_id["grip"].collision_sensitivity == by_id["view"].collision_sensitivity == 3
+    assert all(a.reduced_tcp_boundary_mm is None and a.expected_sn is None for a in hw.arms)
     assert [c.id for c in hw.cameras] == ["grip_wrist", "view_wrist"]
     # RealSense D435i colour over UVC: by USB serial (no by-id path), YUYV only.
     assert all(c.kind == "v4l2" and c.device_path is None and c.serial for c in hw.cameras)

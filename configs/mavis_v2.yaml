@@ -27,12 +27,27 @@ workcells:
   # The Perception Arm (view) keeps reporting controller error C19 (end-effector
   # bus; the SDK's title -- what telemetry.hardware_monitor `detail` shows -- is
   # "End Effector Communication Error", xArm Studio calls it "End Module
-  # Communication Error") -- the arm card shows it as a red C19 chip. Both
+  # Communication Error") -- the arm card shows it as a red C19 chip. Cause: the
+  # box looks for an end effector on the tool RS-485 bus and the Perception Arm
+  # has none (get_tgpio_modbus_baudrate -> (1, -1)); one-off fix in xArm Studio:
+  # Settings -> Externals -> End Effector -> None (SDK 1.18.5 has no write API for
+  # it). Until then the Hardware tab's "Clear errors" (POST .../maintenance
+  # clear_errors = clean_error + clean_warn, NO enable) clears it; measured
+  # 2026-09-04: clearing moves no joint (<= 5e-5 rad). Both
   # linear tracks are NOT homed and NOT enabled (registers pos 0,
   # on_zero 0, is_enabled 0), so their position register is meaningless: the
   # monitor reports rail_pos_m null and the twin overlay falls back to
   # twin_overlay.rail_fallback_m (grip 0.65 = operator's right end, view 0.0).
   # Homing (set_linear_track_back_origin) is a motion command -> phase-09.
+  # Controller-side backstops (phase-09b; 02-hardware §6): tcp_load_kg /
+  # tcp_load_cog_mm / collision_sensitivity are written by the driver at every
+  # connect and by the Hardware tab's "Apply safety settings" (POST .../maintenance
+  # apply_backstops) with no session; the read-only monitor reads them back
+  # (telemetry hardware_monitor.arms[*].collision_sensitivity / tcp_load_kg /
+  # tcp_load_cog_mm, backstops_match = equal sensitivity, |d load| <= 0.05 kg,
+  # |d cog| <= 10 mm). As found 2026-09-04 both boxes had tcp_load 0 kg (wrong:
+  # collision detection is torque-estimate based) and sensitivity 3 (grip) / 1
+  # (view). The values are volatile (lost at a controller reboot).
   hardware:
     kind: hardware
     digital_twin_scene: mavis_v2   # same cell as the sim scene; the Perception Arm carries the microphone body
@@ -41,11 +56,17 @@ workcells:
         ip: 192.168.1.201         # control box 1
         base_in_world: {}         # rail origin in world; measured in phase-09 (03-sim §4.3)
         gripper: xarm_g2          # force-capable Gripper G2 (ArmStatusInfo.gripper_force_capable)
+        tcp_load_kg: 0.95         # estimate accepted by the user 2026-09-05 (not weighed): Gripper G2 + D435i + mount
+        tcp_load_cog_mm: [0, 0, 60]   # estimate (not measured): payload centre of gravity, flange frame, mm
+        collision_sensitivity: 3  # 0 = off .. 5 = most sensitive; lab decision: 3 on both arms
       - id: view                  # Perception Arm: wrist RealSense D435 + RØDE NT-USB Mini (outer rail, nearest the operator)
         ip: 192.168.2.219         # control box 2
         base_in_world: {}
         gripper: none
         microphone: true          # RØDE NT-USB Mini ahead of the wrist camera -> twin collision body
+        tcp_load_kg: 0.55         # estimate accepted by the user 2026-09-05 (not weighed): D435i 0.072 + NT-USB Mini ~0.35 + mount
+        tcp_load_cog_mm: [0, 0, 90]   # estimate (not measured): the mic sits ahead of the camera
+        collision_sensitivity: 3  # the box was found at 1 (too low) on 2026-09-04
     # Both wrist cameras are Intel RealSense D435i used as plain UVC colour
     # cameras (kind v4l2, no depth): addressed by USB serial (sysfs lookup)
     # because the /dev/v4l/by-id symlinks collide between the depth and colour

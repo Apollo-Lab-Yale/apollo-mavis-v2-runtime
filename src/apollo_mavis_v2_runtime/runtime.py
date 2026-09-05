@@ -7,11 +7,11 @@ import uuid
 from concurrent.futures import Future
 
 from apollo_mavis_v2_core import Command, CommandResult, HeldState, ProfileStore
-from apollo_mavis_v2_core.protocol import MicrophoneInfo
+from apollo_mavis_v2_core.protocol import ArmMaintenanceResult, MicrophoneInfo
 
 from .bus import RuntimeBus
 from .config import RuntimeConfig
-from .devices.hardware_monitor import HardwareStateMonitor
+from .devices.hardware_monitor import MAINTENANCE_TIMEOUT_S, HardwareStateMonitor
 from .devices.hardware_probe import HardwareProbe
 from .devices.microphone import MicrophoneReader, to_info
 from .devices.tracker import TrackerReader, TrackerSettings
@@ -129,6 +129,23 @@ class Runtime:
     def _hardware_session_active(self) -> bool:
         session = self.manager.session
         return session is not None and session.spec.kind == "hardware"
+
+    # -- arm maintenance routing (REST; phase-09b, 04-runtime §13.1) ----------------------
+    def arm_maintenance(self, arm_id: str, op: str) -> ArmMaintenanceResult:
+        """``POST /api/hardware/arms/{arm_id}/maintenance``: unknown hardware arm ->
+        ``KeyError`` (404); a hardware session owns the boxes -> the session path
+        (``clear_errors`` / ``recover`` = the driver's user recovery,
+        ``apply_backstops`` refused); otherwise the read-only monitor's
+        maintenance queue (``recover`` refused: "no hardware session - use
+        clear_errors"). Refusals raise :class:`MaintenanceUnavailableError` (409).
+        Blocks <= 10 s on the calling (threadpool) thread; the SDK work happens on
+        the driver's / monitor's own thread."""
+        hw = self.cfg.workcell_config("hardware")
+        if hw is None or all(a.id != arm_id for a in hw.arms):
+            raise KeyError(arm_id)
+        if self._hardware_session_active():
+            return self.manager.session_recovery(arm_id, op, timeout_s=MAINTENANCE_TIMEOUT_S)
+        return self.hardware_monitor.maintenance(arm_id, op, timeout_s=MAINTENANCE_TIMEOUT_S)
 
     # -- session-less device discovery (REST; 04-runtime §13.1) -----------------------
     def microphone_infos(self) -> list[MicrophoneInfo]:

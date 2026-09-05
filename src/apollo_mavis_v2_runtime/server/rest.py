@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 from apollo_mavis_v2_core import ProfileError, ProfileNotFoundError, StateProfile
 from apollo_mavis_v2_core.protocol import (
     KEYMAP,
+    ArmMaintenanceRequest,
+    ArmMaintenanceResult,
     KeymapEntry,
     MicrophoneInfo,
     ProfileInfo,
@@ -21,7 +25,9 @@ from pydantic import BaseModel
 import apollo_mavis_v2_runtime
 
 from ..devices.tracker_calibration import CalibrationError
-from ..errors import SessionError, SessionNotFoundError
+from ..errors import MaintenanceUnavailableError, SessionError, SessionNotFoundError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -190,6 +196,37 @@ def post_tracker_calibration(
         return _runtime(request).tracker_calibration.command(cmd)
     except CalibrationError as e:  # illegal transition / precondition
         raise HTTPException(409, str(e)) from None
+
+
+# -- arm maintenance (phase-09b; 04-runtime §13.1 / §15) -----------------------------------
+# Session-less device management rides REST (addendum above). None of the ops
+# produces motion: clear_errors = clean_error + clean_warn (monitor path, no enable);
+# apply_backstops = the ArmConfig safety parameters (monitor path; 409 in a session);
+# recover = the driver's user recovery incl. enable + servo mode + re-seed from the
+# measured position (session path; 409 without one). 200 whether or not ``ok``.
+@router.post("/hardware/arms/{arm_id}/maintenance")
+def post_arm_maintenance(
+    request: Request, arm_id: str, body: ArmMaintenanceRequest
+) -> ArmMaintenanceResult:
+    rt = _runtime(request)
+    who = request.client.host if request.client is not None else "unknown"
+    try:
+        result = rt.arm_maintenance(arm_id, body.op)
+    except KeyError:
+        raise HTTPException(404, f"unknown hardware arm {arm_id!r}") from None
+    except MaintenanceUnavailableError as e:
+        logger.info("maintenance %s on arm %s from %s: refused - %s", body.op, arm_id, who, e)
+        raise HTTPException(409, str(e)) from None
+    logger.info(
+        "maintenance %s on arm %s from %s via %s: %s - %s",
+        body.op,
+        arm_id,
+        who,
+        result.path,
+        "ok" if result.ok else "FAILED",
+        result.detail,
+    )
+    return result
 
 
 __all__ = ["router"]

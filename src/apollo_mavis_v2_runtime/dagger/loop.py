@@ -142,8 +142,8 @@ class GatedPolicyExecutor(ControlLoop):
         self._policy_drove = False
         for arm_id in self.session_arms:
             q_last = self._last_cmd[arm_id]
-            if states[arm_id].error_code != 0:
-                out[arm_id] = None
+            if self.arm_stopped(arm_id, states[arm_id]):
+                out[arm_id] = None  # FAULT / RECOVERING: hold (04-runtime §15)
             elif self.plans.active(arm_id):
                 q = self.plans.step(arm_id, q_last)
                 self._note_source(arm_id, CommandSource.PLANNER)

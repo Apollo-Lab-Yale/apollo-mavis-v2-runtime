@@ -4,6 +4,16 @@ IDLE -> BRINGUP -> START_FROM -> RUNNING -> TEARDOWN -> IDLE (+ FAULT).
 ``create()`` returns after BRINGUP; START_FROM progress rides telemetry.
 Phase-05 implements teleop over the sim workcell; collect/dagger/inference
 and the hardware workcell path return clean 409s until phases 07/08.
+
+FAULT / RECOVERING (phase-09b; 04-runtime §15): the control loop consumes the
+workcell's driver events every tick and reports the aggregate per-arm state
+through ``ControlLoop.on_fault_state`` -> :meth:`SessionManager._on_arm_fault_state`,
+which moves ``session.state`` RUNNING -> FAULT (an arm stopped by a driver
+fault) -> RECOVERING (re-seeded, waiting for the operator to release every
+input) -> RUNNING. Nothing recovers without an operator click:
+:meth:`SessionManager.session_recovery` is the session path of
+``POST /api/hardware/arms/{arm_id}/maintenance`` (``request_recovery`` on the
+hardware workcell, outcome awaited via ``recovery_result``).
 """
 
 from __future__ import annotations
@@ -23,14 +33,14 @@ from apollo_mavis_v2_core import (
     ProfileStore,
     WorkcellConfig,
 )
-from apollo_mavis_v2_core.protocol import SessionInfo, SessionSpec
+from apollo_mavis_v2_core.protocol import ArmMaintenanceResult, SessionInfo, SessionSpec
 
 from ..config import RuntimeConfig
-from ..control.loop import DEFAULT_ACTIVE_ARM, ControlLoop
+from ..control.loop import DEFAULT_ACTIVE_ARM, ControlLoop, controller_error_title
 from ..control.pose_filter import PoseFilterConfig
 from ..control.tracker_teleop import TrackerTeleop
 from ..devices.tracker import TrackerSettings
-from ..errors import SessionError, SessionNotFoundError
+from ..errors import MaintenanceUnavailableError, SessionError, SessionNotFoundError
 from ..safety.gate import NullGate, SafetyGate
 from ..safety.supervisor import SafetySupervisor
 from ..safety.watchdog import ArmReportWatchdog, InputWatchdog
@@ -44,6 +54,9 @@ if TYPE_CHECKING:
     from ..streams.twin_overlay import TwinOverlayRenderer
 
 logger = logging.getLogger(__name__)
+
+RECOVERY_WAIT_S = 10.0  # session path: wait this long for the driver's RecoveryResult
+RECOVERY_POLL_S = 0.02
 
 
 def _microphone_overrides(wc: WorkcellConfig, scene_id: str | None = None):
@@ -367,6 +380,7 @@ class SessionManager:
             recorder_thread=recorder_thread,
             policy_session=policy_session,
         )
+        self.attach_fault_state(session)
         fps = self.cfg.video.session_fps
         for cam_id, cam in workcell.cameras.items():
             self.hub.add_stream(cam_id, cam, fps)
@@ -671,8 +685,11 @@ class SessionManager:
     def _start_from_worker(self, session: ActiveSession) -> None:
         try:
             if not session.spec.start_from.startswith("profile:"):
-                session.state = SessionState.RUNNING  # keep_current: no motion
+                if session.state is SessionState.BRINGUP:  # a fault may already hold it
+                    session.state = SessionState.RUNNING  # keep_current: no motion
                 return
+            if session.state is not SessionState.BRINGUP:
+                return  # faulted during bring-up: no start_from motion
             session.state = SessionState.START_FROM
             session.start_from_progress = 0.0
             pid = session.spec.start_from.split(":", 1)[1]
@@ -701,7 +718,8 @@ class SessionManager:
                 logger.error("start_from plan failed: %s %s", result.failure,
                              result.failing_pair)
                 session.fault_detail = f"start_from plan failed: {result.failure}"
-                session.state = SessionState.RUNNING  # arms stay held; operator decides
+                if session.state is SessionState.START_FROM:
+                    session.state = SessionState.RUNNING  # arms stay held; operator decides
                 session.start_from_progress = None
                 self.bus.commands.submit(Command(
                     op="_plan_ready",
@@ -728,11 +746,144 @@ class SessionManager:
                     break
                 time.sleep(0.05)
             session.start_from_progress = None
-            session.state = SessionState.RUNNING
+            if session.state is SessionState.START_FROM:  # a driver fault may own it now
+                session.state = SessionState.RUNNING
         except Exception as e:
             logger.exception("start_from worker failed")
             session.fault_detail = repr(e)
             session.state = SessionState.FAULT
+
+    # -- driver faults: FAULT -> RECOVERING -> RUNNING (phase-09b; 04-runtime §15) -----------
+    def attach_fault_state(self, session: ActiveSession) -> None:
+        """Wire ``session.loop.on_fault_state`` to this session's state (also the
+        seam tests use to install a hand-built session)."""
+        session.loop.on_fault_state = lambda state, s=session: self._on_arm_fault_state(s, state)
+
+    def _on_arm_fault_state(self, session: ActiveSession, state: str | None) -> None:
+        """Control-loop callback (loop thread): the aggregate per-arm fault state
+        changed. ``"fault"`` -> FAULT (an arm was stopped by a driver fault;
+        siblings keep running in the loop), ``"recovering"`` -> RECOVERING (the
+        arm was re-seeded from the measured position and waits for the operator
+        to release every input), ``None`` -> back to RUNNING. TEARDOWN is never
+        overridden; BRINGUP / START_FROM give way to a fault (the start_from
+        worker checks before it writes RUNNING)."""
+        if self.session is not session:
+            return
+        current = session.state
+        if current is SessionState.TEARDOWN:
+            return
+        if state == "fault":
+            if current in (
+                SessionState.BRINGUP,
+                SessionState.START_FROM,
+                SessionState.RUNNING,
+                SessionState.RECOVERING,
+            ):
+                session.start_from_progress = None
+                session.state = SessionState.FAULT
+                faults = session.loop._arm_fault_details(time.monotonic())
+                stopped = session.loop.faulted_arms
+                session.fault_detail = "; ".join(
+                    f"{arm}: {text}" for arm, text in faults.items() if arm in stopped
+                )
+                logger.warning("session %s FAULT: %s", session.session_id, session.fault_detail)
+        elif state == "recovering":
+            if current in (
+                SessionState.BRINGUP,
+                SessionState.START_FROM,
+                SessionState.RUNNING,
+                SessionState.FAULT,
+            ):
+                session.start_from_progress = None
+                session.state = SessionState.RECOVERING
+                logger.info("session %s RECOVERING (release every input to resume)",
+                            session.session_id)
+        elif state is None:
+            if current in (SessionState.FAULT, SessionState.RECOVERING):
+                session.state = SessionState.RUNNING
+                session.fault_detail = ""
+                logger.info("session %s RUNNING again", session.session_id)
+
+    def session_recovery(
+        self, arm_id: str, op: str, timeout_s: float = RECOVERY_WAIT_S
+    ) -> ArmMaintenanceResult:
+        """Session path of ``POST /api/hardware/arms/{arm_id}/maintenance``
+        (04-runtime §13.1): inside a hardware session ``clear_errors`` and
+        ``recover`` both run the driver's user-initiated recovery on ITS monitor
+        thread (``workcell.request_recovery(arm_id)``: clean errors -> enable ->
+        servo mode -> ready -> re-seed from the MEASURED position; no motion) and
+        wait <= ``timeout_s`` for the outcome via ``workcell.recovery_result``
+        (the loop consumes the events themselves: FaultEvent -> ReseedEvent ->
+        RecoveredEvent, or a latch FaultEvent). ``apply_backstops`` is refused
+        (409) - the driver applied the volatile settings at connect. Returns
+        ``path="session"``; ``before`` / ``after`` are ``None`` (no monitor
+        sample while the session owns the box)."""
+        session = self.session
+        if session is None or session.spec.kind != "hardware":
+            raise MaintenanceUnavailableError("no hardware session")
+        if op == "apply_backstops":
+            raise MaintenanceUnavailableError(
+                "apply_backstops is not available while a hardware session owns the arm "
+                "(the driver applied the safety settings at connect; end the session first)"
+            )
+        if op not in ("clear_errors", "recover"):
+            raise ValueError(f"unknown maintenance op {op!r}")
+        if arm_id not in session.spec.arms:
+            raise MaintenanceUnavailableError(f"arm {arm_id!r} is not part of the session")
+        workcell = session.workcell
+        request = getattr(workcell, "request_recovery", None)
+        result_of = getattr(workcell, "recovery_result", None)
+        if request is None or result_of is None:
+            raise MaintenanceUnavailableError("the session workcell has no recovery channel")
+        previous = result_of(arm_id)
+        seq0 = int(getattr(previous, "seq", 0) or 0) if previous is not None else 0
+        try:
+            request(arm_id)
+        except KeyError:
+            raise MaintenanceUnavailableError(f"unknown arm {arm_id!r}") from None
+        except Exception as e:  # noqa: BLE001 - CommandError: driver not connected / no channel
+            raise MaintenanceUnavailableError(f"{arm_id}: {e}") from e
+        deadline = time.monotonic() + float(timeout_s)
+        res = None
+        while time.monotonic() < deadline:
+            res = result_of(arm_id)
+            # The driver bumps ``seq`` for its own auto recoveries too: an auto
+            # sequence already running when we asked completes first, so wait for
+            # the result that is ours (``user_initiated``), not merely a newer one.
+            if (
+                res is not None
+                and int(getattr(res, "seq", 0) or 0) > seq0
+                and bool(getattr(res, "user_initiated", False))
+            ):
+                break
+            time.sleep(RECOVERY_POLL_S)
+        else:
+            return ArmMaintenanceResult(
+                arm_id=arm_id,
+                op=op,  # type: ignore[arg-type]
+                path="session",
+                ok=False,
+                detail=(
+                    f"{op} timed out after {float(timeout_s):g} s "
+                    "(no recovery result from the driver)"
+                ),
+            )
+        code = int(getattr(res, "error_code", 0) or 0)
+        title = controller_error_title(code)
+        if res.ok:
+            detail = (
+                f"recovered from {title}" if title else "re-seeded from the measured position"
+            )
+        else:
+            reason = str(getattr(res, "detail", "") or "recovery failed")
+            detail = f"{title} - {reason}" if title else reason
+        return ArmMaintenanceResult(
+            arm_id=arm_id,
+            op=op,  # type: ignore[arg-type]
+            path="session",
+            ok=bool(res.ok),
+            detail=detail,
+        )
 
     # -- teardown -------------------------------------------------------------------
     def teardown(self) -> None:

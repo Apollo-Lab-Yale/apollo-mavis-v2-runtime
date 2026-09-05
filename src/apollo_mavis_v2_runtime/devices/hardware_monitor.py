@@ -22,6 +22,24 @@ synchronous seams a hardware bring-up (phase-09) calls around its connect.
 Without the ``[hardware]`` extra (or with ``enabled: false``) the monitor is
 inert: ``enabled`` is False, every arm reports status ``off`` with a
 ``detail`` that says why, and ``telemetry()`` still returns a valid block.
+
+**Maintenance channel (phase-09b; 04-runtime §13.1 / §15).** The zero-write
+guarantee becomes "zero writes unless an explicit maintenance request":
+:meth:`HardwareStateMonitor.maintenance` forwards the operator's
+``clear_errors`` / ``apply_backstops`` to the arm's ``ArmStateMonitor``, which
+queues it for ITS poll thread (one ``XArmAPI`` is never driven from two
+threads; this thread only waits), and returns the core
+``ArmMaintenanceResult`` with ``path="monitor"``. ``apply_backstops`` writes
+the arm's ``ArmConfig`` safety parameters through the hardware package's own
+``ArmConfig -> XArmDriverConfig`` mapping, so the UI button and the driver's
+connect-time ``apply_backstops`` send identical values. Every slow poll the
+monitor reads the controller's CURRENT ``collision_sensitivity`` / ``tcp_load``
+back; :func:`backstops_match` compares them with the config (sensitivity
+equal, |d load| <= 0.05 kg, |d cog| <= 10 mm) for ``ArmMonitorTelemetry`` and
+the ``before`` / ``after`` rows of a result. ``recover`` (enable + servo mode)
+needs a session driver and is refused here (409: "no hardware session - use
+clear_errors"); so is any op while the monitor is off / paused / not connected
+or another op is still running on that arm (:class:`MaintenanceUnavailableError`).
 """
 
 from __future__ import annotations
@@ -32,15 +50,27 @@ import time
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from apollo_mavis_v2_core import WorkcellConfig
-from apollo_mavis_v2_core.protocol import ArmMonitorTelemetry, HardwareMonitorTelemetry
+from apollo_mavis_v2_core import ArmConfig, WorkcellConfig
+from apollo_mavis_v2_core.protocol import (
+    ArmMaintenanceResult,
+    ArmMonitorTelemetry,
+    HardwareMonitorTelemetry,
+)
 
 from ..config import HardwareMonitorConfig
+from ..errors import MaintenanceUnavailableError
 
 logger = logging.getLogger(__name__)
 
 CHECK_PERIOD_S = 0.5  # paused() is polled this often
 STOP_JOIN_TIMEOUT_S = 5.0
+# phase-09b: backstops_match tolerances (contract; the hardware monitor's own settle
+# check uses the same 0.05 kg) and the REST wait budget for one maintenance op.
+TCP_LOAD_MATCH_KG = 0.05
+TCP_COG_MATCH_MM = 10.0
+MAINTENANCE_TIMEOUT_S = 10.0
+MAINTENANCE_OPS: tuple[str, ...] = ("clear_errors", "apply_backstops", "recover")
+CONNECTED_STATUSES: frozenset[str] = frozenset({"running", "stale"})  # a maintenance op may run
 
 
 class ArmMonitorLike(Protocol):
@@ -57,6 +87,13 @@ class ArmMonitorLike(Protocol):
 
     def snapshot(self) -> Any: ...  # ArmMonitorSample | None
 
+    def maintenance(
+        self, op: str, driver_cfg: Any = None, timeout_s: float = 10.0
+    ) -> Any: ...  # MaintenanceOutcome (phase-09b)
+
+    @property
+    def maintenance_busy(self) -> bool: ...
+
     @property
     def status(self) -> str: ...
 
@@ -70,6 +107,9 @@ class ArmMonitorLike(Protocol):
 MonitorFactory = Callable[..., ArmMonitorLike]
 """``factory(arm_id, ip, *, gripper, expect_rail, poll_hz, stale_s, reconnect_s)``."""
 
+DriverConfigFactory = Callable[[ArmConfig], Any]
+"""``ArmConfig -> XArmDriverConfig`` (the hardware package's ``workcell._driver_cfg``)."""
+
 
 def default_monitor_factory() -> MonitorFactory:
     """The hardware package's ``ArmStateMonitor`` (raises ``ImportError`` without
@@ -79,13 +119,67 @@ def default_monitor_factory() -> MonitorFactory:
     return ArmStateMonitor
 
 
+def default_driver_cfg_factory() -> DriverConfigFactory:
+    """The hardware package's ``ArmConfig -> XArmDriverConfig`` mapping — the ONE
+    place the controller-side backstop parameters (tcp_load, collision
+    sensitivity, reduced-mode boundary, expected SN) are translated, so the UI's
+    ``apply_backstops`` and the driver's connect-time call write the same values
+    (02-hardware §6). Raises ``ImportError`` without the ``[hardware]`` extra."""
+    from apollo_mavis_v2_hardware.workcell import _driver_cfg  # [hardware] extra
+
+    return _driver_cfg
+
+
+def backstops_match(sample: Any, arm: ArmConfig) -> bool | None:
+    """Controller read-back == ``ArmConfig`` backstops (contract tolerances):
+    sensitivity equal, ``|d tcp_load| <= 0.05 kg`` and every centre-of-gravity
+    component within 10 mm. ``None`` when the sample carries no read-back yet
+    (older sample shape, or the monitor never read the rich report frame)."""
+    if sample is None:
+        return None
+    sens = getattr(sample, "collision_sensitivity", None)
+    kg = getattr(sample, "tcp_load_kg", None)
+    if sens is None or kg is None:
+        return None
+    if int(sens) != int(arm.collision_sensitivity):
+        return False
+    eps = 1e-9  # the tolerances are inclusive; keep 0.95 + 0.05 vs 1.0 from flipping on rounding
+    if abs(float(kg) - float(arm.tcp_load_kg)) > TCP_LOAD_MATCH_KG + eps:
+        return False
+    cog = tuple(getattr(sample, "tcp_load_cog_mm", ()) or ())
+    if len(cog) != 3:
+        return False
+    return all(
+        abs(float(a) - float(b)) <= TCP_COG_MATCH_MM + eps
+        for a, b in zip(cog, arm.tcp_load_cog_mm, strict=True)
+    )
+
+
 def sample_to_telemetry(
-    arm_id: str, status: str, detail: str, age_s: float | None, sample: Any
+    arm_id: str,
+    status: str,
+    detail: str,
+    age_s: float | None,
+    sample: Any,
+    *,
+    backstops_match: bool | None = None,
+    maintenance_busy: bool = False,
 ) -> ArmMonitorTelemetry:
     """Core ``ArmMonitorTelemetry`` from a monitor's status + its last
-    ``ArmMonitorSample`` (``None`` -> data fields at their defaults)."""
+    ``ArmMonitorSample`` (``None`` -> data fields at their defaults). The
+    phase-09b read-backs are read duck-typed (absent on an older sample ->
+    their defaults); ``backstops_match`` / ``maintenance_busy`` are the
+    runtime's (:func:`backstops_match`, the monitor's busy flag)."""
     if sample is None:
-        return ArmMonitorTelemetry(arm_id=arm_id, status=status, detail=detail, age_s=age_s)
+        return ArmMonitorTelemetry(
+            arm_id=arm_id,
+            status=status,
+            detail=detail,
+            age_s=age_s,
+            maintenance_busy=maintenance_busy,
+        )
+    sens = getattr(sample, "collision_sensitivity", None)
+    kg = getattr(sample, "tcp_load_kg", None)
     return ArmMonitorTelemetry(
         arm_id=arm_id,
         status=status,
@@ -105,6 +199,11 @@ def sample_to_telemetry(
         warn_code=int(sample.warn_code),
         state=sample.state,
         mode=sample.mode,
+        collision_sensitivity=None if sens is None else int(sens),
+        tcp_load_kg=None if kg is None else float(kg),
+        tcp_load_cog_mm=[float(v) for v in (getattr(sample, "tcp_load_cog_mm", ()) or ())],
+        backstops_match=backstops_match,
+        maintenance_busy=maintenance_busy,
     )
 
 
@@ -125,6 +224,7 @@ class HardwareStateMonitor:
         paused: Callable[[], bool] | None = None,
         *,
         monitor_factory: MonitorFactory | None = None,
+        driver_cfg_factory: DriverConfigFactory | None = None,
         check_period_s: float = CHECK_PERIOD_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -132,10 +232,19 @@ class HardwareStateMonitor:
         self.workcell = workcell
         self.paused_fn = paused or (lambda: False)
         self._factory = monitor_factory
+        self._driver_cfg_factory = driver_cfg_factory  # None = the hardware package's mapping
         self.check_period_s = float(check_period_s)
         self._clock = clock
         self.arm_ids: list[str] = [a.id for a in workcell.arms] if workcell is not None else []
+        self._arm_cfgs: dict[str, ArmConfig] = (
+            {a.id: a for a in workcell.arms} if workcell is not None else {}
+        )
         self._monitors: dict[str, ArmMonitorLike] = {}
+        # phase-09b: one maintenance op at a time per arm (a second concurrent
+        # request is refused with 409 semantics instead of queueing behind the first)
+        self._maintenance_locks: dict[str, threading.Lock] = {
+            arm_id: threading.Lock() for arm_id in self.arm_ids
+        }
         self._disabled_detail = ""  # why the monitor is inert ("" = it is not)
         self._paused = False
         self._lock = threading.Lock()
@@ -199,7 +308,15 @@ class HardwareStateMonitor:
 
     @property
     def paused(self) -> bool:
-        """Last applied hand-over state (connections released)."""
+        """Hand-over state: ``True`` while a hardware session owns the boxes.
+
+        Enabled: the last state the supervisor APPLIED (connections released).
+        Inert (``enabled: false`` / no hardware package): nothing to release, so
+        the flag follows the predicate directly - the UI reads
+        ``telemetry.hardware_monitor.paused`` as "a hardware session exists"
+        (05-ui §8.2) and must not lose that signal with the monitor switched off."""
+        if not self.enabled:
+            return self._safe_paused()
         with self._lock:
             return self._paused
 
@@ -309,18 +426,26 @@ class HardwareStateMonitor:
         sample = mon.snapshot() if mon is not None else None
         return int(sample.error_code) if sample is not None else 0
 
+    def maintenance_busy(self, arm_id: str) -> bool:
+        """A maintenance op is queued / executing on this arm's monitor (phase-09b)."""
+        mon = self._monitors.get(arm_id)
+        return bool(getattr(mon, "maintenance_busy", False)) if mon is not None else False
+
     def arm_telemetry(self) -> list[ArmMonitorTelemetry]:
         rows: list[ArmMonitorTelemetry] = []
         for arm_id in self.arm_ids:
             mon = self._monitors.get(arm_id)
             status, detail = self.status_of(arm_id)
+            sample = mon.snapshot() if mon is not None else None
             rows.append(
                 sample_to_telemetry(
                     arm_id,
                     status,
                     detail,
                     mon.age_s if mon is not None else None,
-                    mon.snapshot() if mon is not None else None,
+                    sample,
+                    backstops_match=backstops_match(sample, self._arm_cfgs[arm_id]),
+                    maintenance_busy=self.maintenance_busy(arm_id),
                 )
             )
         return rows
@@ -332,11 +457,109 @@ class HardwareStateMonitor:
             enabled=self.enabled, paused=self.paused, arms=self.arm_telemetry()
         )
 
+    # -- maintenance channel (phase-09b; 04-runtime §13.1 monitor path) -----------------
+    def maintenance(
+        self, arm_id: str, op: str, timeout_s: float = MAINTENANCE_TIMEOUT_S
+    ) -> ArmMaintenanceResult:
+        """Run one operator-triggered maintenance op on ``arm_id``'s READ-ONLY
+        monitor (``path="monitor"``) and wait for its outcome (<= ``timeout_s``).
+
+        ``clear_errors`` = ``clean_error`` + ``clean_warn`` (never
+        ``motion_enable``); ``apply_backstops`` = ``backstops.apply_backstops``
+        with the arm's ``ArmConfig`` mapped through the hardware package's
+        ``XArmDriverConfig`` mapping. Both execute on the arm monitor's poll
+        thread; this thread only waits. Refusals (HTTP 409 semantics,
+        :class:`MaintenanceUnavailableError`): ``recover`` (needs a hardware
+        session), monitor inert / not started / ``off`` / ``paused`` /
+        ``connecting`` / ``error`` (the box is not connected), or an op already
+        running on that arm. Unknown ``arm_id`` -> ``KeyError`` (404), unknown
+        ``op`` -> ``ValueError`` (422 is FastAPI's job upstream). The result's
+        ``before`` / ``after`` rows carry :func:`backstops_match` against the
+        config; 200 whether or not ``ok``.
+        """
+        if op not in MAINTENANCE_OPS:
+            raise ValueError(f"unknown maintenance op {op!r}; expected one of {MAINTENANCE_OPS}")
+        arm = self._arm_cfgs.get(arm_id)
+        if arm is None:
+            raise KeyError(arm_id)
+        if op == "recover":
+            raise MaintenanceUnavailableError("no hardware session - use clear_errors")
+        mon = self._monitors.get(arm_id)
+        status, detail = self.status_of(arm_id)
+        if mon is None or not self._started or status not in CONNECTED_STATUSES:
+            why = f"monitor {status}" + (f": {detail}" if detail else "")
+            raise MaintenanceUnavailableError(
+                f"{op} needs the read-only monitor connected to {arm_id!r} ({why})"
+            )
+        lock = self._maintenance_locks[arm_id]
+        if not lock.acquire(blocking=False):
+            raise MaintenanceUnavailableError(f"a maintenance op is already running on {arm_id!r}")
+        try:
+            if self.maintenance_busy(arm_id):
+                raise MaintenanceUnavailableError(
+                    f"a maintenance op is already running on {arm_id!r}"
+                )
+            driver_cfg = self._driver_cfg(arm)
+            outcome = mon.maintenance(op, driver_cfg, timeout_s=float(timeout_s))
+        finally:
+            lock.release()
+        return self._result(arm, mon, op, outcome)
+
+    def _driver_cfg(self, arm: ArmConfig) -> Any:
+        try:
+            factory = self._driver_cfg_factory or default_driver_cfg_factory()
+        except Exception as e:  # noqa: BLE001 - [hardware] extra absent or broken
+            raise MaintenanceUnavailableError(
+                f"hardware package not importable ({type(e).__name__}: {e}); "
+                "install the [hardware] extra"
+            ) from e
+        return factory(arm)
+
+    def _result(
+        self, arm: ArmConfig, mon: ArmMonitorLike, op: str, outcome: Any
+    ) -> ArmMaintenanceResult:
+        """Hardware ``MaintenanceOutcome`` -> core ``ArmMaintenanceResult`` (monitor path)."""
+        status, detail = self.status_of(arm.id)
+
+        def row(sample: Any) -> ArmMonitorTelemetry | None:
+            if sample is None:
+                return None
+            age = max(0.0, self._clock() - float(getattr(sample, "t_mono", self._clock())))
+            return sample_to_telemetry(
+                arm.id,
+                status,
+                detail,
+                age,
+                sample,
+                backstops_match=backstops_match(sample, arm),
+                maintenance_busy=False,
+            )
+
+        return ArmMaintenanceResult(
+            arm_id=arm.id,
+            op=str(getattr(outcome, "op", op)),  # type: ignore[arg-type]
+            path="monitor",
+            ok=bool(outcome.ok),
+            detail=str(getattr(outcome, "detail", "") or ""),
+            sdk_codes={str(k): int(v) for k, v in dict(getattr(outcome, "sdk_codes", {})).items()},
+            warnings=[str(w) for w in (getattr(outcome, "warnings", ()) or ())],
+            before=row(getattr(outcome, "before", None)),
+            after=row(getattr(outcome, "after", None)),
+        )
+
 
 __all__ = [
     "ArmMonitorLike",
+    "CONNECTED_STATUSES",
+    "DriverConfigFactory",
     "HardwareStateMonitor",
+    "MAINTENANCE_OPS",
+    "MAINTENANCE_TIMEOUT_S",
     "MonitorFactory",
+    "TCP_COG_MATCH_MM",
+    "TCP_LOAD_MATCH_KG",
+    "backstops_match",
+    "default_driver_cfg_factory",
     "default_monitor_factory",
     "sample_to_telemetry",
 ]

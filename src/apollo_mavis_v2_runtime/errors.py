@@ -21,9 +21,17 @@ class SessionNotFoundError(RuntimeError_):
     """No active session; maps to HTTP 404."""
 
 
+class MaintenanceUnavailableError(RuntimeError_):
+    """An arm maintenance op (phase-09b) cannot run on the current path: the
+    monitor is off / paused / not connected, the op is not available inside
+    or outside a hardware session, or another op is busy on that arm; maps to
+    HTTP 409."""
+
+
 __all__ = [
     "RuntimeError_",
     "SafetyConfigError",
     "SessionError",
     "SessionNotFoundError",
+    "MaintenanceUnavailableError",
 ]

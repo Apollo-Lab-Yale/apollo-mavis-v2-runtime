@@ -244,3 +244,165 @@ def test_fake_monitor_surface_matches_protocol():
     fake = FakeArmMonitor("grip", "1.2.3.4")
     for name in ("start", "stop", "disconnect", "snapshot", "status", "detail", "age_s"):
         assert hasattr(fake, name)
+
+
+# -- phase-09b: safety read-backs, backstops_match, maintenance channel ----------------------------
+def test_backstops_match_tolerances():
+    from apollo_mavis_v2_runtime.devices.hardware_monitor import (
+        TCP_COG_MATCH_MM,
+        TCP_LOAD_MATCH_KG,
+        backstops_match,
+    )
+
+    grip = HW.arms[0].model_copy(update={
+        "tcp_load_kg": 0.95, "tcp_load_cog_mm": (0.0, 0.0, 60.0), "collision_sensitivity": 3,
+    })
+    assert (TCP_LOAD_MATCH_KG, TCP_COG_MATCH_MM) == (0.05, 10.0)
+    assert backstops_match(None, grip) is None
+    assert backstops_match(FakeMonitorSample("grip"), grip) is None  # nothing read back yet
+    ok = FakeMonitorSample(
+        "grip", collision_sensitivity=3, tcp_load_kg=0.95, tcp_load_cog_mm=(0.0, 0.0, 60.0)
+    )
+    assert backstops_match(ok, grip) is True
+    from dataclasses import replace
+
+    assert backstops_match(replace(ok, tcp_load_kg=0.95 + 0.05), grip) is True  # at tolerance
+    assert backstops_match(replace(ok, tcp_load_kg=0.95 + 0.0501), grip) is False
+    assert backstops_match(replace(ok, tcp_load_cog_mm=(10.0, 0.0, 50.0)), grip) is True
+    assert backstops_match(replace(ok, tcp_load_cog_mm=(0.0, 0.0, 49.9)), grip) is False
+    assert backstops_match(replace(ok, collision_sensitivity=4), grip) is False
+    assert backstops_match(replace(ok, tcp_load_cog_mm=()), grip) is False  # cog unreadable
+    assert backstops_match(replace(ok, collision_sensitivity=None), grip) is None
+    # The lab as found (2026-09-04): 0 kg / sensitivity 1 on the Perception Arm.
+    view = HW.arms[1].model_copy(update={"tcp_load_kg": 0.55, "tcp_load_cog_mm": (0.0, 0.0, 90.0)})
+    found = FakeMonitorSample(
+        "view", collision_sensitivity=1, tcp_load_kg=0.0, tcp_load_cog_mm=(0.0, 0.0, 0.0)
+    )
+    assert backstops_match(found, view) is False
+
+
+def test_telemetry_rows_carry_read_backs_match_and_busy():
+    now = time.monotonic()
+    cfg = HW.model_copy(update={"arms": [
+        HW.arms[0].model_copy(update={"tcp_load_kg": 0.95, "tcp_load_cog_mm": (0.0, 0.0, 60.0)}),
+        HW.arms[1],
+    ]})
+    samples = {
+        "grip": FakeMonitorSample(
+            "grip", seq=2, t_mono=now, collision_sensitivity=3, tcp_load_kg=0.97,
+            tcp_load_cog_mm=(1.0, -2.0, 65.0),
+        ),
+        "view": FakeMonitorSample("view", seq=1, t_mono=now),  # rich frame not read yet
+    }
+    factory = FakeMonitorFactory(samples)
+    mon = HardwareStateMonitor(HardwareMonitorConfig(), cfg, monitor_factory=factory)
+    mon.start()
+    try:
+        grip, view = mon.telemetry().arms
+        assert (grip.collision_sensitivity, grip.tcp_load_kg) == (3, 0.97)
+        assert grip.tcp_load_cog_mm == [1.0, -2.0, 65.0]
+        assert grip.backstops_match is True and grip.maintenance_busy is False
+        assert view.collision_sensitivity is None and view.tcp_load_kg is None
+        assert view.tcp_load_cog_mm == [] and view.backstops_match is None
+        factory.monitors["view"].maintenance_busy = True
+        assert mon.telemetry().arms[1].maintenance_busy is True
+        assert mon.maintenance_busy("view") is True and mon.maintenance_busy("nope") is False
+        # a row without a sample keeps the defaults but still reports the busy flag
+        row = sample_to_telemetry("grip", "connecting", "", None, None, maintenance_busy=True)
+        assert row.backstops_match is None and row.maintenance_busy is True
+    finally:
+        mon.stop()
+
+
+def test_inert_monitor_reports_the_hand_over_flag_from_the_predicate():
+    """``telemetry.hardware_monitor.paused`` is the UI's only "a hardware session
+    exists" signal (05-ui §8.2): with the monitor switched off (or the hardware
+    package missing) nothing is released, but the flag must still follow the
+    runtime's predicate - otherwise the Cockpit loses its recover button."""
+    paused = {"on": False}
+    off = HardwareStateMonitor(
+        HardwareMonitorConfig(enabled=False), HW, paused=lambda: paused["on"]
+    )
+    off.start()  # no-op while inert
+    assert off._thread is None and off.paused is False
+    assert off.telemetry().paused is False
+    paused["on"] = True  # a hardware session owns the boxes
+    assert off.paused is True and off.telemetry().paused is True  # immediate, no supervisor
+    assert off.telemetry().enabled is False
+    paused["on"] = False
+    assert off.telemetry().paused is False
+
+    def bad():
+        raise RuntimeError("predicate exploded")
+
+    broken = HardwareStateMonitor(HardwareMonitorConfig(enabled=False), HW, paused=bad)
+    assert broken.paused is False  # predicate errors never poison the flag
+
+    # Enabled: the flag is the APPLIED state (the supervisor's disconnect walk), unchanged.
+    factory = FakeMonitorFactory()
+    live = HardwareStateMonitor(
+        HardwareMonitorConfig(), HW, paused=lambda: paused["on"], monitor_factory=factory,
+        check_period_s=0.02,
+    )
+    assert live.paused is False
+    paused["on"] = True
+    assert live.paused is False  # nothing applied before start()
+    live.start()
+    try:
+        assert live.paused is True  # start() applies the predicate synchronously
+        assert factory.monitors["grip"].calls == ["disconnect"]
+    finally:
+        live.stop()
+        paused["on"] = False
+
+
+def test_maintenance_refusals_on_the_runtime_monitor():
+    import pytest
+
+    from apollo_mavis_v2_runtime.devices.hardware_monitor import MAINTENANCE_OPS
+    from apollo_mavis_v2_runtime.errors import MaintenanceUnavailableError
+
+    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover")
+    factory = FakeMonitorFactory()
+    mon = HardwareStateMonitor(HardwareMonitorConfig(), HW, monitor_factory=factory)
+    with pytest.raises(KeyError):
+        mon.maintenance("arm9", "clear_errors")
+    with pytest.raises(ValueError):
+        mon.maintenance("grip", "home_rail")
+    with pytest.raises(MaintenanceUnavailableError, match="no hardware session - use clear_errors"):
+        mon.maintenance("grip", "recover")
+    with pytest.raises(MaintenanceUnavailableError, match="monitor off"):
+        mon.maintenance("grip", "clear_errors")  # not started
+    mon.start()
+    try:
+        grip = factory.monitors["grip"]
+        grip.disconnect()  # paused (hand-over)
+        with pytest.raises(MaintenanceUnavailableError, match="monitor paused"):
+            mon.maintenance("grip", "clear_errors")
+        grip.start()
+        grip.forced_status = "connecting"
+        with pytest.raises(MaintenanceUnavailableError, match="monitor connecting"):
+            mon.maintenance("grip", "apply_backstops")
+        grip.forced_status = "stale"  # connected, slow sample: the op may run
+        res = mon.maintenance("grip", "clear_errors")
+        assert res.ok and res.path == "monitor" and list(res.sdk_codes) == [
+            "clean_error", "clean_warn",
+        ]
+        assert res.before is None and res.after is None  # never sampled
+        grip.forced_status = None
+        grip.maintenance_busy = True
+        with pytest.raises(MaintenanceUnavailableError, match="already running"):
+            mon.maintenance("grip", "clear_errors")
+        grip.maintenance_busy = False
+        assert grip.maintenance_calls[-1][0] == "clear_errors"
+    finally:
+        mon.stop()
+
+    # Inert monitor (no hardware workcell): every op is 409, never a crash.
+    none = HardwareStateMonitor(HardwareMonitorConfig(), None)
+    with pytest.raises(KeyError):
+        none.maintenance("grip", "clear_errors")
+    off = HardwareStateMonitor(HardwareMonitorConfig(enabled=False), HW)
+    off.start()
+    with pytest.raises(MaintenanceUnavailableError, match="monitor off"):
+        off.maintenance("grip", "clear_errors")

@@ -51,10 +51,37 @@ RAIL_TRAVEL_M = se3.RAIL_TRAVEL_M
 GRIPPER_SEND_EVERY_N_TICKS = 10  # <= 10 Hz (modbus is slow)
 PLAN_STATUS_LINGER_TICKS = 100  # keep "done"/"failed" visible ~1 s
 DEVICE_ACTION_LINGER_S = 1.0  # telemetry shows the last device-sourced discrete action this long
+# Driver events (hardware ``events.py``) the loop consumes from ``workcell.drain_events()``
+# every tick (04-runtime §15; phase-09b), dispatched by CLASS NAME so the runtime never
+# imports the optional hardware package: FaultEvent -> the arm stops (sender paused, held),
+# ReseedEvent / RecoveredEvent -> re-seed from measured + RECOVERING until every live
+# input is released, StudioConflictWarning -> a lingering telemetry warning.
+FAULT_EVENT_NAMES: frozenset[str] = frozenset(
+    {"FaultEvent", "RecoveredEvent", "ReseedEvent", "StudioConflictWarning"}
+)
+STUDIO_WARNING_LINGER_S = 5.0  # a StudioConflictWarning stays in arms[*].fault_detail this long
+STUDIO_WARNING_DEFAULT = "close UFACTORY Studio live control"
 # The Manipulation Arm (arm id ``grip``: xArm Gripper G2 + wrist camera) is the
 # default teleop arm on every workcell, hardware and sim (user decision
 # 2026-09-04); the Perception Arm (``view``) is reached with Tab / switch_arm.
 DEFAULT_ACTIVE_ARM = "grip"
+
+
+def controller_error_title(code: int) -> str:
+    """``"controller error 24: Speed Exceeds Limit"`` from the SDK's ``x_code``
+    table via the hardware package (the runtime never imports ``xarm`` itself);
+    ``"controller error <code>"`` without the ``[hardware]`` extra; ``""`` for 0."""
+    code = int(code)
+    if code == 0:
+        return ""
+    try:
+        from apollo_mavis_v2_hardware import controller_error_title as _title  # [hardware]
+    except Exception:  # noqa: BLE001 - optional extra
+        return f"controller error {code}"
+    try:
+        return _title(code) or f"controller error {code}"
+    except Exception:  # noqa: BLE001 - table lookup is best-effort
+        return f"controller error {code}"
 
 
 def default_active_arm(arms: Sequence[str]) -> str | None:
@@ -163,6 +190,21 @@ class ControlLoop:
         self._plan_clear_at: dict[str, int] = {}
         self._plan_status: str | None = None  # session-level lifecycle string
         self._plan_status_clear_at: int | None = None
+        # Driver fault plumbing (phase-09b; 04-runtime §15). ``_faulted``: arms a
+        # FaultEvent stopped (sender paused, held, nothing published); ``_recovering``:
+        # arms re-seeded by a ReseedEvent / RecoveredEvent that stay held until every
+        # live input is released (clutch re-grip / empty held set); ``_fault_text``:
+        # telemetry ``fault_detail`` per arm, kept through RECOVERING, cleared on
+        # RUNNING; ``_warnings``: lingering StudioConflictWarning text per arm.
+        self._faulted: set[str] = set()
+        self._recovering: set[str] = set()
+        self._fault_text: dict[str, str] = {}
+        self._warnings: dict[str, tuple[str, float]] = {}  # arm -> (text, show until)
+        self._fault_state_reported: str | None = None
+        self.on_fault_state: Callable[[str | None], None] | None = None
+        #   ^ SessionManager hook: "fault" | "recovering" | None (all arms running)
+        self.fault_events = 0  # FaultEvents consumed (tests / diagnostics)
+        self.recoveries = 0  # re-seeds performed after Reseed/RecoveredEvents
 
         self.tick_count = 0
         self.overrun_count = 0
@@ -225,9 +267,13 @@ class ControlLoop:
         self._seeded = True
 
     def reseed_arm(self, arm_id: str) -> None:
-        """Post-recovery re-seed: targets from measured, gate last-safe reset."""
+        """Post-recovery re-seed: targets from measured, gate last-safe reset; the
+        gripper target follows the MEASURED opening too (a key held through the
+        fault integrated nothing, so nothing pre-fault is replayed)."""
         st = self.workcell.arms[arm_id].get_state()
         self._last_cmd[arm_id] = np.array(st.q, dtype=np.float64)
+        if arm_id in self.gripper_arms:
+            self._grip_frac[arm_id] = float(st.gripper.open_frac)
         self._teleop_seeded.discard(arm_id)
         if self.ik is not None:
             self.ik.reset(arm_id, st.q)
@@ -255,6 +301,14 @@ class ControlLoop:
 
         states = self.workcell.states()  # 3 (driver caches; never blocks)
         self._states = states
+        # 3b (phase-09b, §15): an arm re-seeded on an earlier tick leaves RECOVERING
+        # once this tick's inputs (step 2, sampled AFTER the re-seed) hold nothing
+        # live (clutch released / keys up or watchdog-latched); then this tick's
+        # driver events -> per-arm FAULT / RECOVERING. RECOVERING therefore lasts at
+        # least one tick and never ends on inputs sampled before the re-seed.
+        self._update_recovering()
+        self._drain_driver_events(now)
+        self._publish_fault_state()
         self.supervisor.sync(states, now)  # 4
         if self.ik is not None:
             self.ik.sync_passive(states)
@@ -286,6 +340,8 @@ class ControlLoop:
 
         for arm_id, q in dec.q_out.items():  # 9
             self._last_cmd[arm_id] = np.array(q)
+            if arm_id in self._faulted:
+                continue  # stopped by a driver fault: nothing dispatched until the re-seed
             self.bus.arm_slot(arm_id).put(np.array(q))
 
         self._gripper_step(self.sources)
@@ -312,6 +368,8 @@ class ControlLoop:
             session_extra={
                 "plan_status": self._plan_status,
                 "kind": self.workcell_kind,
+                "arm_faults": self._arm_fault_details(now),  # arm -> fault_detail (§15)
+                "arm_recovering": sorted(self._recovering),
                 "tracker": (
                     {
                         **self.tracker.telemetry_extra(),
@@ -336,8 +394,8 @@ class ControlLoop:
         for arm_id in self.session_arms:
             q_last = self._last_cmd[arm_id]
             q_next: np.ndarray | None = None
-            if states[arm_id].error_code != 0:
-                q_next = None  # FAULT: hold; recovery re-seeds (§15)
+            if self.arm_stopped(arm_id, states[arm_id]):
+                q_next = None  # FAULT / RECOVERING: hold; recovery re-seeds (§15)
             elif self.plans.active(arm_id):
                 q_next = self.plans.step(arm_id, q_last)
                 source = CommandSource.PLANNER
@@ -353,6 +411,174 @@ class ControlLoop:
                 q_next = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             out[arm_id] = q_next
         return out, source
+
+    def arm_stopped(self, arm_id: str, state: ArmState) -> bool:
+        """This arm gets no new command this tick (04-runtime §15): a controller
+        error is latched in its state, a driver FaultEvent stopped it, or it was
+        re-seeded and waits for the operator to release every input (RECOVERING).
+        Shared by every mode loop's ``_resolve_arms`` (teleop here, policy mux in
+        ``dagger.loop``)."""
+        return state.error_code != 0 or arm_id in self._faulted or arm_id in self._recovering
+
+    # -- driver events: FAULT -> RECOVERING -> RUNNING (phase-09b; 04-runtime §15) ------
+    @property
+    def fault_state(self) -> str | None:
+        """``"fault"`` while any arm is stopped by a driver fault, ``"recovering"``
+        while any re-seeded arm waits for the re-grip, else ``None``."""
+        if self._faulted:
+            return "fault"
+        if self._recovering:
+            return "recovering"
+        return None
+
+    @property
+    def faulted_arms(self) -> frozenset[str]:
+        return frozenset(self._faulted)
+
+    @property
+    def recovering_arms(self) -> frozenset[str]:
+        return frozenset(self._recovering)
+
+    def _drain_driver_events(self, now: float) -> None:
+        """Consume ``workcell.drain_events()`` (hardware drivers; ``[]`` for sim and
+        fakes) and apply the per-arm transitions. Dispatch is by class name
+        (:data:`FAULT_EVENT_NAMES`): the runtime never imports the optional
+        hardware package's event types."""
+        try:
+            events = self.workcell.drain_events()
+        except Exception:  # noqa: BLE001 - a broken event channel must not stop the tick
+            logger.exception("workcell.drain_events failed")
+            return
+        if not events:
+            return
+        reseeded: set[str] = set()  # one re-seed per arm per tick (Reseed + Recovered pair)
+        for ev in events:
+            kind = type(ev).__name__
+            arm_id = getattr(ev, "arm_id", None)
+            if kind not in FAULT_EVENT_NAMES:
+                logger.debug("driver event %s for %s: %r", kind, arm_id, ev)
+                continue
+            if arm_id not in self.session_arms:
+                logger.info("driver event %s for non-session arm %r ignored: %r", kind, arm_id, ev)
+                continue
+            if kind == "FaultEvent":
+                self._on_fault_event(arm_id, ev, now)
+            elif kind == "StudioConflictWarning":
+                text = str(getattr(ev, "detail", "") or STUDIO_WARNING_DEFAULT)
+                self._warnings[arm_id] = (f"warning: {text}", now + STUDIO_WARNING_LINGER_S)
+                logger.warning(
+                    "%s: %s (controller mode %s state %s)",
+                    arm_id,
+                    text,
+                    getattr(ev, "mode", "?"),
+                    getattr(ev, "state", "?"),
+                )
+            else:  # ReseedEvent / RecoveredEvent
+                self._on_recovered_event(arm_id, ev, now, reseeded)
+
+    def _on_fault_event(self, arm_id: str, ev: object, now: float) -> None:
+        """The driver stopped ``arm_id`` (controller error, latch, link loss, or the
+        start of an operator-requested recovery): pause its sender, hold it, drop
+        its plan / jog / teleop seed, release the clutch anchors if it was the
+        clutched arm. Siblings are untouched (§15 "other arms hold")."""
+        source = str(getattr(ev, "source", "") or "")
+        code = int(getattr(ev, "error_code", 0) or 0)
+        detail = str(getattr(ev, "detail", "") or "")
+        title = controller_error_title(code) if code else ""
+        if title and detail:
+            text = f"{title} - {detail}"
+        elif title:
+            text = title
+        elif detail:
+            text = detail
+        elif source == "user":
+            text = "operator-requested recovery (re-seed from the measured position)"
+        else:
+            text = f"driver fault (source {source or '?'}, code {getattr(ev, 'code', '?')})"
+        self._fault_text[arm_id] = text
+        self._faulted.add(arm_id)
+        self._recovering.discard(arm_id)
+        self._warnings.pop(arm_id, None)
+        self.fault_events += 1
+        sender = self._senders.get(arm_id)
+        if sender is not None:
+            sender.pause()
+        if self.plans.active(arm_id) or self._plan_state.get(arm_id) is not None:
+            self.plans.cancel(arm_id)
+            self._plan_state.pop(arm_id, None)
+            self._plan_clear_at.pop(arm_id, None)
+            if not self.plans.active_arms:
+                self._set_plan_status("cancelled", linger=True)
+        self.jog.clear(arm_id)
+        self._teleop_seeded.discard(arm_id)
+        if self.tracker is not None and arm_id == self.active_arm:
+            self.tracker.release()  # anchors are meaningless after the arm stopped
+            self._clutch_arm = None
+        logger.warning("%s: FAULT - %s", arm_id, text)
+
+    def _on_recovered_event(self, arm_id: str, ev: object, now: float, reseeded: set[str]) -> None:
+        """ReseedEvent / RecoveredEvent: the driver's streamer holds the MEASURED
+        position again -> re-seed our targets from it (once per tick), resume the
+        sender, and keep the arm held (RECOVERING) until every live input is
+        released so the next clutch press is a true rising edge (zero delta)."""
+        if arm_id not in reseeded:
+            try:
+                self.reseed_arm(arm_id)
+            except Exception:  # noqa: BLE001 - keep the arm held rather than crash the tick
+                logger.exception("%s: re-seed after recovery failed", arm_id)
+                return
+            reseeded.add(arm_id)
+            self.recoveries += 1
+        self._faulted.discard(arm_id)
+        self._recovering.add(arm_id)
+        sender = self._senders.get(arm_id)
+        if sender is not None:
+            sender.resume()
+        code = int(getattr(ev, "error_code", 0) or 0)
+        if type(ev).__name__ == "RecoveredEvent":
+            logger.info(
+                "%s: recovered%s; waiting for the operator to release every input",
+                arm_id,
+                f" from {controller_error_title(code)}" if code else "",
+            )
+
+    def _update_recovering(self) -> None:
+        """RECOVERING -> RUNNING once no code is held by a LIVE source: the device
+        clutch must be released (its next press is a rising edge that re-anchors
+        at the measured TCP) and WS codes must be up or latched by the watchdog's
+        AWAIT_EMPTY, which itself only clears on a fresh EMPTY KeysMsg (§8)."""
+        if not self._recovering:
+            return
+        if any(self.sources.scale_for(c) > 0.0 for c in self.sources.held):
+            return
+        for arm_id in sorted(self._recovering):
+            self._recovering.discard(arm_id)
+            self._fault_text.pop(arm_id, None)
+            logger.info("%s: RUNNING again (inputs released after recovery)", arm_id)
+
+    def _publish_fault_state(self) -> None:
+        cb = self.on_fault_state
+        if cb is None:
+            return
+        state = self.fault_state
+        if state == self._fault_state_reported:
+            return
+        self._fault_state_reported = state
+        try:
+            cb(state)
+        except Exception:  # noqa: BLE001 - a manager bug must not stop the tick
+            logger.exception("on_fault_state(%r) failed", state)
+
+    def _arm_fault_details(self, now: float) -> dict[str, str]:
+        """Telemetry ``fault_detail`` per arm: the fault text while FAULT /
+        RECOVERING, else a not-yet-expired StudioConflictWarning."""
+        out = dict(self._fault_text)
+        for arm_id, (text, until) in list(self._warnings.items()):
+            if now >= until:
+                self._warnings.pop(arm_id, None)
+            elif arm_id not in out:
+                out[arm_id] = text
+        return out
 
     def _note_source(self, arm_id: str, source: CommandSource) -> None:
         """Record the source resolving ``arm_id`` this tick (13-tracker §4
@@ -652,10 +878,14 @@ class ControlLoop:
     def _gripper_step(self, sources: HeldSources) -> None:
         """F/H integrate ``open_frac`` per source at that source's scale: a
         device-held gripper code keeps working while the WS deadman is latched
-        and stops within ``stale_s`` when the controller stream dies."""
+        and stops within ``stale_s`` when the controller stream dies. A FAULTED /
+        RECOVERING arm is not commanded at all (§15: nothing integrates, nothing
+        is queued for the sender to replay once it is streaming again)."""
         arm_id = self.active_arm
         if arm_id is None or arm_id not in self.gripper_arms:
             return  # gripper keys are ignored on a camera-only arm
+        if arm_id in self._faulted or arm_id in self._recovering:
+            return  # stopped by a driver fault: the gripper holds too
         grip_v = 0.0
         for code in sources.held:
             gv = held_to_twist(frozenset({code}), self.cfg.teleop).grip_v
@@ -905,8 +1135,12 @@ __all__ = [
     "ControlLoop",
     "DEFAULT_ACTIVE_ARM",
     "DEVICE_ACTION_LINGER_S",
+    "FAULT_EVENT_NAMES",
     "GRIPPER_SEND_EVERY_N_TICKS",
     "HeldSources",
     "PLAN_STATUS_LINGER_TICKS",
+    "STUDIO_WARNING_DEFAULT",
+    "STUDIO_WARNING_LINGER_S",
+    "controller_error_title",
     "default_active_arm",
 ]

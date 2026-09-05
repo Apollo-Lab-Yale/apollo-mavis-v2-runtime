@@ -122,6 +122,10 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
     now = time.monotonic()
     arms: list[ArmTelemetry] = []
     if snap is not None:
+        # phase-09b (04-runtime §15): the loop's per-arm driver-fault text (kept
+        # through RECOVERING, or a lingering Studio-conflict warning) + re-seed flag.
+        faults = snap.session_extra.get("arm_faults") or {}
+        recovering = set(snap.session_extra.get("arm_recovering") or ())
         for arm_id, st in snap.arms.items():
             arms.append(
                 ArmTelemetry(
@@ -138,6 +142,8 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
                     warn_code=st.warn_code,
                     stale=st.stale,
                     goto=snap.plan_status.get(arm_id),
+                    fault_detail=str(faults.get(arm_id, "") or ""),
+                    recovering=arm_id in recovering,
                 )
             )
     return TelemetryMsg(
