@@ -22,6 +22,17 @@ workcells:
   # An unplugged camera reports `live: false` (pure-black tile) -- no other
   # side effect; a box that is off shows `reachable: unreachable`. Sessions on this workcell land with phase-09
   # (`_bringup_hardware`); POST /api/session kind=hardware is 409.
+  # Read-only facts measured on the live cell 2026-09-04 (phase-09a): firmware
+  # v1.12.10 on both boxes, SDK 1.18.5; both arms state 4 (not enabled), mode 0.
+  # The Perception Arm (view) keeps reporting controller error C19 (end-effector
+  # bus; the SDK's title -- what telemetry.hardware_monitor `detail` shows -- is
+  # "End Effector Communication Error", xArm Studio calls it "End Module
+  # Communication Error") -- the arm card shows it as a red C19 chip. Both
+  # linear tracks are NOT homed and NOT enabled (registers pos 0,
+  # on_zero 0, is_enabled 0), so their position register is meaningless: the
+  # monitor reports rail_pos_m null and the twin overlay falls back to
+  # twin_overlay.rail_fallback_m (grip 0.65 = operator's right end, view 0.0).
+  # Homing (set_linear_track_back_origin) is a motion command -> phase-09.
   hardware:
     kind: hardware
     digital_twin_scene: mavis_v2   # same cell as the sim scene; the Perception Arm carries the microphone body
@@ -40,9 +51,25 @@ workcells:
     # because the /dev/v4l/by-id symlinks collide between the depth and colour
     # interfaces, and the colour stream is YUYV only (fourcc). Serial -> arm
     # mapping CONFIRMED by the user on 2026-09-04 from the Hardware-tab tiles.
+    # intrinsics = the D435i COLOUR imager at 640x480 (`rs-enumerate-devices -c`,
+    # Inverse Brown-Conrady, distortion ignored; fovy = 2*atan(240/fy) ~ 43.2 deg,
+    # NOT the MJCF fovy 57 which is the depth field of view). The twin overlay
+    # (`<id>_align` streams) renders the digital twin with exactly these values.
     cameras:
-      - {id: grip_wrist, kind: v4l2, serial: "349643062582", fourcc: YUYV, resolution: [640, 480], fps: 30}
-      - {id: view_wrist, kind: v4l2, serial: "322143060792", fourcc: YUYV, resolution: [640, 480], fps: 30}
+      - id: grip_wrist               # Manipulation Arm wrist (USB serial 349643062582 -> RS ASIC 327122074467)
+        kind: v4l2
+        serial: "349643062582"
+        fourcc: YUYV
+        resolution: [640, 480]
+        fps: 30
+        intrinsics: {fx: 608.19, fy: 608.23, cx: 327.39, cy: 247.90}
+      - id: view_wrist               # Perception Arm wrist (USB serial 322143060792 -> RS ASIC 243522071002)
+        kind: v4l2
+        serial: "322143060792"
+        fourcc: YUYV
+        resolution: [640, 480]
+        fps: 30
+        intrinsics: {fx: 606.36, fy: 606.38, cx: 311.90, cy: 249.45}
     safety:
       enabled: true               # hardware refuses to start without the safety gate
 profiles_dir: ~/apollo/profiles
@@ -84,6 +111,41 @@ hardware_probe:
   period_s: 2.0
   timeout_s: 1.0
   port: 502                     # xArm control port; 30001-30003 report streams are never probed
+# Read-only controller state monitor (phase-09a; 04-runtime §13.3 telemetry
+# `hardware_monitor`): one read-only SDK client per hardware arm polls joint
+# angles, flange pose, error/warn codes, linear-track and gripper registers --
+# never a motion / mode / state / clean_* command -- so the Welcome page shows
+# the real error codes (Perception Arm C19) and the twin overlay can pose the
+# digital twin without a session. PAUSED (connections released) while a
+# hardware session owns the boxes: two SDK clients on one control box are
+# unevidenced. Without the [hardware] extra: enabled false, status off.
+hardware_monitor:
+  enabled: true
+  poll_hz: 10.0                 # joints / pose / codes; rail + gripper registers at ~2 Hz
+  stale_s: 0.5                  # no sample for this long -> stale (grey twin)
+  reconnect_s: 2.0              # first retry delay after a connect / read failure (doubles to 10 s)
+# Digital-twin alignment overlays (phase-09a; 04-runtime §13.4): streams
+# grip_wrist_align / view_wrist_align = the real wrist-camera frame + the
+# mavis_v2 twin (Perception Arm with the microphone body) posed from the
+# monitor's joint angles and rendered from the same wrist camera with the
+# D435i colour intrinsics above, composited as a pale-yellow translucent
+# silhouette; table / obstacle edges in blue as the base-placement cue. Kind
+# `twin` in /api/cameras; live iff the real camera is live and the monitor
+# delivers samples. NOT a calibration: a visual alignment tool for the twin's
+# rail position / direction, base pose, camera extrinsics and joint convention.
+twin_overlay:
+  enabled: true
+  fps: 12.0
+  alpha: 0.5                    # robot tint opacity
+  tint_rgb: [255, 235, 140]     # pale yellow, shaded by the twin's own luminance
+  edge_rgb: [255, 220, 60]      # 1 px robot outline
+  env_outline: true             # table / obstacle edges as thin lines
+  env_rgb: [90, 200, 250]
+  stale_tint_rgb: [170, 170, 170]   # monitor stale / error -> grey twin
+  joint1_offset_rad: 0.0        # diagnostic knob only: the identity joint convention is verified (2026-09-04)
+  rail_flip: false              # true: q_sim = 0.65 - q_track
+  rail_fallback_m: {grip: 0.65, view: 0.0}  # assumed rail position while the track is not homed (see the hardware workcell header)
+  stream_suffix: _align
 tracker:
   # Vive-tracker teleop (13-tracker §4). backend: none | fake | libsurvive.
   # `fake` = scripted 0.15 m circle at 100 Hz so the UI/pipeline can be

@@ -14,7 +14,12 @@ from apollo_mavis_v2_core.testing import FakeCamera
 from conftest import AcceptingListener, LiveServer, make_runtime_config
 from starlette.testclient import TestClient
 
-from apollo_mavis_v2_runtime.config import HardwareProbeConfig, MicrophoneConfig
+from apollo_mavis_v2_runtime.config import (
+    HardwareMonitorConfig,
+    HardwareProbeConfig,
+    MicrophoneConfig,
+    TwinOverlayConfig,
+)
 from apollo_mavis_v2_runtime.runtime import Runtime
 from apollo_mavis_v2_runtime.server.app import create_app
 
@@ -53,6 +58,11 @@ def _config(tmp_path, *, probe_port: int, mic_backend: str = "fake"):
         "workcells": {**cfg.workcells, "hardware": WorkcellConfig.model_validate(HW_WORKCELL)},
         "microphone": MicrophoneConfig(enabled=True, backend=mic_backend, label="RØDE NT-USB Mini"),
         "hardware_probe": HardwareProbeConfig(period_s=0.1, timeout_s=0.5, port=probe_port),
+        # phase-09a: no read-only SDK client against 127.0.0.1 here and no overlay
+        # (camera1/camera2 are not wrist cameras anyway); tests/test_twin_overlay.py
+        # covers both with fakes.
+        "hardware_monitor": HardwareMonitorConfig(enabled=False),
+        "twin_overlay": TwinOverlayConfig(enabled=False),
     })
 
 
@@ -132,8 +142,9 @@ def test_workcell_default_and_kinds(client, rt):
     assert by_id["grip"]["gripper"] == "xarm_g2" and by_id["view"]["gripper"] == "none"
     assert by_id["grip"]["gripper_force_capable"] and not by_id["view"]["gripper_force_capable"]
     assert hw["hardware_ready"] is True and ws["hardware_ready"] is True
+    assert all(a["error_code"] == 0 for a in hw["arms"])  # monitor disabled -> 0
     cams = {c["camera_id"]: c for c in hw["cameras"]}
-    assert set(cams) == {"camera1", "camera2"}
+    assert set(cams) == {"camera1", "camera2"}  # no *_align rows: overlay disabled
     assert cams["camera1"]["live"] is True and cams["camera1"]["kind"] == "v4l2"
     assert cams["camera2"]["live"] is False  # absent -> black tile, no WS
     assert cams["camera2"]["resolution"] == [64, 48] and cams["camera2"]["fps"] == 30
@@ -165,6 +176,10 @@ def test_microphones_and_telemetry_block_fake(client, rt):
     with client.websocket_connect("/ws/telemetry") as ws:
         msg = ws.receive_json()
         assert msg["session"]["state"] == "idle"
+        hm = msg["hardware_monitor"]  # phase-09a: inert block, one row per hardware arm
+        assert hm["enabled"] is False and hm["paused"] is False and hm["overlays"] == []
+        assert [a["arm_id"] for a in hm["arms"]] == ["view", "grip"]  # config order
+        assert all(a["status"] == "off" and "disabled" in a["detail"] for a in hm["arms"])
         block = msg["microphone"]
         assert block is not None and block["mic_id"] == "mic_view"
         assert block["status"] == "live" and block["seq"] > 0

@@ -30,6 +30,22 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
     assert cfg.microphone.enabled and cfg.microphone.mic_id == "mic_view"
     assert cfg.microphone.label == "Perception Arm microphone"
     assert cfg.hardware_probe.enabled and cfg.hardware_probe.port == 502
+    # Phase-09a: D435i COLOUR intrinsics per wrist camera (rs-enumerate-devices -c),
+    # read-only monitor + twin overlay blocks.
+    intr = {c.id: c.intrinsics for c in hw.cameras}
+    assert (intr["grip_wrist"].fx, intr["grip_wrist"].fy) == (608.19, 608.23)
+    assert (intr["grip_wrist"].cx, intr["grip_wrist"].cy) == (327.39, 247.90)
+    assert (intr["view_wrist"].fx, intr["view_wrist"].fy) == (606.36, 606.38)
+    assert (intr["view_wrist"].cx, intr["view_wrist"].cy) == (311.90, 249.45)
+    mon = cfg.hardware_monitor
+    assert (mon.enabled, mon.poll_hz, mon.stale_s, mon.reconnect_s) == (True, 10.0, 0.5, 2.0)
+    ov = cfg.twin_overlay
+    assert ov.enabled and ov.fps == 12.0 and ov.alpha == 0.5 and ov.stream_suffix == "_align"
+    assert ov.tint_rgb == (255, 235, 140) and ov.edge_rgb == (255, 220, 60)
+    assert ov.env_outline and ov.env_rgb == (90, 200, 250)
+    assert ov.stale_tint_rgb == (170, 170, 170)
+    assert ov.joint1_offset_rad == 0.0 and ov.rail_flip is False
+    assert ov.rail_fallback_m == {"grip": 0.65, "view": 0.0}
     sim = cfg.workcells["sim"]
     assert {a.id for a in sim.arms} == {"view", "grip"} and sim.sim_scene == "mavis_v2"
 

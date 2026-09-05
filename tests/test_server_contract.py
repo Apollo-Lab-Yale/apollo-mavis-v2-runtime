@@ -188,3 +188,9 @@ def test_telemetry_pre_session_idle(client):
         }
         assert trk["pose_filtered"] is None and trk["device_action"] is None
         assert msg["microphone"] is None  # microphone.enabled false in this config
+        # Phase-09a: the hardware_monitor block is always present; no hardware
+        # workcell here -> the valid inert block (core HardwareMonitorTelemetry()).
+        assert msg["hardware_monitor"] == {
+            "enabled": False, "paused": False, "arms": [], "overlays": [],
+        }
+        assert list(msg)[-4:] == ["session", "tracker", "microphone", "hardware_monitor"]

@@ -11,19 +11,24 @@ from apollo_mavis_v2_core.protocol import MicrophoneInfo
 
 from .bus import RuntimeBus
 from .config import RuntimeConfig
+from .devices.hardware_monitor import HardwareStateMonitor
 from .devices.hardware_probe import HardwareProbe
 from .devices.microphone import MicrophoneReader, to_info
 from .devices.tracker import TrackerReader, TrackerSettings
 from .devices.tracker_calibration import TrackerCalibration, apply_persisted_yaw
 from .session.manager import SessionManager
 from .streams.hub import VideoHub
+from .streams.twin_overlay import TwinOverlayRenderer
 
 
 class Runtime:
     """Process-singleton: bus, video hub, profile store, tracker reader,
-    microphone reader, hardware probe, tracker calibration FSM, session manager."""
+    microphone reader, hardware probe, read-only hardware monitor + twin
+    alignment overlays (phase-09a), tracker calibration FSM, session manager."""
 
-    def __init__(self, cfg: RuntimeConfig) -> None:
+    def __init__(self, cfg: RuntimeConfig, *, monitor_factory=None) -> None:
+        """``monitor_factory`` is the phase-09a test seam: replaces the hardware
+        package's ``ArmStateMonitor`` class for the read-only monitor."""
         self.cfg = cfg
         self.epoch = uuid.uuid4().hex  # new epoch per process; UI detects restarts
         self.bus = RuntimeBus()
@@ -53,11 +58,30 @@ class Runtime:
             cfg.hardware_probe,
             paused=self._hardware_session_active,
         )
+        # Read-only controller state monitor (phase-09a): one read-only SDK client
+        # per hardware arm, session-less; PAUSED (connections released) while a
+        # hardware session owns the boxes. Started in start() after the previews.
+        self.hardware_monitor = HardwareStateMonitor(
+            cfg.hardware_monitor, hw,
+            paused=lambda: self._hardware_session_active(),  # late-bound (tests patch it)
+            monitor_factory=monitor_factory,
+        )
         self.manager = SessionManager(
             cfg, self.bus, self.hub, self.profile_store, self.epoch,
             tracker_settings=self.tracker_settings,
             hardware_probe=self.hardware_probe,
+            hardware_monitor=self.hardware_monitor,
         )
+        # Twin alignment overlays (phase-09a): <camera_id>_align streams built from
+        # the manager's hardware camera previews + the monitor's samples.
+        self.twin_overlay: TwinOverlayRenderer | None = None
+        if hw is not None:
+            self.twin_overlay = TwinOverlayRenderer(
+                cfg.twin_overlay, hw, hw.digital_twin_scene, self.hardware_monitor,
+                self.manager.hardware_camera_frame, self.hub,
+                paused=lambda: self._hardware_session_active(),
+            )
+            self.manager.twin_overlay = self.twin_overlay
         self.hardware_probe.start()  # no-op without a hardware workcell
         # Calibration wizard back end (13-tracker §4 "Calibration modes"): Runtime-
         # owned, session-less; REST /api/tracker/calibration + telemetry.
@@ -81,8 +105,18 @@ class Runtime:
 
             logging.getLogger(__name__).exception("dataset startup repair failed")
         self.manager.start_previews()
+        # Phase-09a: monitor -> overlay, after the hardware camera previews exist
+        # (the overlay composites onto their frames). Both no-ops when inert.
+        self.hardware_monitor.start()
+        if self.twin_overlay is not None:
+            self.twin_overlay.start()
 
     def stop(self) -> None:
+        # Reverse of start(): overlay (renderers closed on its thread) -> monitor
+        # (boxes released) -> the rest.
+        if self.twin_overlay is not None:
+            self.twin_overlay.stop()
+        self.hardware_monitor.stop()
         self.manager.teardown()
         self.manager.stop_previews()
         self.manager.stop_hardware_previews()

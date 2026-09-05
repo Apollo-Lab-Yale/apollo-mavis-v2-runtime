@@ -10,6 +10,7 @@ from apollo_mavis_v2_core.protocol import (
     ArmTelemetry,
     ClearanceItem,
     ControllerTelemetry,
+    HardwareMonitorTelemetry,
     MicrophoneTelemetry,
     PoseMsg,
     SessionTelemetry,
@@ -101,6 +102,18 @@ def build_microphone_telemetry(runtime, now: float) -> MicrophoneTelemetry | Non
     return to_telemetry(runtime.microphone.status(now))
 
 
+def build_hardware_monitor_telemetry(runtime) -> HardwareMonitorTelemetry:
+    """``hardware_monitor`` block (phase-09a): the read-only monitor's per-arm
+    status/sample rows + the twin overlays' per-stream rows, pre-session and
+    session-less. Always present; ``enabled: false`` with empty ``arms`` when
+    no hardware workcell is configured (or the hardware extra is missing)."""
+    block = runtime.hardware_monitor.telemetry()
+    overlay = getattr(runtime, "twin_overlay", None)
+    if overlay is not None:
+        block.overlays = overlay.telemetry()
+    return block
+
+
 def build_telemetry(runtime, seq: int) -> TelemetryMsg:
     """One frame from the latest StateSnapshot + session manager state."""
     got = runtime.bus.snapshot.get()
@@ -156,6 +169,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
         ),
         tracker=build_tracker_telemetry(runtime, snap, now),
         microphone=build_microphone_telemetry(runtime, now),
+        hardware_monitor=build_hardware_monitor_telemetry(runtime),
     )
 
 
@@ -181,4 +195,5 @@ __all__ = [
     "build_telemetry",
     "build_tracker_telemetry",
     "build_microphone_telemetry",
+    "build_hardware_monitor_telemetry",
 ]

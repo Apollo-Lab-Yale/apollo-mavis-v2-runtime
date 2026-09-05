@@ -39,12 +39,32 @@ from .types import SessionState
 
 if TYPE_CHECKING:
     from ..bus import RuntimeBus
+    from ..devices.hardware_monitor import HardwareStateMonitor
     from ..devices.hardware_probe import HardwareProbe
+    from ..streams.twin_overlay import TwinOverlayRenderer
 
 logger = logging.getLogger(__name__)
 
 
-def _servo_faithful_scene(scene_id: str):
+def _microphone_overrides(wc: WorkcellConfig, scene_id: str | None = None):
+    """``SceneOverrides`` carrying ``ArmConfig.microphone`` per arm (03-sim §4):
+    every build of a workcell's scene / digital twin passes it so the Perception
+    Arm's microphone body exists exactly when the config says so.
+
+    With ``scene_id`` the mapping is restricted to arms the scene actually has:
+    the SIM workcell's arm ids are placeholders until a session picks (and
+    validates against) a scene, so the pre-session preview build must not fail
+    on an id the scene lacks (``SceneArmMismatchError``)."""
+    from apollo_mavis_v2_sim import REGISTRY, SceneOverrides
+
+    mics = {a.id: bool(a.microphone) for a in wc.arms}
+    if scene_id is not None:
+        known = {a.id for a in REGISTRY.descriptor(scene_id).arms}
+        mics = {k: v for k, v in mics.items() if k in known}
+    return SceneOverrides(microphones=mics)
+
+
+def _servo_faithful_scene(scene_id: str, overrides=None):
     """Session workcell scene with hardware-grade servo fidelity.
 
     Mirrors ``guardrail_check._build_real_robot_scene``: the menagerie
@@ -55,7 +75,7 @@ def _servo_faithful_scene(scene_id: str):
     """
     from apollo_mavis_v2_sim import REGISTRY, Addressing, BuiltScene
 
-    scene = REGISTRY.build(scene_id)
+    scene = REGISTRY.build(scene_id, overrides)
     spec = scene.spec
     for body in spec.bodies:
         body.gravcomp = 1.0
@@ -116,6 +136,7 @@ class SessionManager:
         epoch: str,
         tracker_settings: TrackerSettings | None = None,  # Runtime-owned live settings
         hardware_probe: HardwareProbe | None = None,  # Runtime-owned reachability snapshot
+        hardware_monitor: HardwareStateMonitor | None = None,  # Runtime-owned read-only monitor
     ) -> None:
         self.cfg = cfg
         self.bus = bus
@@ -124,6 +145,10 @@ class SessionManager:
         self.epoch = epoch
         self.tracker_settings = tracker_settings or TrackerSettings.from_config(cfg.tracker)
         self.hardware_probe = hardware_probe
+        self.hardware_monitor = hardware_monitor
+        # Twin alignment overlays (phase-09a): Runtime-owned, assigned after construction
+        # (the renderer reads this manager's hardware camera frames).
+        self.twin_overlay: TwinOverlayRenderer | None = None
         self.session: ActiveSession | None = None
         self._lock = threading.Lock()
         self._creating = False  # create() is validating / bringing a session up (under _lock)
@@ -254,14 +279,15 @@ class SessionManager:
         session_cfg = self._session_workcell_config(spec, wc, scene_id)
         rs = RenderService()
         rs.start()
-        scene = _servo_faithful_scene(scene_id)
+        overrides = _microphone_overrides(session_cfg)
+        scene = _servo_faithful_scene(scene_id, overrides)
         workcell = SimWorkcell(scene, session_cfg, render_service=rs)
         workcell.start()
 
         # Twin: always built for planning (goto / start_from); it is the GATE
         # twin only under safety_debug (11-safety §5).
         twin = DigitalTwin(
-            REGISTRY.build(scene_id),
+            REGISTRY.build(scene_id, overrides),
             inflation_m=safety.geom_inflation_m,
             render_service=rs if safety.safety_debug else None,
             allowed_pairs_extra=safety.allowed_pairs_extra,
@@ -755,7 +781,7 @@ class SessionManager:
             return
         rs = RenderService()
         rs.start()
-        scene = REGISTRY.build(wc.sim_scene)
+        scene = REGISTRY.build(wc.sim_scene, _microphone_overrides(wc, wc.sim_scene))
         rs.register_source("preview", scene.model)
         self._preview_scene = scene
         fps = self.cfg.video.preview_fps
@@ -844,6 +870,21 @@ class SessionManager:
         """Last open failure per hardware camera id (diagnostics)."""
         return dict(self._hw_camera_errors)
 
+    def hardware_camera(self, cam_id: str):
+        """The started hardware camera preview (core ``CameraInterface``) for
+        ``cam_id``, or ``None`` when it is not open / has failed. The twin
+        overlay (phase-09a) reads ``latest()`` from it: a UVC node cannot be
+        opened twice, so the preview capture is the ONLY reader of the device."""
+        cam = self._hw_cameras.get(cam_id)
+        if cam is None or getattr(cam, "failed", False):
+            return None
+        return cam
+
+    def hardware_camera_frame(self, cam_id: str):
+        """Newest real frame of a hardware camera (``None`` when unavailable)."""
+        cam = self.hardware_camera(cam_id)
+        return cam.latest() if cam is not None else None
+
     # -- REST discovery helpers (server/rest.py) -------------------------------------
     def camera_infos(self) -> list:
         """``GET /api/cameras``: sim cameras (session or preview) + hardware cameras."""
@@ -877,13 +918,24 @@ class SessionManager:
         if wc is None:
             return []
         out = []
+        live_cams: dict[str, bool] = {}
         for cam_cfg in wc.cameras:
-            cam = self._hw_cameras.get(cam_cfg.id)
-            live = cam is not None and not getattr(cam, "failed", False)
+            live = self.hardware_camera(cam_cfg.id) is not None
+            live_cams[cam_cfg.id] = live
             out.append(CameraInfo(
                 camera_id=cam_cfg.id, kind=cam_cfg.kind, label=cam_cfg.id,
                 resolution=tuple(cam_cfg.resolution), fps=int(cam_cfg.fps), live=live,
             ))
+        # Twin alignment overlays (phase-09a): kind "twin", live iff the real camera
+        # underneath is live AND the overlay is compositing (live / stale tint).
+        overlay = self.twin_overlay
+        if overlay is not None:
+            for src in overlay.streams.values():
+                out.append(CameraInfo(
+                    camera_id=src.stream_id, kind="twin", label=src.label,
+                    resolution=src.resolution, fps=int(overlay.cfg.fps),
+                    live=bool(live_cams.get(src.camera_id)) and src.status in ("live", "stale"),
+                ))
         return out
 
     def scene_infos(self, kind: str) -> list:
@@ -971,19 +1023,20 @@ class SessionManager:
         return arms
 
     def _twin_scene(self, scene_id: str | None):
-        """Built digital-twin scene for the hardware status rows (rail flags,
-        joint limits): the sim preview scene when it is the same id, else a
-        one-off build cached per id; ``None`` when the sim extra / scene is missing."""
+        """Built digital-twin scene of the hardware workcell for the status rows
+        (rail flags, joint limits): a one-off build cached per id, carrying the
+        hardware arms' ``microphone`` flags (``SceneOverrides.microphones``, so
+        it is the same twin the overlay / gate use); ``None`` when the sim extra
+        / scene is missing."""
         if not scene_id:
             return None
-        preview = self._preview_scene
-        if preview is not None and preview.meta.id == scene_id:
-            return preview
         if scene_id not in self._twin_scenes:
             try:
                 from apollo_mavis_v2_sim import REGISTRY
 
-                self._twin_scenes[scene_id] = REGISTRY.build(scene_id)
+                wc = self.cfg.workcell_config("hardware")
+                overrides = _microphone_overrides(wc) if wc is not None else None
+                self._twin_scenes[scene_id] = REGISTRY.build(scene_id, overrides)
             except Exception as e:  # noqa: BLE001 - status rows degrade gracefully
                 logger.warning("digital twin scene %r unavailable for status: %r", scene_id, e)
                 self._twin_scenes[scene_id] = None
@@ -997,6 +1050,7 @@ class SessionManager:
             return []
         connected = self.session is not None and self.session.spec.kind == "hardware"
         probe = self.hardware_probe
+        monitor = self.hardware_monitor  # read-only controller state (phase-09a)
         twin = self._twin_scene(wc.digital_twin_scene)
         arms: list[ArmStatusInfo] = []
         for arm in sorted(wc.arms, key=lambda a: a.id != DEFAULT_ACTIVE_ARM):  # grip first
@@ -1007,7 +1061,7 @@ class SessionManager:
                 has_rail=twin.meta.rail[arm.id] if in_twin else arm.expect_rail == "yes",
                 gripper=arm.gripper,
                 gripper_force_capable=arm.gripper == "xarm_g2",
-                error_code=0,
+                error_code=monitor.error_code(arm.id) if monitor is not None else 0,
                 joint_limits=self._joint_limits(twin, arm.id) if in_twin else [],
             ))
         return arms

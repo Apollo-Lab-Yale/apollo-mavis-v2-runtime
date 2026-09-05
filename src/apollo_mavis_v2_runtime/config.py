@@ -109,6 +109,59 @@ class HardwareProbeConfig(BaseModel):
     port: int = Field(default=502, ge=1, le=65535)
 
 
+class HardwareMonitorConfig(BaseModel):
+    """Read-only controller state monitor (phase-09a; 04-runtime §13.3
+    ``hardware_monitor``): one ``ArmStateMonitor`` (hardware package) per
+    configured hardware arm polls joint angles, flange pose, error/warn codes,
+    linear-track and gripper registers at ``poll_hz`` and NEVER commands the
+    box. A sample older than ``stale_s`` reports ``stale``; connect / read
+    failures retry from ``reconnect_s`` with exponential backoff (cap 10 s).
+    Paused (= connections RELEASED, two SDK clients on one box are unevidenced)
+    while a hardware session owns the arms."""
+
+    enabled: bool = True
+    poll_hz: float = Field(default=10.0, gt=0.0)
+    stale_s: float = Field(default=0.5, gt=0.0)
+    reconnect_s: float = Field(default=2.0, gt=0.0)
+
+
+RGB = tuple[int, int, int]
+
+
+class TwinOverlayConfig(BaseModel):
+    """Digital-twin alignment overlays (phase-09a; 04-runtime §13.4 ``*_align``).
+
+    One ``<camera_id><stream_suffix>`` stream per hardware wrist camera: the
+    real frame with the ``mavis_v2`` twin - posed from the monitor's joint
+    angles / rail position and rendered from the SAME wrist camera with the
+    D435i colour intrinsics (``CameraConfig.intrinsics``) - composited as a
+    pale-yellow translucent silhouette (``alpha``, ``tint_rgb`` shaded by the
+    twin's own luminance, 1 px ``edge_rgb`` outline). ``env_outline`` draws the
+    table / obstacle edges in ``env_rgb`` as the base-placement cue; a stale /
+    erroring monitor swaps the tint for ``stale_tint_rgb``.
+    ``joint1_offset_rad`` is a diagnostic knob only (the identity joint
+    convention is verified); ``rail_flip`` maps ``q_sim = 0.65 - q_track``;
+    ``rail_fallback_m`` is the rail position the twin assumes per arm while the
+    track is not homed (its register is meaningless then) - the tile caption
+    says so (``rail not homed - twin assumes X m``).
+    """
+
+    enabled: bool = True
+    fps: float = Field(default=12.0, gt=0.0)
+    alpha: float = Field(default=0.5, ge=0.0, le=1.0)  # robot tint opacity
+    tint_rgb: RGB = (255, 235, 140)  # pale yellow, shaded by the twin's own luminance
+    edge_rgb: RGB = (255, 220, 60)  # 1 px robot outline
+    env_outline: bool = True  # table / obstacle edges as thin lines (alignment cue)
+    env_rgb: RGB = (90, 200, 250)
+    stale_tint_rgb: RGB = (170, 170, 170)  # monitor stale/error -> grey
+    joint1_offset_rad: float = 0.0  # diagnostic knob; identity is verified
+    rail_flip: bool = False  # q_sim = 0.65 - q_track when true
+    rail_fallback_m: dict[str, float] = Field(
+        default_factory=lambda: {"grip": 0.65, "view": 0.0}
+    )  # used while the track is not homed
+    stream_suffix: str = "_align"
+
+
 class ExtrinsicsTolerance(BaseModel):
     pos_m: float
     rot_rad: float
@@ -320,6 +373,8 @@ class RuntimeConfig(BaseModel):
     tracker: TrackerConfig = TrackerConfig()
     microphone: MicrophoneConfig = MicrophoneConfig()  # phase-11 (04-runtime §14)
     hardware_probe: HardwareProbeConfig = HardwareProbeConfig()  # phase-11
+    hardware_monitor: HardwareMonitorConfig = HardwareMonitorConfig()  # phase-09a
+    twin_overlay: TwinOverlayConfig = TwinOverlayConfig()  # phase-09a
     telemetry_hz: float = 25.0
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
@@ -385,6 +440,8 @@ __all__ = [
     "VideoConfig",
     "MicrophoneConfig",
     "HardwareProbeConfig",
+    "HardwareMonitorConfig",
+    "TwinOverlayConfig",
     "RuntimeConfig",
     "load_runtime_config",
 ]

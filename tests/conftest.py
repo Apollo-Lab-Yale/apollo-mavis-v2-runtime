@@ -8,6 +8,8 @@ os.environ.setdefault("MUJOCO_GL", "egl")  # noqa: E402 - must precede mujoco GL
 
 import socket
 import threading
+import time
+from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
@@ -154,3 +156,94 @@ class LiveServer:
     def stop(self) -> None:
         self._server.should_exit = True
         self._thread.join(timeout=10.0)
+
+
+# -- phase-09a fakes: read-only arm monitor --------------------------------------------------
+@dataclass(frozen=True)
+class FakeMonitorSample:
+    """Duck-typed stand-in for ``apollo_mavis_v2_hardware.ArmMonitorSample`` (same
+    field names; the runtime never imports the hardware dataclass)."""
+
+    arm_id: str
+    seq: int = 1
+    t_mono: float = 0.0
+    q: tuple[float, ...] = (3.141592653589793, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    tcp_pose: tuple[float, ...] = (0.2075, 0.0, 0.1125, 3.141592653589793, 0.0, 0.0)
+    error_code: int = 0
+    warn_code: int = 0
+    state: int | None = 4
+    mode: int | None = 0
+    rail_present: bool | None = True
+    rail_homed: bool | None = False
+    rail_enabled: bool | None = False
+    rail_pos_m: float | None = None
+    rail_raw_mm: float | None = 0.0
+    gripper_open_frac: float | None = None
+    gripper_raw: float | None = None
+
+
+@dataclass
+class FakeArmMonitor:
+    """``ArmStateMonitor`` surface with a call log; ``status`` / ``sample`` are set
+    by the test. ``start()`` -> status ``running`` (unless the test pinned one),
+    ``disconnect()`` -> ``paused``, ``stop()`` -> ``off``."""
+
+    arm_id: str
+    ip: str
+    gripper: str = "none"
+    expect_rail: bool = True
+    poll_hz: float = 10.0
+    stale_s: float = 0.5
+    reconnect_s: float = 2.0
+    calls: list[str] = field(default_factory=list)
+    sample: object | None = None
+    forced_status: str | None = None  # e.g. "stale" / "error" pinned by a test
+    detail_text: str = ""
+    _status: str = "off"
+
+    def start(self) -> None:
+        self.calls.append("start")
+        self._status = "running"
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self.calls.append("stop")
+        self._status = "off"
+
+    def disconnect(self, timeout: float = 2.0) -> None:
+        self.calls.append("disconnect")
+        self._status = "paused"
+
+    def snapshot(self):
+        return self.sample
+
+    @property
+    def status(self) -> str:
+        if self.forced_status is not None and self._status == "running":
+            return self.forced_status
+        return self._status
+
+    @property
+    def detail(self) -> str:
+        return self.detail_text
+
+    @property
+    def age_s(self) -> float | None:
+        return None if self.sample is None else max(0.0, time.monotonic() - self.sample.t_mono)
+
+    @property
+    def connected(self) -> bool:
+        return self._status == "running"
+
+
+class FakeMonitorFactory:
+    """``monitor_factory`` seam: records every constructed :class:`FakeArmMonitor`."""
+
+    def __init__(self, samples: dict[str, object] | None = None) -> None:
+        self.monitors: dict[str, FakeArmMonitor] = {}
+        self.samples = samples or {}
+
+    def __call__(self, arm_id: str, ip: str, **kw) -> FakeArmMonitor:
+        mon = FakeArmMonitor(arm_id, ip, **kw)
+        mon.sample = self.samples.get(arm_id)
+        self.monitors[arm_id] = mon
+        return mon
