@@ -25,7 +25,12 @@ from pydantic import BaseModel
 import apollo_mavis_v2_runtime
 
 from ..devices.tracker_calibration import CalibrationError
-from ..errors import MaintenanceUnavailableError, SessionError, SessionNotFoundError
+from ..errors import (
+    MaintenanceUnavailableError,
+    SafetyConfigError,
+    SessionError,
+    SessionNotFoundError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,9 +165,22 @@ def post_session(request: Request, spec: SessionSpec) -> SessionInfo:
     rt = _runtime(request)
     if rt.tracker_calibration.active:  # reader restarts / trigger clicks must not hit a session
         raise HTTPException(409, "tracker calibration in progress")
+    # phase-09d: fail fast (before manager._lock, which a rail-homing job holds for up to
+    # its whole connect - monitor join + bring-up) while a job / home_rail request is
+    # live; create() re-checks under the lock for the race-free 409.
+    busy_arm = rt.rail_homing.active_arm
+    if busy_arm is not None:
+        from ..session.hardware import arm_label
+
+        raise HTTPException(
+            409, f"rail homing in progress on the {arm_label(busy_arm)} - wait for it to finish"
+        )
     try:
         info = rt.manager.create(spec)
-    except SessionError as e:
+    except (SessionError, SafetyConfigError) as e:
+        # SessionError: the sim / hardware refusal matrices (04-runtime §5, §13.1);
+        # SafetyConfigError: a hardware session that would run without a twin-backed
+        # SafetyGate (11-safety §4) - never a 500, the operator reads the detail.
         raise HTTPException(409, str(e)) from None
     # The calibration's own guard reads manager.session_active, which create() raises
     # under its lock; a calibration that started between the check above and that
@@ -198,34 +216,59 @@ def post_tracker_calibration(
         raise HTTPException(409, str(e)) from None
 
 
-# -- arm maintenance (phase-09b; 04-runtime §13.1 / §15) -----------------------------------
-# Session-less device management rides REST (addendum above). None of the ops
-# produces motion: clear_errors = clean_error + clean_warn (monitor path, no enable);
+# -- arm maintenance (phase-09b/09c/09d; 04-runtime §13.1 / §15) ---------------------------
+# Session-less device management rides REST (addendum above). Three of the four ops
+# produce no motion: clear_errors = clean_error + clean_warn (monitor path, no enable);
 # apply_backstops = the ArmConfig safety parameters (monitor path; 409 in a session);
 # recover = the driver's user recovery incl. enable + servo mode + re-seed from the
-# measured position (session path; 409 without one). 200 whether or not ``ok``.
+# measured position (session path; 409 without one). home_rail (phase-09c) is THE
+# ONE op that moves a mechanical part - the linear-track carriage drives to the
+# zero end - so it is session-less only (409 "end the session first") and twin-gated:
+# dry_run = the sweep verdict + pre_position plan only (zero writes); a sweep-clear
+# posture homes synchronously here (<= 45 s, D3; status "done", 200); a posture that
+# first needs the planned pre-positioning motion (phase-09d) starts a RailHomingJob
+# and answers **202** with status "accepted" + job_id (progress on
+# telemetry.hardware_monitor.arms[].maintenance, the final result at GET .../last);
+# no rail-safe plan = status "refused" (ok false, 200). While a job runs every op is
+# 409 "rail homing in progress". 200 whether or not ``ok`` otherwise.
 @router.post("/hardware/arms/{arm_id}/maintenance")
 def post_arm_maintenance(
-    request: Request, arm_id: str, body: ArmMaintenanceRequest
+    request: Request, arm_id: str, body: ArmMaintenanceRequest, response: Response
 ) -> ArmMaintenanceResult:
     rt = _runtime(request)
     who = request.client.host if request.client is not None else "unknown"
+    label = f"{body.op}{' (dry run)' if body.dry_run else ''}"
     try:
-        result = rt.arm_maintenance(arm_id, body.op)
+        result = rt.arm_maintenance(arm_id, body.op, dry_run=body.dry_run)
     except KeyError:
         raise HTTPException(404, f"unknown hardware arm {arm_id!r}") from None
     except MaintenanceUnavailableError as e:
-        logger.info("maintenance %s on arm %s from %s: refused - %s", body.op, arm_id, who, e)
+        logger.info("maintenance %s on arm %s from %s: refused - %s", label, arm_id, who, e)
         raise HTTPException(409, str(e)) from None
+    if result.status == "accepted":
+        response.status_code = 202
     logger.info(
         "maintenance %s on arm %s from %s via %s: %s - %s",
-        body.op,
+        label,
         arm_id,
         who,
         result.path,
-        "ok" if result.ok else "FAILED",
+        result.status if result.status != "done" else ("ok" if result.ok else "FAILED"),
         result.detail,
     )
+    return result
+
+
+@router.get("/hardware/arms/{arm_id}/maintenance/last")
+def get_arm_maintenance_last(request: Request, arm_id: str) -> ArmMaintenanceResult:
+    """phase-09d: the final ``ArmMaintenanceResult`` of the last ``home_rail`` on
+    this arm (the same ``job_id`` as the 202 that started it); 404 until one exists."""
+    try:
+        result = _runtime(request).last_maintenance(arm_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown hardware arm {arm_id!r}") from None
+    if result is None:
+        raise HTTPException(404, f"no maintenance result for {arm_id!r} yet")
     return result
 
 

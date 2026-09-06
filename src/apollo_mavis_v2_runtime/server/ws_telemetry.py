@@ -172,6 +172,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
                 if dagger is not None and dagger.trainer is not None
                 else None
             ),
+            bringup=runtime.manager.bringup_telemetry(),  # hardware bring-up rows (phase-09c)
         ),
         tracker=build_tracker_telemetry(runtime, snap, now),
         microphone=build_microphone_telemetry(runtime, now),

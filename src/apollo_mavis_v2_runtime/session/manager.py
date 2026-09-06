@@ -2,8 +2,33 @@
 
 IDLE -> BRINGUP -> START_FROM -> RUNNING -> TEARDOWN -> IDLE (+ FAULT).
 ``create()`` returns after BRINGUP; START_FROM progress rides telemetry.
-Phase-05 implements teleop over the sim workcell; collect/dagger/inference
-and the hardware workcell path return clean 409s until phases 07/08.
+Phase-05 implements teleop over the sim workcell (collect / dagger / inference
+followed in phases 07/08); phase-09c adds the HARDWARE teleop session
+(:meth:`SessionManager._bringup_hardware`, 04-runtime §5): the refusal matrix
+(:meth:`SessionManager._validate_hardware` - rail homed, monitor sample,
+no latched error, no homing in flight, teleop only, EVERY configured arm -
+phase-09d), the read-only monitor hand-over (``pause()`` + ``join``; the
+``hardware_session_active`` predicate is true from the first line of
+``create()`` so the monitor's supervisor never reconnects mid-bring-up), a
+session ``WorkcellConfig`` (``cameras: []`` - the preview cameras are ADOPTED
+via ``hub.set_fps`` and never re-opened), a speed-scaled driver factory
+(``SessionSpec.speed_scale``, D2), ``HardwareWorkcell.bring_up`` progress into
+``SessionTelemetry.bringup``, a FRESH gate twin with an unconditional
+``SafetyGate``, and the mirror-image teardown (drivers hand the arms back
+stopped + braked, D6; camera fps restored; monitor resumed). Rail homing is
+NOT part of bring-up: a session is refused while an arm's track is unhomed and
+the operator homes it from the Hardware tab (``home_rail`` maintenance op,
+twin-gated).
+
+Phase-09d: the connect sequence is factored into
+:meth:`SessionManager.connect_hardware_rig` (-> :class:`HardwareRig`) so the
+rail-homing maintenance job (``devices/rail_homing.py``) reuses it to connect
+ONE arm with its track unhomed at speed scale 0.1 while the other arm is
+frozen in the gate twin at its last monitor sample (09c D1 - now used by the
+maintenance motion only: teleop sessions always include both arms).
+``start_from=profile:<id>`` on hardware plans the motion with the gate twin
+INSIDE bring-up (``twin.plan`` -> the same ``execute_plan`` path as sim); a
+plan failure tears the session down (409 "profile motion not collision-free").
 
 FAULT / RECOVERING (phase-09b; 04-runtime §15): the control loop consumes the
 workcell's driver events every tick and reports the aggregate per-arm state
@@ -24,7 +49,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from apollo_mavis_v2_core import (
     ArmConfig,
@@ -33,18 +58,36 @@ from apollo_mavis_v2_core import (
     ProfileStore,
     WorkcellConfig,
 )
-from apollo_mavis_v2_core.protocol import ArmMaintenanceResult, SessionInfo, SessionSpec
+from apollo_mavis_v2_core.protocol import (
+    ArmBringupTelemetry,
+    ArmMaintenanceResult,
+    SessionInfo,
+    SessionSpec,
+)
 
 from ..config import RuntimeConfig
 from ..control.loop import DEFAULT_ACTIVE_ARM, ControlLoop, controller_error_title
 from ..control.pose_filter import PoseFilterConfig
 from ..control.tracker_teleop import TrackerTeleop
+from ..devices.hardware_monitor import CONNECTED_STATUSES, MONITOR_JOIN_TIMEOUT_S
 from ..devices.tracker import TrackerSettings
 from ..errors import MaintenanceUnavailableError, SessionError, SessionNotFoundError
 from ..safety.gate import NullGate, SafetyGate
 from ..safety.supervisor import SafetySupervisor
 from ..safety.watchdog import ArmReportWatchdog, InputWatchdog
 from ..streams.hub import VideoHub
+from .hardware import (
+    RailFlipWorkcell,
+    RailHoldWorkcell,
+    SessionStateProvider,
+    apply_executor_caps,
+    arm_label,
+    bringup_rows,
+    executor_caps_for,
+    frozen_state,
+    scale_control_config,
+    scale_driver_config,
+)
 from .types import SessionState
 
 if TYPE_CHECKING:
@@ -103,6 +146,23 @@ def _servo_faithful_scene(scene_id: str, overrides=None):
     return BuiltScene(scene.meta, spec, model, spec.to_xml(), Addressing(model, scene.meta))
 
 
+def _bringup_step(status) -> str:
+    """Stage name of a failed ``ArmBringupStatus`` (core ``BringupError`` prefixes
+    its message with ``[step]``; fall back to the status fields)."""
+    error = str(getattr(status, "error", "") or "")
+    if error.startswith("["):
+        return error[1 : error.index("]")] if "]" in error else "connect"
+    if getattr(status, "network", "ok") == "failed":
+        return "network"
+    if getattr(status, "rail", "") in ("unhomed", "error"):
+        return "rail"
+    if getattr(status, "gripper", "") == "error":
+        return "gripper"
+    if "report" in error:
+        return "report"
+    return "connect"
+
+
 def _manipulation_first(ids):
     """Status-row order (``GET /api/workcell``): the Manipulation Arm
     (``grip`` = :data:`DEFAULT_ACTIVE_ARM`, the default teleop arm) first, then
@@ -134,6 +194,64 @@ class ActiveSession:
     sources: list[object] = field(default_factory=list)  # started FrameSources
     start_from_progress: float | None = None
     fault_detail: str = ""
+    # phase-09c (hardware): preview cameras adopted at session fps (NOT in ``streams``:
+    # teardown restores their fps instead of removing them), arms frozen in the gate
+    # twin at their last monitor sample (D1), and the unwrapped HardwareWorkcell when
+    # ``workcell`` is the rail_flip adapter (the overlay reads track coordinates).
+    adopted_streams: list[str] = field(default_factory=list)
+    frozen_arms: list[str] = field(default_factory=list)
+    inner_workcell: object | None = None
+    # phase-09d (hardware): ``start_from=profile`` waypoints planned INSIDE bring-up
+    # (``(waypoints, grippers)``); the start_from worker executes them instead of planning
+    planned_start: tuple[dict, dict] | None = None
+
+
+@dataclass
+class HardwareRig:
+    """Everything :meth:`SessionManager.connect_hardware_rig` builds (phase-09d): the
+    connected drivers behind their adapters, the FRESH gate twin + unconditional
+    ``SafetyGate``, the supervisor and a NOT yet started ``ControlLoop``. Shared by
+    the hardware session bring-up and the rail-homing maintenance job."""
+
+    arms: list[str]
+    session_cfg: WorkcellConfig
+    workcell: object  # what the loop drives (RailFlip / RailHold adapters applied)
+    inner: object  # the unwrapped HardwareWorkcell (track rail convention)
+    twin: object
+    gate: SafetyGate
+    supervisor: SafetySupervisor
+    loop: ControlLoop
+    frozen: dict  # arm_id -> ArmState posed once in the twin (09c D1)
+    speed_scale: float
+    executor_caps: Any = None  # ExecutorCaps applied to the loop (phase-09d; None = host slew)
+
+
+@dataclass
+class _BringupProgress:
+    """Hardware bring-up in flight (phase-09c, D5): ``GET /api/session`` answers
+    ``state: bringup`` and telemetry carries one row per (arm, step)."""
+
+    session_id: str
+    spec: SessionSpec | None  # None: the rail-homing job's connect (rows not exposed)
+    rows: list[ArmBringupTelemetry] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def set(self, arm_id: str, step: str, status: str, detail: str = "") -> None:
+        self.update([ArmBringupTelemetry(arm_id=arm_id, step=step, status=status, detail=detail)])
+
+    def update(self, rows: list[ArmBringupTelemetry]) -> None:
+        with self.lock:
+            for new in rows:
+                for i, old in enumerate(self.rows):
+                    if old.arm_id == new.arm_id and old.step == new.step:
+                        self.rows[i] = new
+                        break
+                else:
+                    self.rows.append(new)
+
+    def snapshot(self) -> list[ArmBringupTelemetry]:
+        with self.lock:
+            return list(self.rows)
 
 
 class SessionManager:
@@ -165,6 +283,16 @@ class SessionManager:
         self.session: ActiveSession | None = None
         self._lock = threading.Lock()
         self._creating = False  # create() is validating / bringing a session up (under _lock)
+        self._creating_kind: str | None = None  # spec.kind of the create() in flight
+        self._bringup: _BringupProgress | None = None  # hardware bring-up rows (phase-09c)
+        # phase-09d: the RailHomingService registers itself here (``active_arm``) so
+        # create() refuses ANY session kind while a rail-homing job / request is live
+        self.maintenance_guard: Any = None
+        # phase-09c test seams: ``workcell_factory(session_cfg, driver_factory)`` replaces
+        # the hardware package's HardwareWorkcell; ``driver_api_factory`` is handed to
+        # every XArmDriver (a FakeXArmAPI in tests, the real SDK when None).
+        self.workcell_factory: Callable[[WorkcellConfig, Callable], object] | None = None
+        self.driver_api_factory: Callable[..., object] | None = None
         self._preview_service = None
         self._preview_scene = None
         self._preview_sources: list[object] = []
@@ -180,7 +308,11 @@ class SessionManager:
     # -- info ------------------------------------------------------------------
     @property
     def state(self) -> SessionState:
-        return self.session.state if self.session else SessionState.IDLE
+        if self.session is not None:
+            return self.session.state
+        if self._bringup is not None:
+            return SessionState.BRINGUP  # a hardware bring-up is in flight (phase-09c)
+        return SessionState.IDLE
 
     @property
     def session_active(self) -> bool:
@@ -191,9 +323,41 @@ class SessionManager:
         coming up; ``_creating`` is raised under ``_lock`` before validation."""
         return self._creating or self.session is not None
 
+    @property
+    def hardware_session_active(self) -> bool:
+        """A HARDWARE session exists or is being brought up (phase-09c): the
+        hand-over predicate of the read-only monitor, the probe and the overlay.
+        ``_creating_kind`` is recorded in :meth:`create` once the refusal matrix
+        (:meth:`_validate_hardware`) has passed and right before
+        :meth:`_bringup_hardware` - i.e. before the first side effect (its
+        ``monitor.pause()``) - so the monitor's 0.5 s supervisor never reconnects
+        the control boxes in the middle of a hardware bring-up (its ``pause()``
+        alone would be undone), while a request that is REFUSED never flips the
+        predicate: a supervisor round landing inside the validation window would
+        otherwise disconnect every arm monitor, make the validation itself fail
+        with a spurious "monitor paused" 409 and leave the monitors down until the
+        next round."""
+        kind = self._creating_kind
+        session = self.session
+        if kind is None and session is not None:
+            kind = session.spec.kind
+        return self.session_active and kind == "hardware"
+
     def info(self) -> SessionInfo:
         s = self.session
         if s is None:
+            bp = self._bringup
+            if bp is not None and bp.spec is not None:  # hardware bring-up in flight (D5)
+                return SessionInfo(
+                    session_id=bp.session_id,
+                    epoch=self.epoch,
+                    mode=bp.spec.mode,
+                    arms=list(bp.spec.arms),
+                    streams=[],
+                    state=SessionState.BRINGUP.value,
+                    kind=bp.spec.kind,
+                    speed_scale=bp.spec.speed_scale,
+                )
             raise SessionNotFoundError("no active session")
         return SessionInfo(
             session_id=s.session_id,
@@ -202,7 +366,15 @@ class SessionManager:
             arms=list(s.spec.arms),
             streams=list(s.streams),
             state=s.state.value,
+            kind=s.spec.kind,
+            speed_scale=s.spec.speed_scale,
         )
+
+    def bringup_telemetry(self) -> list[ArmBringupTelemetry] | None:
+        """``SessionTelemetry.bringup`` (phase-09c): the hardware bring-up rows
+        while one is in flight / until the session is RUNNING; ``None`` otherwise."""
+        bp = self._bringup
+        return bp.snapshot() if bp is not None else None
 
     def _tracker_provider(self) -> TrackerTeleop:
         """Per-session clutch/anchor state over the process-wide tracker slot
@@ -221,7 +393,7 @@ class SessionManager:
     def _validate(self, spec: SessionSpec) -> WorkcellConfig:
         if self.session is not None:
             raise SessionError("a session already exists")
-        if spec.mode in ("dagger", "inference"):
+        if spec.kind != "hardware" and spec.mode in ("dagger", "inference"):
             from ..dagger.registry import resolve_policy
 
             resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)  # 409 early
@@ -229,7 +401,7 @@ class SessionManager:
         if wc is None:
             raise SessionError(f"no {spec.kind!r} workcell config available")
         if spec.kind == "hardware":
-            raise SessionError("hardware sessions land with phase-09 integration")
+            return wc  # the hardware refusal matrix follows in _validate_hardware
         if not spec.arms:
             raise SessionError("session needs at least one arm")
         scene_id = spec.sim_scene or wc.sim_scene
@@ -262,11 +434,29 @@ class SessionManager:
         with self._lock:
             self._creating = True  # session_active() is True from here on
             try:
+                # phase-09d: a rail-homing job (or a home_rail request being evaluated)
+                # excludes EVERY session kind - contract §3 REST "409 rail homing in
+                # progress" - not only the hardware refusal matrix's maintenance_busy
+                guard = self.maintenance_guard
+                busy_arm = guard.active_arm if guard is not None else None
+                if busy_arm is not None:
+                    raise SessionError(
+                        f"rail homing in progress on the {arm_label(busy_arm)} - wait for it "
+                        "to finish"
+                    )
                 wc = self._validate(spec)
-                session = self._bringup_sim(spec, wc)
+                if spec.kind == "hardware":
+                    twin_scene, samples = self._validate_hardware(spec, wc)
+                    # hardware_session_active from here on (monitor hand-over): after the
+                    # refusal matrix, before the first side effect (monitor.pause())
+                    self._creating_kind = spec.kind
+                    session = self._bringup_hardware(spec, wc, twin_scene, samples)
+                else:
+                    session = self._bringup_sim(spec, wc)
                 self.session = session
             finally:
                 self._creating = False
+                self._creating_kind = None
         threading.Thread(
             target=self._start_from_worker, args=(session,), name="start-from", daemon=True
         ).start()
@@ -397,6 +587,621 @@ class SessionManager:
             session.sources.append(twin_src)
             session.streams.append("twin")
         return session
+
+    # -- hardware session (phase-09c/09d; 04-runtime §5 BRINGUP, §13.1 refusal matrix) -----
+    def _validate_hardware(self, spec: SessionSpec, wc: WorkcellConfig) -> tuple[str, dict]:
+        """The hardware refusal matrix (409 via :class:`SessionError`), evaluated
+        BEFORE anything is touched; returns ``(twin_scene, monitor samples)``.
+
+        teleop only (phase-09c) -> at least one arm, every arm in the hardware
+        config AND in the twin scene, and - phase-09d - EVERY configured arm in
+        the session ("hardware sessions include every configured arm") -> a
+        resolvable ``digital_twin_scene`` -> no rail homing in flight on ANY arm
+        (monitor op or rail-homing job) -> per arm: the read-only monitor
+        connected with a sample (the twin cannot be posed otherwise), the
+        control box reachable, no latched controller error ("clear errors
+        first"), a linear track where the twin has one, and that track homed +
+        enabled ("rail not homed" - the operator homes it from the Hardware tab)
+        -> ``start_from`` profile covers the arms.
+        """
+        self._require_armed()
+        if spec.mode != "teleop":
+            raise SessionError("hardware sessions support teleop only (phase-09c)")
+        if not spec.arms:
+            raise SessionError("session needs at least one arm")
+        ids = [a.id for a in wc.arms]
+        missing = [a for a in spec.arms if a not in ids]
+        if missing:
+            raise SessionError(f"arms {missing} not in the hardware workcell (has {ids})")
+        if sorted(spec.arms) != sorted(ids):
+            absent = [a for a in ids if a not in spec.arms]
+            names = ", ".join(arm_label(a) for a in ids)
+            raise SessionError(
+                f"hardware sessions include every configured arm ({names}) - "
+                f"missing {absent} (phase-09d: both arms are always part of the session)"
+            )
+        twin_scene = spec.digital_twin_scene or wc.digital_twin_scene
+        if not twin_scene:
+            raise SessionError("hardware session needs a digital_twin_scene")
+        try:
+            from apollo_mavis_v2_sim import REGISTRY, SceneNotFoundError
+        except ImportError as e:
+            raise SessionError(f"hardware sessions need the [sim] extra for the twin: {e}") from e
+        try:
+            meta = REGISTRY.meta(twin_scene)
+        except SceneNotFoundError as e:
+            raise SessionError(str(e)) from e
+        missing = [a for a in spec.arms if a not in meta.arm_ids]
+        if missing:
+            raise SessionError(
+                f"arms {missing} not in scene {twin_scene!r} (has {list(meta.arm_ids)})"
+            )
+        monitor = self.hardware_monitor
+        if monitor is None:
+            raise SessionError(
+                "no read-only hardware monitor - the digital twin cannot be posed for the gate"
+            )
+        for arm in wc.arms:  # a homing in flight on ANY arm (the carriage is moving)
+            if monitor.maintenance_busy(arm.id):
+                raise SessionError(
+                    f"rail homing in progress on the {arm_label(arm.id)} - wait for it to finish"
+                )
+        samples = monitor.snapshot()
+        probe = self.hardware_probe
+        by_id = {a.id: a for a in wc.arms}
+        for arm_id in spec.arms:
+            name = arm_label(arm_id)
+            status, detail = monitor.status_of(arm_id)
+            sample = samples.get(arm_id)
+            if status not in CONNECTED_STATUSES or sample is None:
+                why = f"monitor {status}" + (f": {detail}" if detail else "")
+                raise SessionError(
+                    f"{name}: no monitor sample ({why}) - the read-only monitor must be "
+                    "connected before a hardware session (the digital twin cannot be posed)"
+                )
+            if probe is not None:
+                reach = probe.reachable(arm_id)
+                if reach in ("refused", "unreachable"):
+                    raise SessionError(
+                        f"{name}: control box {by_id[arm_id].ip} is {reach} - power it on / "
+                        "check the network first"
+                    )
+            code = int(getattr(sample, "error_code", 0) or 0)
+            if code:
+                raise SessionError(
+                    f"{name}: controller error {code} is latched - clear errors first"
+                )
+            rail_present = bool(getattr(sample, "rail_present", False))
+            if meta.rail.get(arm_id, False) and not rail_present:
+                raise SessionError(
+                    f"{name}: the digital twin {twin_scene!r} expects a linear track but the "
+                    "monitor found none"
+                )
+            if rail_present and not (
+                getattr(sample, "rail_homed", False) and getattr(sample, "rail_enabled", False)
+            ):
+                raise SessionError(
+                    f"{name}: rail not homed - home it from the Hardware tab (Home rail) "
+                    "before starting a session (carriage position unknown)"
+                )
+        if spec.start_from.startswith("profile:"):
+            pid = spec.start_from.split(":", 1)[1]
+            try:
+                profile = self.profile_store.get(pid)
+            except ProfileNotFoundError as e:
+                raise SessionError(f"unknown profile {pid!r}") from e
+            uncovered = [a for a in spec.arms if a not in profile.arms]
+            if uncovered:
+                raise SessionError(f"profile {pid!r} does not cover arms {uncovered}")
+        return twin_scene, samples
+
+    def _hardware_driver_factory(self, scale: float, rail_homing: str | None = None) -> Callable:
+        """``XArmDriverConfig -> XArmDriver`` with the D2 speed scale applied to
+        the driver-side caps (``servo.max_joint_vel`` / ``max_cart_step_m`` /
+        ``rail_speed_mm_s``); ``driver_api_factory`` (tests) is forwarded.
+        ``rail_homing="allow_unhomed"`` (phase-09d, the rail-homing job ONLY) lets
+        the driver connect with an unhomed track (position unknown); normal
+        sessions keep the config default ``require_homed``."""
+        api_factory = self.driver_api_factory
+
+        def factory(driver_cfg):
+            from apollo_mavis_v2_hardware import XArmDriver  # [hardware] extra
+
+            scaled = scale_driver_config(driver_cfg, scale)
+            if rail_homing is not None:
+                scaled = scaled.model_copy(update={"rail_homing": rail_homing})
+            if api_factory is None:
+                return XArmDriver(scaled)
+            return XArmDriver(scaled, api_factory=api_factory)
+
+        return factory
+
+    def _default_workcell_factory(self, session_cfg: WorkcellConfig, driver_factory: Callable):
+        """The hardware package's ``HardwareWorkcell`` over the session config;
+        ``netsetup=None``: NIC matching would run nmcli mutations inside the POST,
+        reachability comes from the probe instead (the network stage reports
+        ``ok`` + a warning)."""
+        try:
+            from apollo_mavis_v2_hardware import HardwareWorkcell  # [hardware] extra
+        except ImportError as e:
+            raise SessionError(
+                f"hardware package not importable ({type(e).__name__}: {e}); install the "
+                "[hardware] extra"
+            ) from e
+        return HardwareWorkcell(session_cfg, driver_factory=driver_factory, netsetup=None)
+
+    def _on_bringup_status(self, status) -> None:
+        """``HardwareWorkcell.bring_up`` status_cb (bring-up threads) -> telemetry rows."""
+        bp = self._bringup
+        if bp is not None:
+            try:
+                bp.update(bringup_rows(status))
+            except Exception:  # noqa: BLE001 - telemetry must never break bring-up
+                logger.exception("bring-up status row failed")
+
+    def _require_armed(self) -> None:
+        """Arming switch (2026-09-05, after a test process reached a real control box):
+        the REAL xArm drivers are connected only when ``hardware_session.armed`` is
+        true. Test seams (``workcell_factory``) never reach the SDK and bypass it."""
+        if self.workcell_factory is None and not self.cfg.hardware_session.armed:
+            raise SessionError(
+                "hardware not armed: set hardware_session.armed: true in the lab config before "
+                "connecting the real arms (the repo default is false so tests and dev instances "
+                "never enable a control box)"
+            )
+
+    def connect_hardware_rig(
+        self,
+        *,
+        arms: list[str],
+        wc: WorkcellConfig,
+        twin_scene: str,
+        samples: dict,
+        speed_scale: float,
+        progress: _BringupProgress,
+        bus=None,
+        tracker: bool = True,
+        allow_unhomed_rail: bool = False,
+        rail_hold: bool = False,
+        status_cb: Callable | None = None,
+    ) -> HardwareRig:
+        """Connect ``arms`` of the hardware workcell and build the gated control
+        stack around them (04-runtime §5 steps 2-11; the loop is NOT started).
+
+        Shared by :meth:`_bringup_hardware` (every configured arm, the session's
+        ``speed_scale``) and the phase-09d rail-homing job (ONE arm,
+        ``speed_scale`` 0.1, ``allow_unhomed_rail`` + ``rail_hold``: the driver
+        connects with the track unhomed and reports ``rail: unhomed``, the
+        ``RailHoldWorkcell`` adapter shows the twin the configured
+        ``rail_fallback_m`` instead of the driver's 0.0 placeholder and never
+        commands the carriage). Twin arms NOT in ``arms`` are frozen at their
+        last monitor sample (09c D1). ``bus`` defaults to the runtime bus (the
+        job passes a private one so no WS input can reach its loop);
+        ``tracker=False`` builds the loop without the tracker provider. The
+        monitor is paused + joined here; on ANY failure the workcell is stopped
+        again and the exception propagates - the caller resumes the monitor.
+        """
+        self._require_armed()
+        from apollo_mavis_v2_sim import (
+            REGISTRY,
+            DigitalTwin,
+            IKParams,
+            MinkIKSolver,
+            SceneOverrides,
+            default_collision_pairs,
+        )
+
+        from ..control.fk import SceneKinematics
+        from ..streams.twin_overlay import base_pose_overrides
+
+        hs = self.cfg.hardware_session
+        monitor = self.hardware_monitor
+        assert monitor is not None  # _validate_hardware / the job's preflight
+        safety = wc.safety
+        scale = float(speed_scale)
+        meta = REGISTRY.meta(twin_scene)
+        workcell = None
+        try:
+            # 1. monitor hand-over (rule 3): release every box, then wait for the poll
+            #    threads to really exit (a disconnect() may return mid-SDK-call).
+            for a in arms:
+                progress.set(a, "monitor", "pending", "releasing the read-only monitor")
+            monitor.pause()
+            alive = monitor.join(MONITOR_JOIN_TIMEOUT_S)
+            if alive:
+                names = ", ".join(arm_label(a) for a in alive)
+                raise SessionError(
+                    f"read-only monitor of the {names} is still inside the SDK after "
+                    f"{MONITOR_JOIN_TIMEOUT_S:g} s - retry in a moment"
+                )
+            for a in arms:
+                progress.set(a, "monitor", "ok", "read-only monitor released the control box")
+
+            # 2. WorkcellConfig for these arms only, NO cameras (rule 4)
+            session_cfg = wc.model_copy(
+                update={"arms": [a for a in wc.arms if a.id in arms], "cameras": []}
+            )
+
+            # 3. HardwareWorkcell with the speed-scaled driver factory (D2), netsetup None
+            factory = self.workcell_factory or self._default_workcell_factory
+            workcell = factory(
+                session_cfg,
+                self._hardware_driver_factory(
+                    scale, rail_homing="allow_unhomed" if allow_unhomed_rail else None
+                ),
+            )
+            inner = workcell
+
+            # 4. bring_up (never start(): one arm failing must not abort the report)
+            bring_up = getattr(workcell, "bring_up", None)
+            if bring_up is None:
+                raise SessionError("the hardware workcell has no bring_up()")
+            statuses = bring_up(
+                status_cb=status_cb or self._on_bringup_status, timeout_s=hs.bringup_timeout_s
+            )
+            failures = []
+            accepted_rail = ("ready", "none") + (("unhomed",) if allow_unhomed_rail else ())
+            for arm_id in arms:
+                st = statuses.get(arm_id)
+                if st is None:
+                    failures.append(f"{arm_label(arm_id)}: bring-up reported no status")
+                    continue
+                error = getattr(st, "error", None)
+                rail = str(getattr(st, "rail", "unknown"))
+                if error or not getattr(st, "connected", False):
+                    failures.append(
+                        f"{arm_label(arm_id)}: {_bringup_step(st)} - "
+                        f"{error or 'not connected'}"
+                    )
+                elif meta.rail.get(arm_id, False) and rail not in accepted_rail:
+                    # connected with a track that is not READY (e.g. the driver latched
+                    # RAIL_ERROR at connect): its position is unverifiable, so the gate
+                    # twin would place the carriage at a guess - refuse. ("none" on a
+                    # railed twin arm is the dof mismatch caught right below.) The
+                    # rail-homing job accepts "unhomed" (it homes the track itself).
+                    failures.append(
+                        f"{arm_label(arm_id)}: rail - linear track {rail} after connect "
+                        "(carriage position unknown, the digital twin cannot gate it)"
+                    )
+            if failures:
+                raise SessionError("hardware bring-up failed: " + "; ".join(failures))
+
+            # 5. consistency: driver dof == twin dof, first state not stale
+            states = workcell.states()
+            for arm_id in arms:
+                expected = 8 if meta.rail.get(arm_id, False) else 7
+                dof = int(workcell.arms[arm_id].dof)
+                if dof != expected:
+                    raise SessionError(
+                        f"{arm_label(arm_id)}: driver reports {dof} dof but the digital twin "
+                        f"{twin_scene!r} has {expected} (rail detection disagrees)"
+                    )
+                st = states.get(arm_id)
+                if st is None or st.stale:
+                    raise SessionError(
+                        f"{arm_label(arm_id)}: first state is stale (30003 report stream silent)"
+                    )
+            if hs.rail_flip:  # one rail convention for twin, IK, gate and loop
+                workcell = RailFlipWorkcell(inner)
+            if rail_hold:  # phase-09d: unknown carriage -> the twin sees the fallback
+                workcell = RailHoldWorkcell(workcell, self.cfg.twin_overlay.rail_fallback_m)
+            if workcell is not inner:
+                states = workcell.states()  # the start-posture check below sees it too
+
+            # 6. FRESH gate twin (never the cached status scene: inflation mutates the model)
+            overrides = SceneOverrides(
+                microphones={a.id: bool(a.microphone) for a in wc.arms if a.id in meta.arm_ids},
+                base_pose={
+                    k: v for k, v in base_pose_overrides(wc).items() if k in meta.arm_ids
+                },
+            )
+            try:
+                twin = DigitalTwin(
+                    REGISTRY.build(twin_scene, overrides),
+                    inflation_m=safety.geom_inflation_m,
+                    allowed_pairs_extra=safety.allowed_pairs_extra,
+                )
+            except Exception as e:  # noqa: BLE001 - TwinAuditError / scene build
+                raise SessionError(f"digital twin {twin_scene!r} unavailable: {e}") from e
+            # 7. the gate is UNCONDITIONAL on hardware (11-safety §4; ControlLoop re-checks)
+            gate = SafetyGate(twin, safety)
+            pairs = default_collision_pairs(twin.scene, twin.allowed)
+            for a in arms:
+                progress.set(a, "gate", "ok", f"SafetyGate on twin {twin_scene!r}")
+
+            # 8. D1: arms not connected here are frozen at their last monitor sample
+            frozen = self._freeze_unselected_arms(twin, meta, arms, samples, progress)
+
+            # 9. IK / kinematics / supervisor
+            ik = MinkIKSolver(
+                twin.scene,
+                IKParams(
+                    min_distance_m=safety.geom_inflation_m + 0.002,
+                    lock_rail=not self.cfg.control.rail_in_ik,
+                ),
+                collision_pairs=pairs,
+            )
+            if frozen:
+                ik.sync_passive(frozen)
+            kin = SceneKinematics(twin.scene)
+            supervisor = SafetySupervisor(
+                gate,
+                InputWatchdog(self.cfg.control.watchdog.stale_s, self.cfg.control.watchdog.ramp_s),
+                twin=twin,
+                report_watchdog=ArmReportWatchdog(safety.twin_staleness_s),
+                warn_clearance_m=safety.warn_clearance_m,
+            )
+            start_report = twin.check({a: states[a].q for a in arms})
+            if start_report.blocked:
+                for a in arms:
+                    progress.set(
+                        a,
+                        "gate",
+                        "warning",
+                        f"twin reports {start_report.pairs} within the inflation at the start "
+                        "posture - the gate holds until the clearance opens",
+                    )
+
+            # 10. control loop at the scaled host-side caps; workcell_kind hardware. The
+            #     PlanExecutor is additionally bounded by the connected drivers' servo
+            #     caps (per-joint velocity + lever-weighted Cartesian step; phase-09d):
+            #     a host step the streamer must clip would bend the physical path off
+            #     the validated straight segment while the gate sees only the command.
+            control_cfg = scale_control_config(self.cfg.control, scale)
+            caps = executor_caps_for((inner.arms[a] for a in arms), control_cfg)
+            control_cfg = apply_executor_caps(control_cfg, caps)
+            if caps.source == "servo":
+                logger.info(
+                    "hardware loop: plan executor capped by the servo stream - slew %.5f rad/tick, "
+                    "cart %.5f m/tick (host slew %.5f)",
+                    caps.slew_rad_per_tick,
+                    caps.cart_step_m if caps.cart_step_m is not None else float("nan"),
+                    scale_control_config(self.cfg.control, scale).jog.slew_rad_per_tick,
+                )
+            loop = ControlLoop(
+                workcell,
+                control_cfg,
+                bus or self.bus,
+                supervisor,
+                list(arms),
+                ik=ik,
+                kin=kin,
+                planner=twin,
+                profile_store=self.profile_store,
+                workcell_kind="hardware",
+                gripper_arms=[a.id for a in session_cfg.arms if a.gripper != "none"],
+                tracker=self._tracker_provider() if tracker else None,
+            )
+            return HardwareRig(
+                arms=list(arms),
+                session_cfg=session_cfg,
+                workcell=workcell,
+                inner=inner,
+                twin=twin,
+                gate=gate,
+                supervisor=supervisor,
+                loop=loop,
+                frozen=frozen,
+                speed_scale=scale,
+                executor_caps=caps,
+            )
+        except BaseException:
+            if workcell is not None:
+                try:
+                    workcell.stop()  # nothing half-connected (D6 hand-back)
+                except Exception:  # noqa: BLE001
+                    logger.exception("hardware connect abort: workcell.stop failed")
+            raise
+
+    @staticmethod
+    def stop_rig(loop, workcell) -> None:
+        """Stop a :class:`HardwareRig`'s loop (senders) then its drivers
+        (``HardwareWorkcell.shutdown`` sees no cameras; D6 hand-back: mode 0,
+        state 4, brakes engaged, posture kept). Never raises."""
+        try:
+            if loop is not None:
+                loop.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("hardware rig: loop.stop failed")
+        try:
+            if workcell is not None:
+                workcell.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("hardware rig: workcell.stop failed")
+
+    def _bringup_hardware(
+        self, spec: SessionSpec, wc: WorkcellConfig, twin_scene: str, samples: dict
+    ) -> ActiveSession:
+        """Mirror of :meth:`_bringup_sim` for the real cell (module docstring;
+        04-runtime §5): :meth:`connect_hardware_rig` for every configured arm,
+        the ``start_from`` profile motion planned on the gate twin BEFORE the
+        loop starts (phase-09d: a plan failure is a 409, never a silent hold),
+        then the loop, the session, the camera hand-over and the overlay
+        provider. Every failure path tears down what exists, restores the
+        camera fps and resumes the monitor before the ``SessionError`` (409)
+        leaves; nothing stays half-connected."""
+        scale = float(spec.speed_scale)
+        session_id = uuid.uuid4().hex
+        progress = _BringupProgress(session_id, spec)
+        self._bringup = progress
+        labels = ", ".join(arm_label(a) for a in spec.arms)
+        logger.info(
+            "hardware session %s: bring-up of %s at speed scale %.2f (twin %r)",
+            session_id,
+            labels,
+            scale,
+            twin_scene,
+        )
+        rig: HardwareRig | None = None
+        session: ActiveSession | None = None
+        try:
+            rig = self.connect_hardware_rig(
+                arms=list(spec.arms),
+                wc=wc,
+                twin_scene=twin_scene,
+                samples=samples,
+                speed_scale=scale,
+                progress=progress,
+            )
+            # 11. start_from=profile: plan on the gate twin NOW (measured start, frozen
+            #     arms as obstacles); the worker executes the waypoints (§5.2 path)
+            planned = None
+            if spec.start_from.startswith("profile:"):
+                planned = self._plan_profile_start(spec, rig, progress)
+            rig.loop.start()
+            loop, workcell = rig.loop, rig.workcell
+            session = ActiveSession(
+                session_id=session_id,
+                spec=spec,
+                state=SessionState.BRINGUP,
+                workcell=workcell,
+                loop=loop,
+                supervisor=rig.supervisor,
+                twin=rig.twin,
+                render_service=None,
+                frozen_arms=sorted(rig.frozen),
+                inner_workcell=rig.inner,
+                planned_start=planned,
+            )
+            self.attach_fault_state(session)
+
+            # 12. camera hand-over (rule 4): the previews keep their UVC nodes and hub
+            #     ids, only their encoder fps changes; teardown switches it back.
+            for cam_id in list(self._hw_cameras):
+                if self.hardware_camera(cam_id) is None:
+                    continue
+                self.hub.set_fps(cam_id, self.cfg.video.session_fps)
+                session.adopted_streams.append(cam_id)
+
+            # 13. overlay: the monitor is paused, so the alignment streams read the
+            #     session arms from the driver (and any frozen arm from its sample).
+            if self.twin_overlay is not None:
+                self.twin_overlay.set_state_provider(
+                    SessionStateProvider(
+                        rig.inner,
+                        spec.arms,
+                        {a: samples[a] for a in rig.frozen if a in samples},
+                        loop.gripper_arms,
+                    )
+                )
+            for a in spec.arms:
+                progress.set(a, "loop", "ok", f"control loop running at speed scale {scale:g}")
+            logger.info("hardware session %s: bring-up complete (%s)", session_id, labels)
+            return session
+        except BaseException:
+            self._abort_hardware_bringup(
+                rig.loop if rig is not None else None,
+                rig.workcell if rig is not None else None,
+                session,
+            )
+            raise
+
+    def _plan_profile_start(
+        self, spec: SessionSpec, rig: HardwareRig, progress: _BringupProgress
+    ) -> tuple[dict, dict]:
+        """``start_from=profile:<id>`` on hardware (phase-09d): plan every arm's
+        motion from its MEASURED posture to the profile posture on the gate twin
+        (``twin.plan`` - RRT-Connect, frozen arms as static obstacles; the rail
+        slot follows the profile when it has one, else stays) before the loop
+        starts; returns ``(waypoints, grippers)`` for ``execute_plan``. A failed
+        plan raises ``SessionError`` ("profile motion not collision-free") and the
+        caller tears the session down."""
+        from apollo_mavis_v2_core import PlanRequest
+
+        pid = spec.start_from.split(":", 1)[1]
+        profile = self.profile_store.get(pid)  # validated by _validate_hardware
+        states = rig.workcell.states()
+        q_start: dict[str, list[float]] = {}
+        q_goal: dict[str, list[float]] = {}
+        grippers: dict[str, float] = {}
+        for arm_id in rig.arms:
+            st = states[arm_id]
+            posture = profile.arms[arm_id]
+            goal = list(posture.q)
+            if st.q.shape[0] > 7:  # rail slot LAST
+                rail = posture.rail_pos_m
+                goal.append(float(st.q[7]) if rail is None else float(rail))
+            q_start[arm_id] = [float(x) for x in st.q]
+            q_goal[arm_id] = goal
+            if arm_id in rig.loop.gripper_arms:
+                grippers[arm_id] = float(posture.gripper_open_frac)
+        for a in rig.arms:
+            progress.set(a, "start_from", "pending", f"planning the motion to profile {pid!r}")
+        rig.twin.sync({a: states[a] for a in rig.arms})  # measured context for the planner
+        result = rig.twin.plan(PlanRequest(q_start=q_start, q_goal=q_goal))
+        if not result.ok:
+            pair = f" ({' / '.join(result.failing_pair)})" if result.failing_pair else ""
+            raise SessionError(
+                f"profile motion not collision-free: {result.failure}{pair} - the digital twin "
+                f"found no safe path from the measured posture to profile {pid!r}"
+            )
+        for a in rig.arms:
+            progress.set(
+                a,
+                "start_from",
+                "ok",
+                f"{len(result.waypoints.get(a, ()))} waypoints planned to profile {pid!r}",
+            )
+        return result.waypoints, grippers
+
+    def _freeze_unselected_arms(
+        self, twin, meta, arms: list[str], samples: dict, progress: _BringupProgress
+    ) -> dict:
+        """D1: pose every twin arm NOT in ``arms`` once from its last monitor sample
+        (q7 + rail position / ``rail_fallback_m``, ``rail_flip`` applied) and leave
+        it there - brakes engaged, never commanded; a row says so. An arm the
+        monitor never sampled keeps the scene keyframe (warning). Since phase-09d
+        only the rail-homing maintenance motion connects a subset of the arms."""
+        hs = self.cfg.hardware_session
+        frozen: dict = {}
+        for arm_id in meta.arm_ids:
+            if arm_id in arms:
+                continue
+            name = arm_label(arm_id)
+            sample = samples.get(arm_id)
+            if sample is None or len(getattr(sample, "q", ())) < 7:
+                progress.set(
+                    arm_id,
+                    "frozen",
+                    "warning",
+                    f"{name}: no monitor sample - the twin keeps its keyframe posture; "
+                    "do not move it from Studio",
+                )
+                continue
+            state, note = frozen_state(
+                arm_id,
+                sample,
+                has_rail=bool(meta.rail.get(arm_id, False)),
+                rail_fallback_m=self.cfg.twin_overlay.rail_fallback_m,
+                rail_flip=hs.rail_flip,
+            )
+            twin.sync({arm_id: state})
+            frozen[arm_id] = state
+            detail = f"{name} frozen at last sample (monitor seq {getattr(sample, 'seq', 0)})"
+            if note:
+                detail += f"; {note}"
+            progress.set(arm_id, "frozen", "warning" if note else "ok", detail)
+            logger.info("hardware maintenance/session: %s", detail)
+        return frozen
+
+    def _abort_hardware_bringup(self, loop, workcell, session: ActiveSession | None) -> None:
+        """Failure path of :meth:`_bringup_hardware`: stop what started (loop ->
+        drivers; ``HardwareWorkcell.shutdown`` sees no cameras), restore the
+        adopted previews' fps, drop the overlay provider, resume the monitor
+        (the hand-over predicate goes false first so the supervisor agrees)."""
+        self.stop_rig(loop, workcell)
+        if session is not None:
+            for cam_id in session.adopted_streams:
+                self.hub.set_fps(cam_id, self.cfg.video.preview_fps)
+        if self.twin_overlay is not None:
+            self.twin_overlay.set_state_provider(None)
+        self._bringup = None
+        self._creating_kind = None  # hardware_session_active false before the monitor resumes
+        if self.hardware_monitor is not None:
+            try:
+                self.hardware_monitor.resume()
+            except Exception:  # noqa: BLE001
+                logger.exception("hardware bring-up abort: monitor resume failed")
 
     def _build_collect_recorder(
         self,
@@ -687,34 +1492,42 @@ class SessionManager:
             if not session.spec.start_from.startswith("profile:"):
                 if session.state is SessionState.BRINGUP:  # a fault may already hold it
                     session.state = SessionState.RUNNING  # keep_current: no motion
+                    self._bringup = None  # hardware bring-up rows shown until running
                 return
             if session.state is not SessionState.BRINGUP:
                 return  # faulted during bring-up: no start_from motion
             session.state = SessionState.START_FROM
             session.start_from_progress = 0.0
-            pid = session.spec.start_from.split(":", 1)[1]
-            profile = self.profile_store.get(pid)
-            states = session.workcell.states()
-            q_start: dict[str, list[float]] = {}
-            q_goal: dict[str, list[float]] = {}
-            grippers: dict[str, float] = {}
-            for arm_id in session.spec.arms:
-                st = states[arm_id]
-                posture = profile.arms[arm_id]
-                goal = list(posture.q)
-                if st.q.shape[0] > 7:  # rail slot LAST
-                    rail = posture.rail_pos_m
-                    goal.append(float(st.q[7]) if rail is None else float(rail))
-                q_start[arm_id] = [float(x) for x in st.q]
-                q_goal[arm_id] = goal
-                if arm_id in session.loop.gripper_arms:
-                    grippers[arm_id] = float(posture.gripper_open_frac)
-            from apollo_mavis_v2_core import PlanRequest
+            if session.planned_start is not None:
+                # hardware (phase-09d): planned on the gate twin inside bring-up
+                waypoints, grippers = session.planned_start
+                q_goal = dict(waypoints)
+                result = None
+            else:
+                pid = session.spec.start_from.split(":", 1)[1]
+                profile = self.profile_store.get(pid)
+                states = session.workcell.states()
+                q_start: dict[str, list[float]] = {}
+                q_goal = {}
+                grippers = {}
+                for arm_id in session.spec.arms:
+                    st = states[arm_id]
+                    posture = profile.arms[arm_id]
+                    goal = list(posture.q)
+                    if st.q.shape[0] > 7:  # rail slot LAST
+                        rail = posture.rail_pos_m
+                        goal.append(float(st.q[7]) if rail is None else float(rail))
+                    q_start[arm_id] = [float(x) for x in st.q]
+                    q_goal[arm_id] = goal
+                    if arm_id in session.loop.gripper_arms:
+                        grippers[arm_id] = float(posture.gripper_open_frac)
+                from apollo_mavis_v2_core import PlanRequest
 
-            if session.supervisor.twin is None:  # plain sim: keep the plan twin fresh
-                session.twin.sync(states)
-            result = session.twin.plan(PlanRequest(q_start=q_start, q_goal=q_goal))
-            if not result.ok:
+                if session.supervisor.twin is None:  # plain sim: keep the plan twin fresh
+                    session.twin.sync(states)
+                result = session.twin.plan(PlanRequest(q_start=q_start, q_goal=q_goal))
+                waypoints = result.waypoints
+            if result is not None and not result.ok:
                 logger.error("start_from plan failed: %s %s", result.failure,
                              result.failing_pair)
                 session.fault_detail = f"start_from plan failed: {result.failure}"
@@ -727,10 +1540,10 @@ class SessionManager:
                     source="internal",
                 ))
                 return
-            total = sum(len(w) for w in result.waypoints.values()) or 1
+            total = sum(len(w) for w in waypoints.values()) or 1
             self.bus.commands.submit(Command(
                 op="execute_plan",
-                args={"waypoints": result.waypoints, "gripper": grippers},
+                args={"waypoints": waypoints, "gripper": grippers},
                 source="internal",
             ))
             plans = session.loop.plans
@@ -748,6 +1561,7 @@ class SessionManager:
             session.start_from_progress = None
             if session.state is SessionState.START_FROM:  # a driver fault may own it now
                 session.state = SessionState.RUNNING
+                self._bringup = None
         except Exception as e:
             logger.exception("start_from worker failed")
             session.fault_detail = repr(e)
@@ -887,12 +1701,19 @@ class SessionManager:
 
     # -- teardown -------------------------------------------------------------------
     def teardown(self) -> None:
-        """DELETE /api/session (idempotent); also SIGTERM/fatal-error path."""
+        """DELETE /api/session (idempotent); also SIGTERM/fatal-error path.
+
+        Hardware (phase-09c): after ``workcell.stop()`` (drivers hand the arms
+        back stopped + braked, D6; the workcell owns no cameras) the adopted
+        previews go back to ``preview_fps``, the overlay reads the monitor
+        again and the read-only monitor is resumed (after ``session`` is
+        cleared so its predicate agrees)."""
         with self._lock:
             session = self.session
             if session is None:
                 return
             session.state = SessionState.TEARDOWN
+            hardware = session.spec.kind == "hardware"
             try:
                 if session.policy_session is not None:
                     session.policy_session.stop()  # trainer stop -> reloader -> runner
@@ -907,7 +1728,15 @@ class SessionManager:
                     session.render_service.stop()
                 session.workcell.stop()
             finally:
+                if hardware:
+                    for cam_id in session.adopted_streams:
+                        self.hub.set_fps(cam_id, self.cfg.video.preview_fps)
+                    if self.twin_overlay is not None:
+                        self.twin_overlay.set_state_provider(None)
                 self.session = None
+                self._bringup = None
+            if hardware and self.hardware_monitor is not None:
+                self.hardware_monitor.resume()
         self.start_previews()
 
     # -- pre-session camera previews (~15 fps, 04-runtime §13.4) --------------------

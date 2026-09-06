@@ -215,13 +215,24 @@ def test_hardware_previews_survive_a_sim_session_and_sim_previews_stop(client, r
     assert rt.hub.has("camera1")
 
 
-def test_hardware_session_still_409_until_phase_09(client):
-    spec = {
-        "mode": "teleop", "kind": "hardware", "arms": ["grip"],
-        "frames": {"grip": "arm_base:grip"}, "digital_twin_scene": SCENE,
+def test_hardware_session_refused_without_a_monitor_sample(client, rt):
+    """Phase-09c: the hardware path exists, but with the read-only monitor
+    disabled the digital twin cannot be posed for the gate -> 409 naming the arm
+    (user-facing name) and the monitor's own reason. Nothing was touched: the
+    previews stay up, no session, monitor never paused."""
+    spec = {  # phase-09d: every configured arm (a subset is its own 409, tested elsewhere)
+        "mode": "teleop", "kind": "hardware", "arms": ["grip", "view"],
+        "frames": {"grip": "arm_base:grip", "view": "arm_base:view"},
+        "digital_twin_scene": SCENE,
     }
     r = client.post("/api/session", json=spec)
-    assert r.status_code == 409 and "phase-09" in r.json()["detail"]
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail.startswith("Manipulation Arm: no monitor sample (monitor off:")
+    assert "hardware_monitor.enabled: false" in detail
+    assert rt.manager.session is None and rt.hub.has("camera1")
+    assert client.get("/api/session").status_code == 404
+    assert rt.manager.hardware_session_active is False
 
 
 def test_hardware_ready_false_when_boxes_refuse(tmp_path):

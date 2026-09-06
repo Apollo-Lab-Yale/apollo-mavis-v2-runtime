@@ -53,6 +53,16 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
     assert ov.stale_tint_rgb == (170, 170, 170)
     assert ov.joint1_offset_rad == 0.0 and ov.rail_flip is False
     assert ov.rail_fallback_m == {"grip": 0.65, "view": 0.0}
+    # Phase-09c/09d: first live runs at 10 % (both arms always in the session, so no
+    # arm pre-selection key); D4 sweep margins; rail_flip lives here now (the overlay
+    # key is an alias) and stays false until the first homing is checked against the
+    # *_align overlay.
+    hs = cfg.hardware_session
+    assert hs.default_speed_scale == 0.1 and not hasattr(hs, "default_arms")
+    assert hs.rail_flip is False and ov.rail_flip is False
+    assert (hs.home_rail_inflation_m, hs.home_rail_step_m) == (0.025, 0.005)
+    assert hs.bringup_timeout_s == 60.0
+    assert cfg.tracker.backend == "fake"  # the live config switches to libsurvive
     sim = cfg.workcells["sim"]
     assert {a.id for a in sim.arms} == {"view", "grip"} and sim.sim_scene == "mavis_v2"
 

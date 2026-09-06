@@ -1,24 +1,29 @@
-"""``POST /api/hardware/arms/{arm_id}/maintenance`` (phase-09b; 04-runtime §13.1 /
-§15) over a Runtime with a hardware workcell config, a FAKE read-only monitor and,
-for the session path, a hand-installed hardware session over
-``tests/fakes.EventFakeWorkcell`` - no control box anywhere.
+"""``POST /api/hardware/arms/{arm_id}/maintenance`` (phase-09b/09c; 04-runtime
+§13.1 / §15) over a Runtime with a hardware workcell config, a FAKE read-only
+monitor and, for the session path, a REAL ``POST /api/session kind=hardware``
+over ``tests/fakes.HardwareFakeWorkcell`` (the ``workcell_factory`` seam) - no
+control box anywhere.
 
-Three routes: the monitor path (no session: clear_errors / apply_backstops on
-the arm monitor's thread, ``recover`` -> 409), the session path (a hardware
-session owns the boxes: clear_errors / recover = the driver's user recovery,
-apply_backstops -> 409) and the 409 matrix (unknown arm 404, monitor off /
-paused / erroring, busy). Plus the session state machine FAULT -> RECOVERING ->
-RUNNING driven by the scripted driver events, and the telemetry fields
-``hardware_monitor.arms[*]`` read-backs / ``backstops_match`` /
-``maintenance_busy`` and ``arms[*].fault_detail`` / ``recovering``."""
+Routes: the monitor path (no session: clear_errors / apply_backstops on the arm
+monitor's thread, ``recover`` -> 409, ``home_rail`` = the twin-gated homing:
+dry-run verdict, blocked sweep = ok false + zero writes, clear sweep = the
+fake's exact write set), the session path (a hardware session owns the boxes:
+clear_errors / recover = the driver's user recovery, apply_backstops and
+home_rail -> 409) and the 409 matrix (unknown arm 404, monitor off / paused /
+erroring, busy; ``POST /api/session`` while a homing is in flight). Plus the
+fake full chain of the phase-09c acceptance (unhomed -> session 409 -> home_rail
+-> session running) and the session state machine FAULT -> RECOVERING ->
+RUNNING driven by the scripted driver events."""
 
 from __future__ import annotations
 
+import math
 import time
+from dataclasses import replace
 
 import pytest
 from apollo_mavis_v2_core import WorkcellConfig
-from apollo_mavis_v2_core.protocol import ArmMaintenanceResult, SessionSpec
+from apollo_mavis_v2_core.protocol import ArmMaintenanceResult
 from apollo_mavis_v2_core.testing import FakeArm
 from conftest import (
     BACKSTOP_SEQUENCE,
@@ -27,24 +32,40 @@ from conftest import (
     FakeMonitorSample,
     make_runtime_config,
 )
-from fakes import EventFakeWorkcell
+from fakes import HardwareFakeWorkcell
 from starlette.testclient import TestClient
 
 from apollo_mavis_v2_runtime.config import (
-    ControlConfig,
     HardwareMonitorConfig,
     HardwareProbeConfig,
     MicrophoneConfig,
     TwinOverlayConfig,
 )
-from apollo_mavis_v2_runtime.control.loop import ControlLoop
 from apollo_mavis_v2_runtime.runtime import Runtime
-from apollo_mavis_v2_runtime.safety.gate import NullGate
-from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
-from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 from apollo_mavis_v2_runtime.server.app import create_app
-from apollo_mavis_v2_runtime.session.manager import ActiveSession
 from apollo_mavis_v2_runtime.session.types import SessionState
+
+PI = math.pi
+HOME_RAIL_WRITES = [
+    "set_linear_track_back_origin",
+    "set_linear_track_enable",
+    "set_linear_track_speed",
+]
+TABLE_DIVE_Q = (PI, 0.8, 0.0, 0.5, 0.0, 0.3, 0.0)  # gripper below the table top (test_rail_sweep)
+# Manipulation Arm reaching sideways along the rail: the sweep is blocked (the gripper
+# meets the rail base near 0 m) AND no candidate posture has a position-agnostic path
+# (every path would first move the gripper deeper into the rail base at rail 0 m).
+REACH_SIDE_Q = (PI / 2, 0.9, 0.0, 0.9, 0.0, 0.0, 0.0)
+HW_SPEC = {
+    "mode": "teleop",
+    "kind": "hardware",
+    "arms": ["grip", "view"],  # phase-09d: every configured arm, always
+    "frames": {"grip": "arm_base:grip", "view": "arm_base:view"},
+    "digital_twin_scene": "mavis_v2",
+    "speed_scale": 0.1,
+}
+GRIP_Q0 = [PI, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.65]  # keyframe posture, rail at the right end
+VIEW_Q0 = [PI, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 HW_WORKCELL = {
     "kind": "hardware",
@@ -81,7 +102,7 @@ def _samples() -> dict[str, FakeMonitorSample]:
     (grip) / 1 (view), C19 latched on the Perception Arm."""
     now = time.monotonic()
     return {
-        "grip": FakeMonitorSample(
+        "grip": FakeMonitorSample(  # rail present, NOT homed (as found): rail_pos_m None
             "grip",
             seq=3,
             t_mono=now,
@@ -160,8 +181,10 @@ def _hw_arm(msg: dict, arm_id: str) -> dict:
 def test_unknown_arm_404_and_bad_op_422(client):
     r = client.post(URL.format("arm9"), json={"op": "clear_errors"})
     assert r.status_code == 404 and "arm9" in r.json()["detail"]
-    assert client.post(URL.format("grip"), json={"op": "home_rail"}).status_code == 422
+    assert client.post(URL.format("grip"), json={"op": "go_home"}).status_code == 422
     assert client.post(URL.format("grip"), json={}).status_code == 422
+    body = {"op": "home_rail", "dry_run": "yes?"}
+    assert client.post(URL.format("grip"), json=body).status_code == 422
 
 
 # -- monitor path (no session) -------------------------------------------------------------
@@ -272,49 +295,290 @@ def test_monitor_not_connected_or_busy_is_409(client, factory):
         view.scripted_outcome = None
 
 
+# -- home_rail: THE ONE motion op (phase-09c; monitor path, twin-gated) ----------------------
+def test_home_rail_dry_run_returns_the_sweep_verdict_and_writes_nothing(client, factory):
+    grip = factory.monitors["grip"]
+    assert grip.sample.rail_present and not grip.sample.rail_homed  # as found in the lab
+    r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+    assert r.status_code == 200, r.text
+    res = ArmMaintenanceResult.model_validate(r.json())
+    assert (res.arm_id, res.op, res.path, res.ok) == ("grip", "home_rail", "monitor", True)
+    assert res.sdk_codes == {} and res.after is None  # zero writes
+    assert res.before is not None and res.before.rail_homed is False
+    v = res.rail_sweep
+    assert v is not None and v.clear
+    assert (v.scene_id, v.inflation_m, v.step_m) == ("mavis_v2", 0.025, 0.005)
+    assert v.q_checked == pytest.approx(list(grip.sample.q)) and v.sample_seq == grip.sample.seq
+    assert v.assumptions == ["view rail unknown - used fallback 0.00 m"]
+    assert v.min_clearance_pair == ["table", "view_microphone"]
+    assert res.detail.startswith("rail sweep clear")
+    assert res.detail.endswith("(dry run, nothing written)")
+    assert grip.homing_calls == [] and all(c[0] != "home_rail" for c in grip.maintenance_calls)
+    assert grip.sample.rail_homed is False  # untouched
+
+
+def test_home_rail_blocked_sweep_without_a_plan_is_refused_with_zero_writes(client, rt, factory):
+    """Phase-09d: a blocked sweep is refused ONLY when no rail-safe pre-positioning
+    path exists (the position-agnostic check rejects every candidate) - status
+    ``refused``, ``ok`` false, nothing written, no job started."""
+    grip = factory.monitors["grip"]
+    original = grip.sample
+    grip.sample = replace(original, q=REACH_SIDE_Q, seq=original.seq + 1)
+    try:
+        for body in ({"op": "home_rail", "dry_run": True}, {"op": "home_rail"}):
+            r = client.post(URL.format("grip"), json=body)  # dry run, then the REAL op
+            assert r.status_code == 200, r.text
+            res = ArmMaintenanceResult.model_validate(r.json())
+            assert res.status == "refused" and res.job_id is None
+            assert res.ok is False and res.sdk_codes == {} and res.after is None
+            assert res.rail_sweep is not None and not res.rail_sweep.clear
+            assert res.rail_sweep.first_blocked_m == 0.0
+            assert "grip_rail_base" in res.rail_sweep.first_blocked_pair
+            plan = res.rail_sweep.pre_position
+            assert plan is not None and plan.needed and not plan.clear
+            assert plan.waypoints == 0 and plan.target_q == [] and plan.source == "current"
+            assert plan.detail.startswith("no rail-safe pre-positioning path: keyframe:")
+            assert "home:" in plan.detail and plan.detail.endswith(
+                "fold the arm toward the factory zero posture in xArm Studio (joints 2-7 near 0) "
+                "and retry"
+            )
+            assert res.detail.startswith("home_rail refused: home_rail refused: rail sweep blocked")
+            assert grip.homing_calls == []  # the monitor never saw the op
+            assert all(c[0] != "home_rail" for c in grip.maintenance_calls)
+        assert not rt.rail_homing.active and rt.rail_homing.job("grip") is None
+        # the refused real op is the arm's last result; the dry run is not
+        assert client.get(URL.format("grip") + "/last").json()["status"] == "refused"
+    finally:
+        grip.sample = original
+
+
+def test_home_rail_dry_run_with_a_plannable_posture_offers_the_pre_position_plan(
+    client, rt, factory
+):
+    """The table-dive posture is blocked at rail 0 m but a straight joint path to the
+    keyframe posture is clear for EVERY rail position: the dry run says so
+    (``needed`` + ``clear``, waypoints, ~duration at 10 %) and writes nothing."""
+    grip = factory.monitors["grip"]
+    original = grip.sample
+    grip.sample = replace(original, q=TABLE_DIVE_Q, seq=original.seq + 1)
+    try:
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 200, r.text
+        res = ArmMaintenanceResult.model_validate(r.json())
+        assert (res.status, res.ok, res.job_id, res.sdk_codes) == ("done", True, None, {})
+        v = res.rail_sweep
+        assert v is not None and not v.clear and "table" in v.first_blocked_pair
+        plan = v.pre_position
+        assert plan is not None and plan.needed and plan.clear and plan.source == "keyframe"
+        assert plan.target_q == pytest.approx([PI, 0, 0, 0, 0, 0, 0])
+        assert plan.waypoints >= 2 and plan.checked_rail_positions == 131
+        # at the DRIVER's caps x 0.1 (the servo stream's 0.2 mm/tick Cartesian bound over the
+        # lever arms binds: sum|dq| lever = 1.425 m -> ~71 s), not the host slew's 4 s
+        assert 60.0 < plan.duration_s < 90.0
+        assert plan.detail.startswith("the arm first moves along a planned path (")
+        assert res.detail.endswith("(dry run, nothing written)")
+        assert "then the rail homes and the arm holds that posture" in res.detail
+        assert grip.homing_calls == [] and not rt.rail_homing.active
+        assert rt.rail_homing.job("grip") is None  # a dry run never starts the job
+    finally:
+        grip.sample = original
+
+
+def test_home_rail_refusals_are_409_before_any_write(client, factory):
+    grip, view = factory.monitors["grip"], factory.monitors["view"]
+    original = grip.sample
+    # controller error latched -> clear errors first
+    grip.sample = replace(original, error_code=24)
+    try:
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 409 and "controller error 24" in r.json()["detail"]
+        assert "clear errors first" in r.json()["detail"]
+        # no linear track on this arm
+        grip.sample = replace(original, rail_present=False)
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 409 and "no linear track detected" in r.json()["detail"]
+    finally:
+        grip.sample = original
+    # another op running on the arm (the homing itself, typically)
+    grip.maintenance_busy = True
+    try:
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 409 and "already running" in r.json()["detail"]
+        # ... and no hardware session may start while the carriage moves
+        r = client.post("/api/session", json=HW_SPEC)
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"].startswith("rail homing in progress on the Manipulation Arm")
+    finally:
+        grip.maintenance_busy = False
+    # a homing in flight on the OTHER arm: its monitor publishes nothing while the
+    # carriage travels, so its sample still shows the pre-homing carriage - the sweep
+    # would be judged against a wrong posture (two carriages moving, unverified geometry)
+    view.maintenance_busy = True
+    try:
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == (
+            "home_rail refused: rail homing in progress on the Perception Arm - wait for it "
+            "to finish"
+        )
+    finally:
+        view.maintenance_busy = False
+    # the target's own sample is stale: the sweep must use the CURRENT posture
+    grip.forced_status = "stale"
+    try:
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 409, r.text
+        assert "sample of 'grip' is stale" in r.json()["detail"]
+        assert "retry when it reads running" in r.json()["detail"]
+    finally:
+        grip.forced_status = None
+    # the monitor not connected
+    view.forced_status = "error"
+    try:
+        r = client.post(URL.format("view"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 409 and "monitor error" in r.json()["detail"]
+    finally:
+        view.forced_status = None
+    assert grip.homing_calls == [] and view.homing_calls == []
+
+
+def test_home_rail_records_a_non_live_other_arm_monitor_as_an_assumption(client, factory):
+    """The other arm is still posed from its last sample when its monitor is not live
+    (stale / paused / error), but the verdict says so - the HomeRailSheet shows it."""
+    grip, view = factory.monitors["grip"], factory.monitors["view"]
+    view.forced_status = "stale"
+    try:
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 200, r.text
+        res = ArmMaintenanceResult.model_validate(r.json())
+        assert res.ok and res.rail_sweep is not None and res.rail_sweep.clear
+        assert res.rail_sweep.assumptions == [
+            "view rail unknown - used fallback 0.00 m",
+            "view: monitor stale - posed from its last sample, which may not be its current "
+            "posture",
+        ]
+    finally:
+        view.forced_status = None
+    assert grip.homing_calls == [] and res.sdk_codes == {}
+
+
+def _hardware_cells(recovery_latency_s: float = 0.0):
+    """``workcell_factory`` seam + the cells it built (one per POST)."""
+    cells: list[HardwareFakeWorkcell] = []
+
+    def workcell_factory(session_cfg, driver_factory):
+        cell = HardwareFakeWorkcell(
+            {
+                a.id: FakeArm(a.id, has_rail=True, q0=GRIP_Q0 if a.id == "grip" else VIEW_Q0)
+                for a in session_cfg.arms
+            },
+            kind="hardware",
+            recovery_latency_s=recovery_latency_s,
+        )
+        cells.append(cell)
+        return cell
+
+    return workcell_factory, cells
+
+
+def test_fake_full_chain_unhomed_409_then_home_rail_then_session_running(client, rt, factory):
+    """Phase-09c acceptance over fakes: unhomed -> POST /api/session 409 "rail not
+    homed" -> home_rail on BOTH arms (sweep-clear postures: the synchronous 09c
+    monitor path, exact write set, judged from the registers; ``pre_position.needed``
+    false) -> the session comes up to RUNNING with speed_scale applied, the
+    monitor paused and, after DELETE, resumed."""
+    grip, view = factory.monitors["grip"], factory.monitors["view"]
+    view.sample = replace(view.sample, error_code=0, warn_code=0)  # C19 cleared (09b op)
+    assert not grip.sample.rail_homed and not view.sample.rail_homed
+    r = client.post("/api/session", json=HW_SPEC)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"].startswith("Manipulation Arm: rail not homed - home it from the")
+    assert rt.manager.session is None and not rt.hardware_monitor.paused
+
+    r = client.post(URL.format("grip"), json={"op": "home_rail"})
+    assert r.status_code == 200, r.text
+    res = ArmMaintenanceResult.model_validate(r.json())
+    assert (res.path, res.ok, res.status, res.job_id) == ("monitor", True, "done", None)
+    assert list(res.sdk_codes) == HOME_RAIL_WRITES  # never motion_enable
+    assert res.detail.startswith("rail homed: carriage at 0.000 m (register 0 mm), track enabled")
+    assert res.rail_sweep is not None and res.rail_sweep.clear
+    plan = res.rail_sweep.pre_position
+    assert plan is not None and not plan.needed and plan.clear and plan.source == "current"
+    assert plan.target_q == pytest.approx(res.rail_sweep.q_checked) and plan.waypoints == 0
+    assert res.after is not None and res.after.rail_homed and res.after.rail_enabled
+    assert res.after.rail_pos_m == 0.0
+    assert grip.homing_calls == [tuple(res.rail_sweep.q_checked)]  # expected_q hand-off
+    op, driver_cfg, timeout_s = grip.maintenance_calls[-1]
+    assert op == "home_rail" and timeout_s == 45.0  # D3: the long REST budget
+    assert driver_cfg.rail_speed_mm_s == 50 and driver_cfg.arm_id == "grip"
+    msg = _telemetry(client, lambda m: _hw_arm(m, "grip")["rail_homed"] is True)
+    assert _hw_arm(msg, "grip")["rail_pos_m"] == 0.0
+    assert _hw_arm(msg, "grip")["maintenance"] is None  # no async job ran
+    # the synchronous result is the arm's "last" too
+    last = ArmMaintenanceResult.model_validate(client.get(URL.format("grip") + "/last").json())
+    assert last.detail == res.detail and last.status == "done"
+    assert client.get(URL.format("view") + "/last").status_code == 404  # nothing yet
+    assert client.get(URL.format("arm9") + "/last").status_code == 404
+
+    r = client.post("/api/session", json=HW_SPEC)
+    assert r.status_code == 409 and r.json()["detail"].startswith("Perception Arm: rail not homed")
+    r = client.post(URL.format("view"), json={"op": "home_rail"})
+    assert r.status_code == 200 and r.json()["ok"] is True, r.text
+    assert view.homing_calls == [tuple(view.sample.q)] and view.sample.rail_homed
+
+    workcell_factory, cells = _hardware_cells()
+    rt.manager.workcell_factory = workcell_factory
+    try:
+        r = client.post("/api/session", json=HW_SPEC)
+        assert r.status_code == 200, r.text
+        info = r.json()
+        assert (info["kind"], info["speed_scale"], info["arms"]) == (
+            "hardware",
+            0.1,
+            ["grip", "view"],
+        )
+        assert info["streams"] == []  # no cameras configured here -> nothing adopted
+        assert _wait(lambda: rt.manager.state is SessionState.RUNNING)
+        assert rt.hardware_monitor.paused and grip.calls[-1] == "join"
+        assert len(cells) == 1 and cells[0].started and cells[0].bringup_calls == [60.0]
+        assert set(cells[0].arms) == {"grip", "view"}  # both arms (phase-09d)
+        assert rt.manager.session.loop.cfg.dq_max_rad == pytest.approx(0.004)
+        # home_rail is session-less only
+        r = client.post(URL.format("grip"), json={"op": "home_rail", "dry_run": True})
+        assert r.status_code == 409 and r.json()["detail"].endswith("end the session first")
+        msg = _telemetry(client, lambda m: m["session"]["state"] == "running")
+        assert msg["session"]["bringup"] is None and msg["hardware_monitor"]["paused"] is True
+    finally:
+        rt.manager.workcell_factory = None
+        assert client.delete("/api/session").status_code == 204
+    assert cells[0].stop_calls == 1 and rt.manager.session is None
+    assert _wait(lambda: not rt.hardware_monitor.paused) and grip.calls[-1] == "start"
+
+
 # -- session path (a hardware session owns the boxes) ----------------------------------------
 @pytest.fixture()
-def hw_session(rt, client):
-    """A hand-installed hardware session (POST /api/session kind=hardware is still
-    409 until phase-09): EventFakeWorkcell + a real ControlLoop, wired to the
-    manager exactly like ``_bringup_*`` does."""
-    cell = EventFakeWorkcell(
-        {"grip": FakeArm("grip", has_rail=True), "view": FakeArm("view", has_rail=True)},
-        kind="hardware",
-        recovery_latency_s=0.05,
+def hw_session(rt, client, factory):
+    """A hardware session brought up by the REAL ``POST /api/session`` path over
+    ``HardwareFakeWorkcell`` (``workcell_factory`` seam) + a real ControlLoop with
+    the SafetyGate on the mavis_v2 twin; the fake monitor's Manipulation Arm reads
+    homed + enabled (the phase-09c refusal matrix requires it)."""
+    grip, view = factory.monitors["grip"], factory.monitors["view"]
+    grip.sample = replace(
+        grip.sample, rail_homed=True, rail_enabled=True, rail_pos_m=0.0, error_code=0
     )
-    cell.start()
-    loop = ControlLoop(
-        cell,
-        ControlConfig(),
-        rt.bus,
-        SafetySupervisor(NullGate(), InputWatchdog()),
-        ["grip"],
-        profile_store=rt.profile_store,
-        workcell_kind="hardware",
+    view.sample = replace(
+        view.sample, rail_homed=True, rail_enabled=True, rail_pos_m=0.0, error_code=0, warn_code=0
     )
-    spec = SessionSpec(
-        mode="teleop",
-        kind="hardware",
-        arms=["grip"],
-        frames={"grip": "arm_base:grip"},
-        digital_twin_scene="mavis_v2",
-    )
-    session = ActiveSession(
-        session_id="hw-test",
-        spec=spec,
-        state=SessionState.RUNNING,
-        workcell=cell,
-        loop=loop,
-        supervisor=loop.supervisor,
-        twin=None,
-        render_service=None,
-    )
-    rt.manager.attach_fault_state(session)
-    loop.start()
-    rt.manager.session = session
-    assert _wait(lambda: rt.hardware_monitor.paused)  # the monitor released the boxes
+    workcell_factory, cells = _hardware_cells(recovery_latency_s=0.05)
+    rt.manager.workcell_factory = workcell_factory
+    r = client.post("/api/session", json=HW_SPEC)
+    assert r.status_code == 200, r.text
+    session = rt.manager.session
+    cell, loop = cells[0], session.loop
+    assert _wait(lambda: rt.manager.state is SessionState.RUNNING)
+    assert rt.hardware_monitor.paused  # the monitor released the boxes
     yield cell, loop, session
+    rt.manager.workcell_factory = None
     assert client.delete("/api/session").status_code == 204
     assert rt.manager.session is None
     assert _wait(lambda: not rt.hardware_monitor.paused)
@@ -323,8 +587,8 @@ def hw_session(rt, client):
 def test_session_path_apply_backstops_409_and_arm_outside_session_409(client, hw_session):
     r = client.post(URL.format("grip"), json={"op": "apply_backstops"})
     assert r.status_code == 409 and "hardware session" in r.json()["detail"]
-    r = client.post(URL.format("view"), json={"op": "recover"})  # configured, not in the session
-    assert r.status_code == 409 and "not part of the session" in r.json()["detail"]
+    r = client.post(URL.format("grip"), json={"op": "home_rail"})
+    assert r.status_code == 409 and "end the session first" in r.json()["detail"]
     r = client.post(URL.format("arm9"), json={"op": "recover"})
     assert r.status_code == 404
 

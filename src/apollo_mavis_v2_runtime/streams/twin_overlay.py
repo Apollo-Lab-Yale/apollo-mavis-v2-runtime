@@ -33,6 +33,14 @@ from the SAME wrist camera:
   ``waiting`` (nothing published, ``/api/cameras`` ``live: false``) rather
   than drawing the keyframe posture as if it had been measured.
 
+During a hardware session (phase-09c) the monitor is paused, so
+:meth:`TwinOverlayRenderer.set_state_provider` swaps the sample source: the
+session installs a provider that serves the session arms from the driver's
+``workcell.states()`` (track rail convention; ``rail_flip`` is applied here as
+usual) and the unselected arms from their frozen last sample (grey tint,
+"frozen at last sample"); the streams keep their ids and ``paused()`` is
+ignored while a provider is installed. Teardown restores the monitor source.
+
 GL contexts are thread-affine: both ``mujoco.Renderer`` instances (RGB and
 segmentation) and the ``MjData`` are created AND closed inside the overlay
 thread. The published ``CameraFrame`` reuses the real frame's ``t_mono`` /
@@ -356,6 +364,9 @@ class TwinOverlayRenderer:
         self._ready = threading.Event()  # scene built (or build failed)
         self._registered: list[str] = []
         self.frames_rendered = 0
+        # phase-09c: alternative sample source while a hardware session owns the arms
+        # (``samples() -> {arm_id: sample}``, ``status_of(arm_id) -> (status, detail)``)
+        self._provider: Any = None
         self._plan_streams()
 
     # -- construction --------------------------------------------------------------------
@@ -443,6 +454,16 @@ class TwinOverlayRenderer:
     def wait_ready(self, timeout: float = 30.0) -> bool:
         """Block until the twin scene is built (or failed); tests."""
         return self._ready.wait(timeout)
+
+    def set_state_provider(self, provider: Any) -> None:
+        """Install (``provider``) or remove (``None``) the hardware-session sample
+        source (module docstring). The provider is read once per frame on the
+        overlay thread; assignment is atomic."""
+        self._provider = provider
+
+    @property
+    def state_provider(self) -> Any:
+        return self._provider
 
     # -- readers -------------------------------------------------------------------------
     def status_of(self, stream_id: str) -> TwinOverlayStatus:
@@ -588,12 +609,22 @@ class TwinOverlayRenderer:
 
     def _tick(self, ctx: _Context) -> None:
         mj = ctx.mujoco
-        if self.paused_fn():
-            for src in self.streams.values():
-                if src.status != "error":
-                    src.set_status("waiting", "paused - a hardware session owns the arms")
-            return
-        samples = self.monitor.snapshot()
+        provider = self._provider
+        if provider is None:
+            if self.paused_fn():
+                for src in self.streams.values():
+                    if src.status != "error":
+                        src.set_status("waiting", "paused - a hardware session owns the arms")
+                return
+            samples = self.monitor.snapshot()
+            status_of = self.monitor.status_of
+        else:  # hardware session: driver states + frozen arms (phase-09c)
+            try:
+                samples = provider.samples()
+            except Exception:  # noqa: BLE001 - a provider failure never kills the overlay
+                logger.exception("twin overlay: session state provider failed")
+                samples = {}
+            status_of = provider.status_of
         fallbacks = self._pose_arms(ctx, samples)
         now = self._clock()
         for src in self.streams.values():
@@ -607,7 +638,7 @@ class TwinOverlayRenderer:
             if real is None:
                 src.set_status("waiting", f"no frame from {src.camera_id}")
                 continue
-            mon_status, mon_detail = self.monitor.status_of(src.arm_id)
+            mon_status, mon_detail = status_of(src.arm_id)
             mon_text = f"monitor {mon_status}" + (f": {mon_detail}" if mon_detail else "")
             if src.arm_id not in samples:
                 # Never measured (box off / connecting): publish nothing rather than a

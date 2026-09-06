@@ -42,6 +42,14 @@ class JogConfig(BaseModel):
     slew_rad_per_tick: float = 0.02
     rail_m_per_tick: float = 0.002
     goto_threshold_rad: float = 0.15
+    # Hardware executor caps (phase-09d; set PROGRAMMATICALLY by the hardware bring-up
+    # from the connected driver's ServoLimits, not meant for YAML): the PlanExecutor
+    # also bounds sum|dq_j| * plan_lever_arm_m[j] per tick by plan_cart_step_m, the
+    # lever-weighted Cartesian step the driver's servo streamer enforces, so the
+    # commanded path never runs ahead of what the arm can follow along the validated
+    # straight segment. None = joint slew only (sim).
+    plan_cart_step_m: float | None = None
+    plan_lever_arm_m: tuple[float, ...] | None = None
 
 
 class WatchdogConfig(BaseModel):
@@ -140,10 +148,14 @@ class TwinOverlayConfig(BaseModel):
     table / obstacle edges in ``env_rgb`` as the base-placement cue; a stale /
     erroring monitor swaps the tint for ``stale_tint_rgb``.
     ``joint1_offset_rad`` is a diagnostic knob only (the identity joint
-    convention is verified); ``rail_flip`` maps ``q_sim = 0.65 - q_track``;
+    convention is verified); ``rail_flip`` maps ``q_sim = 0.65 - q_track`` -
+    since phase-09c it is a DEPRECATED ALIAS of ``hardware_session.rail_flip``
+    (the overlay and the gate / sweep twins must agree; ``RuntimeConfig``
+    unifies the two keys, either one set -> both true);
     ``rail_fallback_m`` is the rail position the twin assumes per arm while the
     track is not homed (its register is meaningless then) - the tile caption
-    says so (``rail not homed - twin assumes X m``).
+    says so (``rail not homed - twin assumes X m``); the ``home_rail`` sweep and
+    a hardware session's frozen (unselected) arm use the same fallback.
     """
 
     enabled: bool = True
@@ -155,11 +167,45 @@ class TwinOverlayConfig(BaseModel):
     env_rgb: RGB = (90, 200, 250)
     stale_tint_rgb: RGB = (170, 170, 170)  # monitor stale/error -> grey
     joint1_offset_rad: float = 0.0  # diagnostic knob; identity is verified
-    rail_flip: bool = False  # q_sim = 0.65 - q_track when true
+    rail_flip: bool = False  # DEPRECATED alias of hardware_session.rail_flip (kept one release)
     rail_fallback_m: dict[str, float] = Field(
         default_factory=lambda: {"grip": 0.65, "view": 0.0}
     )  # used while the track is not homed
     stream_suffix: str = "_align"
+
+
+class HardwareSessionConfig(BaseModel):
+    """Real-cell session defaults and rail conventions (phase-09c/09d; 04-runtime §5).
+
+    ``default_speed_scale`` is what the Hardware tab pre-selects (first live
+    runs at 10 %; the session body still decides). A hardware session always
+    includes EVERY configured arm (phase-09d: ``SessionSpec.arms`` must equal
+    the workcell's arms, else 409), so there is no arm pre-selection any more
+    (the phase-09c ``default_arms`` key is gone; an old key in a YAML is
+    ignored). ``rail_flip`` maps the track register onto the twin's rail slot
+    as ``q_sim = 0.65 - q_track`` for BOTH the alignment overlay and the gate /
+    ``home_rail`` sweep twins (one convention; verify with the overlay right
+    after the first homing). ``home_rail_inflation_m`` / ``home_rail_step_m``
+    tune the full-travel twin sweep that gates the operator-triggered
+    ``home_rail`` maintenance op (D4: the guardrail's debug margin, 5 mm steps
+    -> 131 checks) and the position-agnostic path check of its planned
+    pre-positioning motion (phase-09d); the gate twin itself keeps
+    ``safety.geom_inflation_m``. ``bringup_timeout_s`` bounds
+    ``HardwareWorkcell.bring_up`` inside ``POST /api/session`` and inside the
+    rail-homing job's connect.
+    """
+
+    # ARMING SWITCH (2026-09-05, after a test process reached a real control box): the
+    # real xArm drivers are only ever CONNECTED (enable, servo stream, rail homing)
+    # when this is true. The repo config keeps it false, so any Runtime built from it
+    # (tests, dev instances, a forgotten render) refuses hardware sessions and
+    # home_rail with 409 "hardware not armed". The lab render sets it true.
+    armed: bool = False
+    default_speed_scale: float = Field(default=0.1, gt=0.0, le=1.0)  # D2: 10 % first
+    rail_flip: bool = False  # q_sim = 0.65 - q_track (overlay + gate + sweep twins)
+    home_rail_inflation_m: float = Field(default=0.025, gt=0.0)  # D4 sweep margin (m)
+    home_rail_step_m: float = Field(default=0.005, gt=0.0)  # D4 sweep step (m)
+    bringup_timeout_s: float = Field(default=60.0, gt=0.0)  # HardwareWorkcell.bring_up budget
 
 
 class ExtrinsicsTolerance(BaseModel):
@@ -375,6 +421,7 @@ class RuntimeConfig(BaseModel):
     hardware_probe: HardwareProbeConfig = HardwareProbeConfig()  # phase-11
     hardware_monitor: HardwareMonitorConfig = HardwareMonitorConfig()  # phase-09a
     twin_overlay: TwinOverlayConfig = TwinOverlayConfig()  # phase-09a
+    hardware_session: HardwareSessionConfig = HardwareSessionConfig()  # phase-09c
     telemetry_hz: float = 25.0
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
@@ -384,6 +431,16 @@ class RuntimeConfig(BaseModel):
             object.__setattr__(self, name, Path(getattr(self, name)).expanduser())
         if self.ui_dist is not None:
             object.__setattr__(self, "ui_dist", Path(self.ui_dist).expanduser())
+        # phase-09c: ``twin_overlay.rail_flip`` is the deprecated alias of
+        # ``hardware_session.rail_flip``; either key set -> one convention for the
+        # overlay, the gate twin and the home_rail sweep.
+        flip = bool(self.hardware_session.rail_flip or self.twin_overlay.rail_flip)
+        if flip != self.hardware_session.rail_flip:
+            hs = self.hardware_session.model_copy(update={"rail_flip": flip})
+            object.__setattr__(self, "hardware_session", hs)
+        if flip != self.twin_overlay.rail_flip:
+            ov = self.twin_overlay.model_copy(update={"rail_flip": flip})
+            object.__setattr__(self, "twin_overlay", ov)
 
     def workcell_config(self, kind: str) -> WorkcellConfig | None:
         return self.workcells.get(kind)
@@ -442,6 +499,7 @@ __all__ = [
     "HardwareProbeConfig",
     "HardwareMonitorConfig",
     "TwinOverlayConfig",
+    "HardwareSessionConfig",
     "RuntimeConfig",
     "load_runtime_config",
 ]

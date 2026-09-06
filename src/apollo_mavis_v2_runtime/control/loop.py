@@ -32,7 +32,9 @@ from apollo_mavis_v2_core import (
 from apollo_mavis_v2_core.protocol import HELD_CODES, JointTargetArgs, TrackerSettingsArgs
 
 from ..config import ControlConfig
+from ..errors import SafetyConfigError
 from ..profiles.store import save_from_states, save_initial_overwrite
+from ..safety.gate import SafetyGate
 from .joint_panel import JogState, PlanExecutor
 from .snapshot import StateSnapshot
 from .teleop import TargetIntegrator, held_to_twist, twist_to_control_frame
@@ -149,6 +151,15 @@ class ControlLoop:
         tracker: TrackerTeleop | None = None,  # clutched Vive-tracker target provider
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # 11-safety §4 item 4 (phase-09c): a hardware loop MUST dispatch through a
+        # SafetyGate bound to a live digital twin - the chokepoint refuses anything else.
+        if workcell_kind == "hardware" and not (
+            isinstance(supervisor.gate, SafetyGate) and supervisor.twin is not None
+        ):
+            raise SafetyConfigError(
+                "hardware sessions require a SafetyGate bound to a live digital twin "
+                "(11-safety §4); refusing to build the control loop"
+            )
         self.workcell = workcell
         self.cfg = cfg
         self.bus = bus

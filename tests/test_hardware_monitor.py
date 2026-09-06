@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import time
 
+import pytest
 from apollo_mavis_v2_core import WorkcellConfig
 from apollo_mavis_v2_core.protocol import HardwareMonitorTelemetry
 from conftest import FakeArmMonitor, FakeMonitorFactory, FakeMonitorSample
+from pydantic import ValidationError
 
 from apollo_mavis_v2_runtime.config import (
     HardwareMonitorConfig,
@@ -57,6 +59,18 @@ def test_config_defaults_match_contract():
     assert rt.hardware_monitor == HardwareMonitorConfig() and rt.twin_overlay == TwinOverlayConfig()
     # YAML lists become the RGB tuples.
     assert TwinOverlayConfig.model_validate({"tint_rgb": [1, 2, 3]}).tint_rgb == (1, 2, 3)
+    # phase-09c: hardware_session block defaults (D2 / D4) and the rail_flip alias.
+    hs = rt.hardware_session
+    assert hs.default_speed_scale == 0.1 and not hasattr(hs, "default_arms")  # 09d: gone
+    assert RuntimeConfig.model_validate({"hardware_session": {"default_arms": ["grip"]}})
+    assert (hs.rail_flip, hs.home_rail_inflation_m, hs.home_rail_step_m) == (False, 0.025, 0.005)
+    assert hs.bringup_timeout_s == 60.0
+    aliased = RuntimeConfig.model_validate({"twin_overlay": {"rail_flip": True}})
+    assert aliased.hardware_session.rail_flip is True and aliased.twin_overlay.rail_flip is True
+    new = RuntimeConfig.model_validate({"hardware_session": {"rail_flip": True}})
+    assert new.twin_overlay.rail_flip is True  # the overlay reads one convention
+    with pytest.raises(ValidationError):
+        RuntimeConfig.model_validate({"hardware_session": {"default_speed_scale": 0}})
 
 
 # -- inert modes ----------------------------------------------------------------------------
@@ -161,7 +175,8 @@ def test_start_while_already_paused_only_releases_and_sync_seams():
     try:
         grip = factory.monitors["grip"]
         assert grip.calls == ["disconnect"] and mon.paused is True  # never connected
-        mon.resume()  # explicit hand-back (phase-09 bring-up seam)
+        paused["on"] = False  # the session / job released the boxes ...
+        mon.resume()  # ... and hands back explicitly (phase-09 bring-up seam)
         assert grip.calls == ["disconnect", "start"] and mon.paused is False
         mon.pause()
         mon.pause()  # idempotent
@@ -170,6 +185,30 @@ def test_start_while_already_paused_only_releases_and_sync_seams():
         mon.stop()
     mon.resume()  # after stop: no reconnect
     assert grip.calls[-1] == "stop"
+
+
+def test_resume_is_a_no_op_while_the_hand_over_predicate_still_holds():
+    """``resume()`` re-applies the predicate instead of blindly reconnecting: a
+    caller that never paused the monitor (a rail-homing job failing before its
+    connect while a hardware create() owns the boxes) must not put a second SDK
+    client on a box the session's drivers hold."""
+    factory = FakeMonitorFactory()
+    paused = {"on": True}
+    mon = HardwareStateMonitor(
+        HardwareMonitorConfig(), HW, paused=lambda: paused["on"],
+        monitor_factory=factory, check_period_s=5.0,
+    )
+    mon.start()
+    try:
+        grip = factory.monitors["grip"]
+        assert grip.calls == ["disconnect"] and mon.paused is True
+        mon.resume()  # predicate still true -> nothing reconnects
+        assert grip.calls == ["disconnect"] and mon.paused is True
+        paused["on"] = False
+        mon.resume()  # predicate released -> the explicit hand-back reconnects
+        assert grip.calls == ["disconnect", "start"] and mon.paused is False
+    finally:
+        mon.stop()
 
 
 def test_predicate_errors_do_not_kill_the_supervisor():
@@ -307,6 +346,28 @@ def test_telemetry_rows_carry_read_backs_match_and_busy():
         factory.monitors["view"].maintenance_busy = True
         assert mon.telemetry().arms[1].maintenance_busy is True
         assert mon.maintenance_busy("view") is True and mon.maintenance_busy("nope") is False
+        assert mon.telemetry().arms[1].maintenance is None  # no async job (phase-09d)
+        # phase-09d: an attached job registry contributes busy + the progress block
+        from apollo_mavis_v2_core.protocol import MaintenanceProgress
+
+        class Jobs:
+            def busy(self, arm_id):
+                return arm_id == "grip"
+
+            def progress(self, arm_id):
+                if arm_id != "grip":
+                    return None
+                return MaintenanceProgress(
+                    op="home_rail", job_id="j1", phase="positioning", detail="wp 1", progress=0.5
+                )
+
+        mon.jobs = Jobs()
+        grip_row = mon.telemetry().arms[0]
+        assert mon.maintenance_busy("grip") is True and grip_row.maintenance_busy is True
+        assert grip_row.maintenance is not None and grip_row.maintenance.phase == "positioning"
+        assert grip_row.maintenance.job_id == "j1" and mon.job_progress("view") is None
+        mon.jobs = None
+        assert mon.maintenance_busy("grip") is False
         # a row without a sample keeps the defaults but still reports the busy flag
         row = sample_to_telemetry("grip", "connecting", "", None, None, maintenance_busy=True)
         assert row.backstops_match is None and row.maintenance_busy is True
@@ -362,17 +423,19 @@ def test_maintenance_refusals_on_the_runtime_monitor():
     from apollo_mavis_v2_runtime.devices.hardware_monitor import MAINTENANCE_OPS
     from apollo_mavis_v2_runtime.errors import MaintenanceUnavailableError
 
-    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover")
+    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover", "home_rail")
     factory = FakeMonitorFactory()
     mon = HardwareStateMonitor(HardwareMonitorConfig(), HW, monitor_factory=factory)
     with pytest.raises(KeyError):
         mon.maintenance("arm9", "clear_errors")
     with pytest.raises(ValueError):
-        mon.maintenance("grip", "home_rail")
+        mon.maintenance("grip", "go_home")
     with pytest.raises(MaintenanceUnavailableError, match="no hardware session - use clear_errors"):
         mon.maintenance("grip", "recover")
     with pytest.raises(MaintenanceUnavailableError, match="monitor off"):
         mon.maintenance("grip", "clear_errors")  # not started
+    with pytest.raises(MaintenanceUnavailableError, match="monitor off"):
+        mon.maintenance("grip", "home_rail")  # phase-09c: a real op now, same gate
     mon.start()
     try:
         grip = factory.monitors["grip"]
@@ -395,6 +458,17 @@ def test_maintenance_refusals_on_the_runtime_monitor():
             mon.maintenance("grip", "clear_errors")
         grip.maintenance_busy = False
         assert grip.maintenance_calls[-1][0] == "clear_errors"
+        # home_rail without a sweep checker (no twin scene / [sim] extra) is refused
+        # BEFORE any write: the monitor never sees the op.
+        with pytest.raises(MaintenanceUnavailableError, match="needs the digital twin"):
+            mon.maintenance("grip", "home_rail")
+        assert grip.maintenance_calls[-1][0] == "clear_errors" and grip.homing_calls == []
+        # join(): the hand-over waits for the poll threads; a thread still inside the
+        # SDK is reported by arm id.
+        assert mon.join(0.1) == []
+        grip.join_result = False
+        assert mon.join(0.1) == ["grip"]
+        grip.join_result = True
     finally:
         mon.stop()
 

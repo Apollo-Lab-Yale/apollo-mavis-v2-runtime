@@ -20,8 +20,16 @@ workcells:
   # connected. Exactly TWO control boxes (2026-09-04): Manipulation Arm `grip`
   # at 192.168.1.201 and Perception Arm `view` at 192.168.2.219, one NIC each.
   # An unplugged camera reports `live: false` (pure-black tile) -- no other
-  # side effect; a box that is off shows `reachable: unreachable`. Sessions on this workcell land with phase-09
-  # (`_bringup_hardware`); POST /api/session kind=hardware is 409.
+  # side effect; a box that is off shows `reachable: unreachable`. Sessions on this
+  # workcell (phase-09c/09d, teleop only): POST /api/session kind=hardware brings up
+  # BOTH arms (SessionSpec.arms must list every arm below, phase-09d) at
+  # `speed_scale` (default 10 %), adopts the preview cameras (no UVC re-open) and
+  # gates every command through a fresh mavis_v2 twin; it is refused (409) while an
+  # arm's rail is unhomed, its controller has an error latched, the read-only
+  # monitor has no sample of it, or a rail homing is in progress. Only the
+  # rail-homing maintenance motion (home_rail with a planned pre-positioning path)
+  # connects ONE arm; the other is then frozen in the gate twin at its last monitor
+  # sample (09c D1) and must not be moved from xArm Studio meanwhile.
   # Read-only facts measured on the live cell 2026-09-04 (phase-09a): firmware
   # v1.12.10 on both boxes, SDK 1.18.5; both arms state 4 (not enabled), mode 0.
   # The Perception Arm (view) keeps reporting controller error C19 (end-effector
@@ -38,7 +46,17 @@ workcells:
   # on_zero 0, is_enabled 0), so their position register is meaningless: the
   # monitor reports rail_pos_m null and the twin overlay falls back to
   # twin_overlay.rail_fallback_m (grip 0.65 = operator's right end, view 0.0).
-  # Homing (set_linear_track_back_origin) is a motion command -> phase-09.
+  # Homing (set_linear_track_back_origin) IS motion: it is the ONE motion-class
+  # maintenance op, `home_rail` (phase-09c) -- operator-triggered from the arm card
+  # (Home rail), gated by a full-travel twin sweep at the arm's current posture
+  # (hardware_session.home_rail_* below; dry_run shows the verdict first), executed
+  # on the read-only monitor's thread with zero writes when the sweep is clear.
+  # A posture that is NOT sweep-clear (phase-09d) gets a twin-planned pre-positioning
+  # path to the arm's keyframe / home posture, checked for EVERY rail position; the
+  # operator confirms, the runtime connects that arm alone (rail unhomed, 10 %),
+  # drives the path under the gate, homes the rail, holds the posture (202 + job
+  # progress on telemetry, result at GET .../maintenance/last).
+  # The driver never homes at connect (RailNotHomedError -> session 409).
   # Controller-side backstops (phase-09b; 02-hardware §6): tcp_load_kg /
   # tcp_load_cog_mm / collision_sensitivity are written by the driver at every
   # connect and by the Hardware tab's "Apply safety settings" (POST .../maintenance
@@ -164,9 +182,29 @@ twin_overlay:
   env_rgb: [90, 200, 250]
   stale_tint_rgb: [170, 170, 170]   # monitor stale / error -> grey twin
   joint1_offset_rad: 0.0        # diagnostic knob only: the identity joint convention is verified (2026-09-04)
-  rail_flip: false              # true: q_sim = 0.65 - q_track
-  rail_fallback_m: {grip: 0.65, view: 0.0}  # assumed rail position while the track is not homed (see the hardware workcell header)
+  # rail_flip moved to hardware_session.rail_flip (phase-09c; the old key is still
+  # accepted as an alias for one release and unified with the new one).
+  rail_fallback_m: {grip: 0.65, view: 0.0}  # assumed rail position while the track is not homed (see the hardware workcell header); also the home_rail sweep's / frozen arm's assumption
   stream_suffix: _align
+# Real-cell sessions (phase-09c/09d; 04-runtime §5/§14). default_speed_scale is what
+# the Hardware tab pre-selects (first live runs at 10 %; SessionSpec.speed_scale
+# decides). Since phase-09d a hardware session always includes BOTH arms
+# (SessionSpec.arms must equal the arms above, else 409) - the phase-09c
+# default_arms key is gone. rail_flip maps the track register onto the twin's rail
+# slot as q_sim = 0.65 - q_track for the overlay AND the gate / sweep twins -- home
+# the rail, look at the *_align overlay: if the twin's carriage sits at the wrong
+# end, set true and restart. home_rail_inflation_m / home_rail_step_m tune the twin
+# sweep that gates the home_rail op (D4: 25 mm blind-sweep margin, 5 mm steps = 131
+# checks over 0.65 m) and the position-agnostic check of its planned
+# pre-positioning path; bringup_timeout_s bounds bring_up in POST and in the job.
+hardware_session:
+  armed: false                # arming switch: real drivers connect / rails home ONLY when true.
+                              # Repo default false (tests, dev instances); the lab render sets true.
+  default_speed_scale: 0.1
+  rail_flip: false
+  home_rail_inflation_m: 0.025
+  home_rail_step_m: 0.005
+  bringup_timeout_s: 60.0
 tracker:
   # Vive-tracker teleop (13-tracker §4). backend: none | fake | libsurvive.
   # `fake` = scripted 0.15 m circle at 100 Hz so the UI/pipeline can be
@@ -174,6 +212,9 @@ tracker:
   # For the real tracker: run scripts/tracker/01-sudo-udev-and-deps.sh and
   # 02-build-pysurvive.sh once, keep the tracker still with both base
   # stations visible on first start (~10-20 s), then set `backend: libsurvive`.
+  # The LIVE config (~/apollo/mavis_v2_live.yaml, rendered by the operations
+  # deployment) runs the real cell with `backend: libsurvive`; this shipped
+  # file keeps `fake` so the stack runs without the Vive hardware.
   backend: fake
   object_name: WM0                            # dongle-paired tracker codename
   libsurvive_args: ["--lighthousecount", "4", "--globalscenesolver", "0", "--disable-calibrate", "1"]  # freeze the lighthouse calibration during teleop (2026-09-03: the online scene solver moved a station 32 cm mid-session)

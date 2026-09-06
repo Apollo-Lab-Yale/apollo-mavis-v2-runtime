@@ -26,9 +26,9 @@ inert: ``enabled`` is False, every arm reports status ``off`` with a
 **Maintenance channel (phase-09b; 04-runtime §13.1 / §15).** The zero-write
 guarantee becomes "zero writes unless an explicit maintenance request":
 :meth:`HardwareStateMonitor.maintenance` forwards the operator's
-``clear_errors`` / ``apply_backstops`` to the arm's ``ArmStateMonitor``, which
-queues it for ITS poll thread (one ``XArmAPI`` is never driven from two
-threads; this thread only waits), and returns the core
+``clear_errors`` / ``apply_backstops`` / ``home_rail`` to the arm's
+``ArmStateMonitor``, which queues it for ITS poll thread (one ``XArmAPI`` is
+never driven from two threads; this thread only waits), and returns the core
 ``ArmMaintenanceResult`` with ``path="monitor"``. ``apply_backstops`` writes
 the arm's ``ArmConfig`` safety parameters through the hardware package's own
 ``ArmConfig -> XArmDriverConfig`` mapping, so the UI button and the driver's
@@ -40,6 +40,32 @@ the ``before`` / ``after`` rows of a result. ``recover`` (enable + servo mode)
 needs a session driver and is refused here (409: "no hardware session - use
 clear_errors"); so is any op while the monitor is off / paused / not connected
 or another op is still running on that arm (:class:`MaintenanceUnavailableError`).
+
+**``home_rail`` (phase-09c; 04-runtime §13.1) - THE ONE op that moves a
+mechanical part.** The carriage drives to the track's zero end
+(``set_linear_track_back_origin``), operator-triggered from the Hardware tab
+and session-less only (the runtime routes it to 409 "end the session first"
+while a hardware session exists). Before anything is written the runtime
+sweeps a dedicated digital twin (``devices.rail_sweep.RailSweepChecker``) over
+the FULL travel at the arm's current posture against the other arm's last
+sample: ``dry_run`` returns that ``RailSweepVerdict`` alone (``ok`` iff clear,
+zero writes); a blocked sweep returns ``ok=False`` + the verdict (zero writes);
+a clear sweep hands ``expected_q = sample.q`` to the hardware monitor, whose
+poll thread re-samples and refuses if the joints moved or an error is latched,
+then homes, enables and sets the positioning speed and judges from the
+registers only. The REST handler waits :data:`HOME_RAIL_TIMEOUT_S` (45 s) for
+this op instead of 10 s; while it runs the arm's status reads ``stale`` and
+``maintenance_busy`` is true, and ``POST /api/session`` is refused ("rail
+homing in progress").
+
+**Phase-09d.** The sweep + refusals are :meth:`HardwareStateMonitor.home_rail_preflight`
+(zero writes) and the monitor op :meth:`HardwareStateMonitor.home_rail_execute`,
+so ``devices/rail_homing.py`` can decide between them: a posture that is not
+sweep-clear gets a planned pre-positioning motion run by a ``RailHomingJob``
+(this arm's driver connected alone, the monitor paused meanwhile). The job
+registry is attached as :attr:`HardwareStateMonitor.jobs` (``busy(arm_id)`` /
+``progress(arm_id)``): ``maintenance_busy`` is true for the job's whole life and
+``ArmMonitorTelemetry.maintenance`` carries its ``MaintenanceProgress``.
 """
 
 from __future__ import annotations
@@ -47,7 +73,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from apollo_mavis_v2_core import ArmConfig, WorkcellConfig
@@ -55,10 +82,13 @@ from apollo_mavis_v2_core.protocol import (
     ArmMaintenanceResult,
     ArmMonitorTelemetry,
     HardwareMonitorTelemetry,
+    MaintenanceProgress,
+    RailSweepVerdict,
 )
 
 from ..config import HardwareMonitorConfig
 from ..errors import MaintenanceUnavailableError
+from .rail_sweep import RailSweepChecker, describe_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +99,11 @@ STOP_JOIN_TIMEOUT_S = 5.0
 TCP_LOAD_MATCH_KG = 0.05
 TCP_COG_MATCH_MM = 10.0
 MAINTENANCE_TIMEOUT_S = 10.0
-MAINTENANCE_OPS: tuple[str, ...] = ("clear_errors", "apply_backstops", "recover")
+# phase-09c: home_rail = the SDK's 30 s homing wait + enable + speed + an after-sample;
+# the caller (REST) waits this long (hardware HOME_RAIL_TIMEOUT_S, D3).
+HOME_RAIL_TIMEOUT_S = 45.0
+MONITOR_JOIN_TIMEOUT_S = 15.0  # hand-over: wait this long for a poll thread inside the SDK
+MAINTENANCE_OPS: tuple[str, ...] = ("clear_errors", "apply_backstops", "recover", "home_rail")
 CONNECTED_STATUSES: frozenset[str] = frozenset({"running", "stale"})  # a maintenance op may run
 
 
@@ -85,10 +119,18 @@ class ArmMonitorLike(Protocol):
 
     def disconnect(self, timeout: float = 2.0) -> bool | None: ...  # False = not yet released
 
+    def join(self, timeout: float | None = None) -> bool: ...  # poll thread exited (phase-09c)
+
     def snapshot(self) -> Any: ...  # ArmMonitorSample | None
 
     def maintenance(
-        self, op: str, driver_cfg: Any = None, timeout_s: float = 10.0
+        self,
+        op: str,
+        driver_cfg: Any = None,
+        timeout_s: float | None = 10.0,
+        *,
+        expected_q: Any = None,  # home_rail: the 7 joints the sweep assumed (phase-09c)
+        q_tol_rad: float = 0.02,
     ) -> Any: ...  # MaintenanceOutcome (phase-09b)
 
     @property
@@ -109,6 +151,45 @@ MonitorFactory = Callable[..., ArmMonitorLike]
 
 DriverConfigFactory = Callable[[ArmConfig], Any]
 """``ArmConfig -> XArmDriverConfig`` (the hardware package's ``workcell._driver_cfg``)."""
+
+
+class MaintenanceJobsLike(Protocol):
+    """Registry of asynchronous maintenance jobs (phase-09d ``RailHomingService``)."""
+
+    def busy(self, arm_id: str) -> bool: ...
+
+    def progress(self, arm_id: str) -> MaintenanceProgress | None: ...
+
+
+@dataclass
+class HomeRailPreflight:
+    """Everything :meth:`HardwareStateMonitor.home_rail_preflight` established with
+    zero writes: the arm, its monitor + driver config, the sample the sweep used,
+    every arm's sample, the twin verdict and the ``before`` telemetry row."""
+
+    arm: ArmConfig
+    monitor: ArmMonitorLike
+    driver_cfg: Any
+    sample: Any
+    samples: dict[str, Any]
+    verdict: RailSweepVerdict
+    before: ArmMonitorTelemetry
+
+    def result(self, *, dry_run: bool, detail: str | None = None) -> ArmMaintenanceResult:
+        """The zero-write ``ArmMaintenanceResult`` (dry run or refused sweep)."""
+        if detail is None:
+            detail = describe_verdict(self.verdict, dry_run=dry_run)
+        return ArmMaintenanceResult(
+            arm_id=self.arm.id,
+            op="home_rail",
+            path="monitor",
+            ok=bool(self.verdict.clear and dry_run),
+            detail=detail,
+            sdk_codes={},
+            before=self.before,
+            after=None,
+            rail_sweep=self.verdict,
+        )
 
 
 def default_monitor_factory() -> MonitorFactory:
@@ -164,12 +245,14 @@ def sample_to_telemetry(
     *,
     backstops_match: bool | None = None,
     maintenance_busy: bool = False,
+    maintenance: MaintenanceProgress | None = None,
 ) -> ArmMonitorTelemetry:
     """Core ``ArmMonitorTelemetry`` from a monitor's status + its last
     ``ArmMonitorSample`` (``None`` -> data fields at their defaults). The
     phase-09b read-backs are read duck-typed (absent on an older sample ->
     their defaults); ``backstops_match`` / ``maintenance_busy`` are the
-    runtime's (:func:`backstops_match`, the monitor's busy flag)."""
+    runtime's (:func:`backstops_match`, the monitor's busy flag);
+    ``maintenance`` is the phase-09d job progress (``None`` = no job)."""
     if sample is None:
         return ArmMonitorTelemetry(
             arm_id=arm_id,
@@ -177,6 +260,7 @@ def sample_to_telemetry(
             detail=detail,
             age_s=age_s,
             maintenance_busy=maintenance_busy,
+            maintenance=maintenance,
         )
     sens = getattr(sample, "collision_sensitivity", None)
     kg = getattr(sample, "tcp_load_kg", None)
@@ -204,6 +288,7 @@ def sample_to_telemetry(
         tcp_load_cog_mm=[float(v) for v in (getattr(sample, "tcp_load_cog_mm", ()) or ())],
         backstops_match=backstops_match,
         maintenance_busy=maintenance_busy,
+        maintenance=maintenance,
     )
 
 
@@ -225,6 +310,8 @@ class HardwareStateMonitor:
         *,
         monitor_factory: MonitorFactory | None = None,
         driver_cfg_factory: DriverConfigFactory | None = None,
+        rail_sweep: RailSweepChecker | None = None,
+        rail_fallback_m: Mapping[str, float] | None = None,
         check_period_s: float = CHECK_PERIOD_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -233,6 +320,11 @@ class HardwareStateMonitor:
         self.paused_fn = paused or (lambda: False)
         self._factory = monitor_factory
         self._driver_cfg_factory = driver_cfg_factory  # None = the hardware package's mapping
+        # phase-09c: the home_rail gate (None = no twin scene / sim extra -> home_rail 409)
+        self.rail_sweep = rail_sweep
+        self.rail_fallback_m: dict[str, float] = dict(rail_fallback_m or {})
+        # phase-09d: asynchronous maintenance jobs (RailHomingService), attached by Runtime
+        self.jobs: MaintenanceJobsLike | None = None
         self.check_period_s = float(check_period_s)
         self._clock = clock
         self.arm_ids: list[str] = [a.id for a in workcell.arms] if workcell is not None else []
@@ -354,9 +446,33 @@ class HardwareStateMonitor:
         self._apply_paused(True)
 
     def resume(self) -> None:
-        """Synchronous resume after a hand-over (reconnects every arm)."""
+        """Synchronous resume after a hand-over (reconnects every arm) - UNLESS
+        the hand-over predicate still holds: a caller that never paused the
+        monitor itself (a rail-homing job failing before its connect while a
+        hardware ``create()`` owns the boxes) must not put a second SDK client
+        on a box the session's drivers hold; the supervisor re-applies the
+        predicate every round anyway, this just closes the window."""
         if self._started:
-            self._apply_paused(False)
+            self._apply_paused(self._safe_paused())
+
+    def join(self, timeout_s: float = MONITOR_JOIN_TIMEOUT_S) -> list[str]:
+        """After :meth:`pause`: wait up to ``timeout_s`` PER ARM for the poll
+        threads to exit (the SDK client is released for certain only then; a
+        ``disconnect()`` may return while the thread is still inside a blocking
+        SDK call, up to a whole ``home_rail`` wait). Returns the arm ids whose
+        thread is STILL alive - the hardware bring-up refuses on any."""
+        alive: list[str] = []
+        for arm_id, mon in self._monitors.items():
+            join = getattr(mon, "join", None)
+            if join is None:
+                continue
+            try:
+                if not join(float(timeout_s)):
+                    alive.append(arm_id)
+            except Exception:  # noqa: BLE001 - treat a broken join as "still busy"
+                logger.exception("arm monitor %r join failed", arm_id)
+                alive.append(arm_id)
+        return alive
 
     def _safe_paused(self) -> bool:
         try:
@@ -427,9 +543,16 @@ class HardwareStateMonitor:
         return int(sample.error_code) if sample is not None else 0
 
     def maintenance_busy(self, arm_id: str) -> bool:
-        """A maintenance op is queued / executing on this arm's monitor (phase-09b)."""
+        """A maintenance op is queued / executing on this arm's monitor (phase-09b)
+        or an asynchronous maintenance job owns the arm (phase-09d)."""
+        if self.jobs is not None and self.jobs.busy(arm_id):
+            return True
         mon = self._monitors.get(arm_id)
         return bool(getattr(mon, "maintenance_busy", False)) if mon is not None else False
+
+    def job_progress(self, arm_id: str) -> MaintenanceProgress | None:
+        """Live / lingering progress of the phase-09d job on this arm (``None`` = none)."""
+        return self.jobs.progress(arm_id) if self.jobs is not None else None
 
     def arm_telemetry(self) -> list[ArmMonitorTelemetry]:
         rows: list[ArmMonitorTelemetry] = []
@@ -446,6 +569,7 @@ class HardwareStateMonitor:
                     sample,
                     backstops_match=backstops_match(sample, self._arm_cfgs[arm_id]),
                     maintenance_busy=self.maintenance_busy(arm_id),
+                    maintenance=self.job_progress(arm_id),
                 )
             )
         return rows
@@ -457,9 +581,14 @@ class HardwareStateMonitor:
             enabled=self.enabled, paused=self.paused, arms=self.arm_telemetry()
         )
 
-    # -- maintenance channel (phase-09b; 04-runtime §13.1 monitor path) -----------------
+    # -- maintenance channel (phase-09b/09c; 04-runtime §13.1 monitor path) -------------
     def maintenance(
-        self, arm_id: str, op: str, timeout_s: float = MAINTENANCE_TIMEOUT_S
+        self,
+        arm_id: str,
+        op: str,
+        timeout_s: float = MAINTENANCE_TIMEOUT_S,
+        *,
+        dry_run: bool = False,
     ) -> ArmMaintenanceResult:
         """Run one operator-triggered maintenance op on ``arm_id``'s READ-ONLY
         monitor (``path="monitor"``) and wait for its outcome (<= ``timeout_s``).
@@ -467,13 +596,21 @@ class HardwareStateMonitor:
         ``clear_errors`` = ``clean_error`` + ``clean_warn`` (never
         ``motion_enable``); ``apply_backstops`` = ``backstops.apply_backstops``
         with the arm's ``ArmConfig`` mapped through the hardware package's
-        ``XArmDriverConfig`` mapping. Both execute on the arm monitor's poll
-        thread; this thread only waits. Refusals (HTTP 409 semantics,
+        ``XArmDriverConfig`` mapping. ``home_rail`` (phase-09c, THE ONE motion
+        op) is gated first by the full-travel twin sweep (module docstring):
+        ``dry_run`` -> the verdict alone (``ok`` iff clear, zero writes); a
+        blocked sweep -> ``ok=False`` + verdict (zero writes); clear -> the
+        hardware monitor homes with ``expected_q = sample.q`` (its poll thread
+        re-samples and refuses if the arm moved) and the verdict rides
+        ``rail_sweep``. All execute on the arm monitor's poll thread; this
+        thread only waits. Refusals (HTTP 409 semantics,
         :class:`MaintenanceUnavailableError`): ``recover`` (needs a hardware
         session), monitor inert / not started / ``off`` / ``paused`` /
-        ``connecting`` / ``error`` (the box is not connected), or an op already
-        running on that arm. Unknown ``arm_id`` -> ``KeyError`` (404), unknown
-        ``op`` -> ``ValueError`` (422 is FastAPI's job upstream). The result's
+        ``connecting`` / ``error`` (the box is not connected), an op already
+        running on that arm, or - ``home_rail`` - no twin sweep configured, no
+        sample, no linear track, or a latched controller error (the box would
+        refuse anyway). Unknown ``arm_id`` -> ``KeyError`` (404), unknown ``op``
+        -> ``ValueError`` (422 is FastAPI's job upstream). The result's
         ``before`` / ``after`` rows carry :func:`backstops_match` against the
         config; 200 whether or not ``ok``.
         """
@@ -491,6 +628,11 @@ class HardwareStateMonitor:
             raise MaintenanceUnavailableError(
                 f"{op} needs the read-only monitor connected to {arm_id!r} ({why})"
             )
+        if op == "home_rail":
+            pre = self.home_rail_preflight(arm_id)
+            if dry_run or not pre.verdict.clear:
+                return pre.result(dry_run=dry_run)
+            return self.home_rail_execute(pre, float(timeout_s))
         lock = self._maintenance_locks[arm_id]
         if not lock.acquire(blocking=False):
             raise MaintenanceUnavailableError(f"a maintenance op is already running on {arm_id!r}")
@@ -505,6 +647,134 @@ class HardwareStateMonitor:
             lock.release()
         return self._result(arm, mon, op, outcome)
 
+    def home_rail_preflight(self, arm_id: str) -> HomeRailPreflight:
+        """``home_rail`` refusals + the twin sweep, ZERO writes (phase-09c/09d).
+
+        Refused (409, :class:`MaintenanceUnavailableError`): the monitor not
+        connected to the arm, an op already running on it, ANOTHER arm's homing
+        in flight (its monitor publishes nothing during the SDK wait, so its
+        sample still shows the pre-homing carriage while the real one travels -
+        the sweep would be judged against a wrong posture and two carriages
+        would move with unverified geometry), the target's own monitor ``stale``
+        (the sweep posture must be the CURRENT one; the hardware monitor
+        re-samples before the write as a second line of defence), no sample, no
+        linear track, a latched controller error, or no twin. Another arm whose
+        monitor is not ``running`` (stale / paused / error) is still posed from
+        its last sample, with an ``assumptions`` entry saying so. The sweep
+        verdict and the ``before`` row ride the returned :class:`HomeRailPreflight`;
+        ``rail_sweep.pre_position`` is left ``None`` for the caller
+        (``devices/rail_homing.py``) to fill.
+        """
+        from ..session.hardware import arm_label  # local: keeps devices free of session imports
+
+        arm = self._arm_cfgs.get(arm_id)
+        if arm is None:
+            raise KeyError(arm_id)
+        mon = self._monitors.get(arm_id)
+        status, detail = self.status_of(arm_id)
+        if mon is None or not self._started or status not in CONNECTED_STATUSES:
+            why = f"monitor {status}" + (f": {detail}" if detail else "")
+            raise MaintenanceUnavailableError(
+                f"home_rail needs the read-only monitor connected to {arm_id!r} ({why})"
+            )
+        if self.maintenance_busy(arm_id):
+            raise MaintenanceUnavailableError(f"a maintenance op is already running on {arm_id!r}")
+        driver_cfg = self._driver_cfg(arm)
+        sweep = self.rail_sweep
+        if sweep is None:
+            raise MaintenanceUnavailableError(
+                "home_rail needs the digital twin to gate the sweep (no digital_twin_scene / "
+                "[sim] extra)"
+            )
+        for other_id in self._arm_cfgs:
+            if other_id != arm_id and self.maintenance_busy(other_id):
+                raise MaintenanceUnavailableError(
+                    f"home_rail refused: rail homing in progress on the {arm_label(other_id)} - "
+                    "wait for it to finish"
+                )
+        status, detail = self.status_of(arm_id)
+        if status == "stale":
+            raise MaintenanceUnavailableError(
+                f"home_rail refused: the read-only monitor sample of {arm_id!r} is stale"
+                + (f" ({detail})" if detail else "")
+                + " - the sweep needs the arm's CURRENT posture; retry when it reads running"
+            )
+        sample = mon.snapshot()
+        if sample is None:
+            raise MaintenanceUnavailableError(
+                f"home_rail needs a monitor sample of {arm_id!r} (none yet)"
+            )
+        if not getattr(sample, "rail_present", False):
+            raise MaintenanceUnavailableError(
+                f"home_rail refused: no linear track detected on {arm_id!r}"
+            )
+        code = int(getattr(sample, "error_code", 0) or 0)
+        if code:
+            raise MaintenanceUnavailableError(
+                f"home_rail refused: controller error {code} is latched on {arm_id!r} - "
+                "clear errors first"
+            )
+        samples = self.snapshot()
+        try:
+            verdict = sweep.check(arm_id, samples, self.rail_fallback_m)
+        except (KeyError, ValueError, ImportError) as e:
+            raise MaintenanceUnavailableError(
+                f"home_rail refused: rail sweep unavailable for {arm_id!r} ({e})"
+            ) from e
+        for other_id in self._arm_cfgs:  # a sampled other arm whose monitor is not live
+            if other_id == arm_id or other_id not in samples:
+                continue
+            o_status, _ = self.status_of(other_id)
+            if o_status != "running":
+                verdict.assumptions.append(
+                    f"{other_id}: monitor {o_status} - posed from its last sample, which may "
+                    "not be its current posture"
+                )
+        before = sample_to_telemetry(
+            arm_id,
+            status,
+            detail,
+            mon.age_s,
+            sample,
+            backstops_match=backstops_match(sample, arm),
+            maintenance_busy=False,
+        )
+        return HomeRailPreflight(arm, mon, driver_cfg, sample, dict(samples), verdict, before)
+
+    def home_rail_execute(self, pre: HomeRailPreflight, timeout_s: float) -> ArmMaintenanceResult:
+        """The 09c monitor-path homing after a CLEAR preflight: joints untouched,
+        the arm monitor's poll thread re-samples (``expected_q`` = the sweep's
+        posture) and homes; judged from the registers. One op per arm at a time
+        (per-arm lock + ``maintenance_busy``)."""
+        arm, mon, verdict = pre.arm, pre.monitor, pre.verdict
+        if not verdict.clear:
+            raise MaintenanceUnavailableError(
+                f"home_rail on {arm.id!r}: the sweep is not clear - nothing written"
+            )
+        lock = self._maintenance_locks[arm.id]
+        if not lock.acquire(blocking=False):
+            raise MaintenanceUnavailableError(f"a maintenance op is already running on {arm.id!r}")
+        try:
+            if self.maintenance_busy(arm.id):
+                raise MaintenanceUnavailableError(
+                    f"a maintenance op is already running on {arm.id!r}"
+                )
+            logger.warning(
+                "home_rail on %s: sweep clear (min clearance %s m) - HOMING the linear track "
+                "(the carriage drives to the zero end)",
+                arm.id,
+                f"{verdict.min_clearance_m:.3f}" if verdict.min_clearance_m is not None else "?",
+            )
+            outcome = mon.maintenance(
+                "home_rail",
+                pre.driver_cfg,
+                timeout_s=float(timeout_s),
+                expected_q=tuple(float(v) for v in verdict.q_checked),
+            )
+        finally:
+            lock.release()
+        return self._result(arm, mon, "home_rail", outcome, rail_sweep=verdict)
+
     def _driver_cfg(self, arm: ArmConfig) -> Any:
         try:
             factory = self._driver_cfg_factory or default_driver_cfg_factory()
@@ -516,7 +786,12 @@ class HardwareStateMonitor:
         return factory(arm)
 
     def _result(
-        self, arm: ArmConfig, mon: ArmMonitorLike, op: str, outcome: Any
+        self,
+        arm: ArmConfig,
+        mon: ArmMonitorLike,
+        op: str,
+        outcome: Any,
+        rail_sweep: Any = None,
     ) -> ArmMaintenanceResult:
         """Hardware ``MaintenanceOutcome`` -> core ``ArmMaintenanceResult`` (monitor path)."""
         status, detail = self.status_of(arm.id)
@@ -545,6 +820,7 @@ class HardwareStateMonitor:
             warnings=[str(w) for w in (getattr(outcome, "warnings", ()) or ())],
             before=row(getattr(outcome, "before", None)),
             after=row(getattr(outcome, "after", None)),
+            rail_sweep=rail_sweep,
         )
 
 
@@ -552,9 +828,13 @@ __all__ = [
     "ArmMonitorLike",
     "CONNECTED_STATUSES",
     "DriverConfigFactory",
+    "HOME_RAIL_TIMEOUT_S",
     "HardwareStateMonitor",
+    "HomeRailPreflight",
+    "MaintenanceJobsLike",
     "MAINTENANCE_OPS",
     "MAINTENANCE_TIMEOUT_S",
+    "MONITOR_JOIN_TIMEOUT_S",
     "MonitorFactory",
     "TCP_COG_MATCH_MM",
     "TCP_LOAD_MATCH_KG",

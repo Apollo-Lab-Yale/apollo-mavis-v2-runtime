@@ -16,7 +16,13 @@ import pytest
 from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 
 from apollo_mavis_v2_runtime.bus import RuntimeBus
-from apollo_mavis_v2_runtime.config import ControlConfig, RuntimeConfig, TrackerConfig, VideoConfig
+from apollo_mavis_v2_runtime.config import (
+    ControlConfig,
+    HardwareSessionConfig,
+    RuntimeConfig,
+    TrackerConfig,
+    VideoConfig,
+)
 from apollo_mavis_v2_runtime.control.loop import ControlLoop
 from apollo_mavis_v2_runtime.safety.gate import NullGate
 from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
@@ -44,7 +50,34 @@ def make_runtime_config(
         calibration_dir=tmp_path / "calibration",  # never read ~/apollo/calibration in tests
         video=VideoConfig(preview_fps=15, session_fps=30),
         tracker=tracker or TrackerConfig(),
+        # tests run against fakes only: arm the (fake) hardware paths so home_rail jobs and
+        # hardware sessions can be exercised; the real-SDK path stays behind the conftest
+        # guard below, and test_hardware_session pins the unarmed refusal explicitly.
+        hardware_session=HardwareSessionConfig(armed=True),
     )
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_real_hardware(monkeypatch):
+    """Safety net for EVERY runtime test (phase-09d): the lab machine can reach both
+    control boxes, so a code path that builds the REAL ``HardwareWorkcell`` with the
+    real SDK (no ``driver_api_factory`` fake) must fail loudly instead of connecting,
+    enabling or moving an arm. Tests that want the real workcell classes set
+    ``manager.driver_api_factory`` to a ``FakeXArmAPI`` factory first."""
+    from apollo_mavis_v2_runtime.errors import SessionError
+    from apollo_mavis_v2_runtime.session.manager import SessionManager
+
+    real = SessionManager._default_workcell_factory
+
+    def guarded(self, session_cfg, driver_factory):
+        if self.driver_api_factory is None:
+            raise SessionError(
+                "TEST GUARD: refusing to build a real HardwareWorkcell against the real xArm "
+                "SDK (set manager.workcell_factory or manager.driver_api_factory)"
+            )
+        return real(self, session_cfg, driver_factory)
+
+    monkeypatch.setattr(SessionManager, "_default_workcell_factory", guarded)
 
 
 @pytest.fixture
@@ -229,8 +262,13 @@ class FakeArmMonitor:
     for ``recover`` / a missing driver config / a disconnected monitor;
     ``clear_errors`` writes exactly ``clean_error`` + ``clean_warn`` and zeroes the
     codes of the newest sample; ``apply_backstops`` writes the ``backstops.py``
-    sequence and echoes the driver config into the read-back fields. A test can
-    pin ``scripted_outcome`` (returned verbatim) or ``maintenance_busy``."""
+    sequence and echoes the driver config into the read-back fields;
+    ``home_rail`` (phase-09c) refuses without ``expected_q`` / on a posture
+    mismatch (``q_tol_rad``) / with an error latched, else writes exactly the
+    hardware ``MAINTENANCE_SDK_METHODS["home_rail"]`` set and the newest sample
+    reads homed + enabled at 0.000 m (``homing_calls`` counts them). A test can
+    pin ``scripted_outcome`` (returned verbatim) or ``maintenance_busy``; ``join``
+    returns ``join_result`` (False = the poll thread is still inside the SDK)."""
 
     arm_id: str
     ip: str
@@ -246,6 +284,8 @@ class FakeArmMonitor:
     maintenance_busy: bool = False
     maintenance_calls: list[tuple[str, object, float]] = field(default_factory=list)
     scripted_outcome: object | None = None
+    join_result: bool = True  # phase-09c: False = poll thread still inside the SDK
+    homing_calls: list[tuple[float, ...]] = field(default_factory=list)  # expected_q per homing
     _status: str = "off"
 
     def start(self) -> None:
@@ -260,12 +300,24 @@ class FakeArmMonitor:
         self.calls.append("disconnect")
         self._status = "paused"
 
+    def join(self, timeout: float | None = None) -> bool:
+        self.calls.append("join")
+        return self.join_result
+
     def snapshot(self):
         return self.sample
 
-    def maintenance(self, op: str, driver_cfg=None, timeout_s: float = 10.0):
+    def maintenance(
+        self,
+        op: str,
+        driver_cfg=None,
+        timeout_s: float | None = 10.0,
+        *,
+        expected_q=None,
+        q_tol_rad: float = 0.02,
+    ):
         self.maintenance_calls.append((op, driver_cfg, timeout_s))
-        if op not in ("clear_errors", "apply_backstops", "recover"):
+        if op not in ("clear_errors", "apply_backstops", "recover", "home_rail"):
             raise ValueError(f"unknown maintenance op {op!r}")
         if op == "recover":
             return FakeMaintenanceOutcome(self.arm_id, op, False, "recover needs a session")
@@ -273,6 +325,18 @@ class FakeArmMonitor:
             return FakeMaintenanceOutcome(
                 self.arm_id, op, False, "apply_backstops needs the arm's driver config"
             )
+        if op == "home_rail":
+            if driver_cfg is None:
+                return FakeMaintenanceOutcome(
+                    self.arm_id, op, False, "home_rail needs the arm's driver config (rail speed)"
+                )
+            if expected_q is None or len(expected_q) != 7:
+                return FakeMaintenanceOutcome(
+                    self.arm_id,
+                    op,
+                    False,
+                    "home_rail needs expected_q: the 7 joint angles the rail sweep was checked at",
+                )
         if self._status != "running":
             return FakeMaintenanceOutcome(
                 self.arm_id, op, False, f"not connected to {self.ip} (monitor {self._status})"
@@ -280,6 +344,8 @@ class FakeArmMonitor:
         if self.scripted_outcome is not None:
             return self.scripted_outcome
         before = self.sample
+        if op == "home_rail":
+            return self._home_rail(before, driver_cfg, tuple(expected_q), q_tol_rad)
         if op == "clear_errors":
             codes = {"clean_error": 0, "clean_warn": 0}
             err = getattr(before, "error_code", 0) if before is not None else 0
@@ -314,6 +380,54 @@ class FakeArmMonitor:
             )
         if after is not None:
             self.sample = after  # the monitor's newest sample reflects the op
+        return FakeMaintenanceOutcome(self.arm_id, op, True, detail, codes, (), before, after)
+
+    def _home_rail(self, before, driver_cfg, expected_q, q_tol_rad):
+        """Mirror of the hardware monitor's ``home_rail`` branch (zero writes on a
+        refusal; judged from the after-sample registers)."""
+        op = "home_rail"
+        if before is None:
+            return FakeMaintenanceOutcome(self.arm_id, op, False, "home_rail refused: no sample")
+        if before.error_code:
+            return FakeMaintenanceOutcome(
+                self.arm_id,
+                op,
+                False,
+                f"home_rail refused: controller error {before.error_code} is latched",
+                before=before,
+            )
+        worst = max(range(7), key=lambda i: abs(before.q[i] - expected_q[i]))
+        dev = abs(before.q[worst] - expected_q[worst])
+        if dev > q_tol_rad:
+            return FakeMaintenanceOutcome(
+                self.arm_id,
+                op,
+                False,
+                f"home_rail refused: the arm moved since the sweep (joint {worst + 1} differs "
+                f"by {dev:.3f} rad, tolerance {q_tol_rad:g} rad); re-run the sweep",
+                before=before,
+            )
+        self.homing_calls.append(tuple(expected_q))
+        speed = int(getattr(driver_cfg, "rail_speed_mm_s", 50))
+        codes = {
+            "set_linear_track_back_origin": 0,
+            "set_linear_track_enable": 0,
+            "set_linear_track_speed": 0,
+        }
+        after = replace(
+            before,
+            seq=before.seq + 2,
+            rail_present=True,
+            rail_homed=True,
+            rail_enabled=True,
+            rail_pos_m=0.0,
+            rail_raw_mm=0.0,
+        )
+        self.sample = after
+        detail = (
+            "rail homed: carriage at 0.000 m (register 0 mm), track enabled, "
+            f"positioning speed {speed} mm/s"
+        )
         return FakeMaintenanceOutcome(self.arm_id, op, True, detail, codes, (), before, after)
 
     @property

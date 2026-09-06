@@ -14,8 +14,11 @@ from .config import RuntimeConfig
 from .devices.hardware_monitor import MAINTENANCE_TIMEOUT_S, HardwareStateMonitor
 from .devices.hardware_probe import HardwareProbe
 from .devices.microphone import MicrophoneReader, to_info
+from .devices.rail_homing import RailHomingService
+from .devices.rail_sweep import RailSweepChecker
 from .devices.tracker import TrackerReader, TrackerSettings
 from .devices.tracker_calibration import TrackerCalibration, apply_persisted_yaw
+from .errors import MaintenanceUnavailableError
 from .session.manager import SessionManager
 from .streams.hub import VideoHub
 from .streams.twin_overlay import TwinOverlayRenderer
@@ -61,16 +64,36 @@ class Runtime:
         # Read-only controller state monitor (phase-09a): one read-only SDK client
         # per hardware arm, session-less; PAUSED (connections released) while a
         # hardware session owns the boxes. Started in start() after the previews.
+        # phase-09c: the monitor's ``home_rail`` op is gated by a full-travel sweep
+        # of a dedicated digital twin (RailSweepChecker; built lazily on first use).
+        self.rail_sweep: RailSweepChecker | None = None
+        if hw is not None and hw.digital_twin_scene:
+            self.rail_sweep = RailSweepChecker(
+                hw,
+                hw.digital_twin_scene,
+                inflation_m=cfg.hardware_session.home_rail_inflation_m,
+                step_m=cfg.hardware_session.home_rail_step_m,
+                rail_flip=cfg.hardware_session.rail_flip,
+            )
         self.hardware_monitor = HardwareStateMonitor(
             cfg.hardware_monitor, hw,
             paused=lambda: self._hardware_session_active(),  # late-bound (tests patch it)
             monitor_factory=monitor_factory,
+            rail_sweep=self.rail_sweep,
+            rail_fallback_m=cfg.twin_overlay.rail_fallback_m,
         )
         self.manager = SessionManager(
             cfg, self.bus, self.hub, self.profile_store, self.epoch,
             tracker_settings=self.tracker_settings,
             hardware_probe=self.hardware_probe,
             hardware_monitor=self.hardware_monitor,
+        )
+        # phase-09d: home_rail with a planned pre-positioning motion. The service decides
+        # dry-run / synchronous 09c homing / asynchronous RailHomingJob (202) / refused,
+        # registers itself as the monitor's ``jobs`` (maintenance_busy + progress) and
+        # keeps the final result per arm (GET .../maintenance/last).
+        self.rail_homing = RailHomingService(
+            cfg, self.hardware_monitor, self.rail_sweep, self.manager
         )
         # Twin alignment overlays (phase-09a): <camera_id>_align streams built from
         # the manager's hardware camera previews + the monitor's samples.
@@ -82,6 +105,7 @@ class Runtime:
                 paused=lambda: self._hardware_session_active(),
             )
             self.manager.twin_overlay = self.twin_overlay
+            self.rail_homing.twin_overlay = self.twin_overlay
         self.hardware_probe.start()  # no-op without a hardware workcell
         # Calibration wizard back end (13-tracker §4 "Calibration modes"): Runtime-
         # owned, session-less; REST /api/tracker/calibration + telemetry.
@@ -116,6 +140,7 @@ class Runtime:
         # (boxes released) -> the rest.
         if self.twin_overlay is not None:
             self.twin_overlay.stop()
+        self.rail_homing.stop()  # a homing in flight is never interrupted; wait for it
         self.hardware_monitor.stop()
         self.manager.teardown()
         self.manager.stop_previews()
@@ -127,25 +152,81 @@ class Runtime:
         self.microphone.stop()
 
     def _hardware_session_active(self) -> bool:
-        session = self.manager.session
-        return session is not None and session.spec.kind == "hardware"
+        """Hand-over predicate for the monitor / probe / overlay: a hardware
+        session exists OR ``create()`` is bringing one up (phase-09c: true from
+        the first line of a hardware ``create()``, otherwise the monitor's 0.5 s
+        supervisor round would reconnect the boxes in the middle of bring-up) OR
+        a rail-homing job's driver holds a control box (phase-09d)."""
+        return self.manager.hardware_session_active or self.rail_homing.owns_boxes
 
-    # -- arm maintenance routing (REST; phase-09b, 04-runtime §13.1) ----------------------
-    def arm_maintenance(self, arm_id: str, op: str) -> ArmMaintenanceResult:
+    # -- arm maintenance routing (REST; phase-09b/09c, 04-runtime §13.1) -------------------
+    def arm_maintenance(
+        self, arm_id: str, op: str, *, dry_run: bool = False
+    ) -> ArmMaintenanceResult:
         """``POST /api/hardware/arms/{arm_id}/maintenance``: unknown hardware arm ->
         ``KeyError`` (404); a hardware session owns the boxes -> the session path
         (``clear_errors`` / ``recover`` = the driver's user recovery,
-        ``apply_backstops`` refused); otherwise the read-only monitor's
-        maintenance queue (``recover`` refused: "no hardware session - use
-        clear_errors"). Refusals raise :class:`MaintenanceUnavailableError` (409).
-        Blocks <= 10 s on the calling (threadpool) thread; the SDK work happens on
-        the driver's / monitor's own thread."""
+        ``apply_backstops`` and ``home_rail`` refused); otherwise the read-only
+        monitor's maintenance queue (``recover`` refused: "no hardware session -
+        use clear_errors"). ``home_rail`` (phase-09c) is THE ONE op that moves a
+        mechanical part - the carriage drives to the track's zero end - so it is
+        session-less only ("end the session first"), twin-gated (``rail_sweep``)
+        and routed to the :class:`RailHomingService` (phase-09d): ``dry_run``
+        returns the sweep verdict + ``pre_position`` (zero writes); a sweep-clear
+        posture homes synchronously on the monitor's thread (<= 45 s, ``status:
+        done``); a posture that needs the planned pre-positioning motion starts a
+        ``RailHomingJob`` (``status: accepted`` + ``job_id`` -> REST 202); no
+        plan -> ``status: refused``. While a job runs EVERY op is refused ("rail
+        homing in progress"). Refusals raise :class:`MaintenanceUnavailableError`
+        (409). Blocks on the calling (threadpool) thread; the SDK work happens on
+        the driver's / monitor's / job's own thread."""
+        from .session.hardware import arm_label
+
         hw = self.cfg.workcell_config("hardware")
         if hw is None or all(a.id != arm_id for a in hw.arms):
             raise KeyError(arm_id)
+        busy_arm = self.rail_homing.active_arm  # phase-09d: a job owns the cell
+        if busy_arm is not None:
+            raise MaintenanceUnavailableError(
+                f"{op} refused: rail homing in progress on the {arm_label(busy_arm)} - "
+                "wait for it to finish"
+            )
         if self._hardware_session_active():
+            if op == "home_rail":
+                raise MaintenanceUnavailableError(
+                    "home_rail is not available while a hardware session owns the arms - "
+                    "end the session first"
+                )
             return self.manager.session_recovery(arm_id, op, timeout_s=MAINTENANCE_TIMEOUT_S)
-        return self.hardware_monitor.maintenance(arm_id, op, timeout_s=MAINTENANCE_TIMEOUT_S)
+        if op == "home_rail" and not dry_run and not self.cfg.hardware_session.armed:
+            raise MaintenanceUnavailableError(
+                "home_rail refused: hardware not armed (set hardware_session.armed: true in the "
+                "lab config; the repo default is false so tests and dev instances never move a "
+                "rail)"
+            )
+        if op == "home_rail":
+            # phase-09d: the maintenance motion excludes EVERY session (contract 注意事项 1),
+            # including a sim one and a create() still validating (its kind is not
+            # recorded yet, so _hardware_session_active() is false in that window)
+            if self.manager.session_active:
+                raise MaintenanceUnavailableError(
+                    "home_rail is not available while a session is active or starting - "
+                    "end the session first"
+                )
+            return self.rail_homing.request(arm_id, dry_run=dry_run)
+        return self.hardware_monitor.maintenance(
+            arm_id, op, timeout_s=MAINTENANCE_TIMEOUT_S, dry_run=dry_run
+        )
+
+    def last_maintenance(self, arm_id: str) -> ArmMaintenanceResult | None:
+        """``GET /api/hardware/arms/{arm_id}/maintenance/last`` (phase-09d): the
+        final result of the last ``home_rail`` on this arm (a finished
+        ``RailHomingJob`` or a synchronous homing); ``None`` -> 404. Unknown
+        hardware arm -> ``KeyError`` (404)."""
+        hw = self.cfg.workcell_config("hardware")
+        if hw is None or all(a.id != arm_id for a in hw.arms):
+            raise KeyError(arm_id)
+        return self.rail_homing.last(arm_id)
 
     # -- session-less device discovery (REST; 04-runtime §13.1) -----------------------
     def microphone_infos(self) -> list[MicrophoneInfo]:
