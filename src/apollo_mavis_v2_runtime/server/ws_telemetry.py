@@ -90,6 +90,12 @@ def build_tracker_telemetry(runtime, snap, now: float) -> TrackerTelemetry:
         device_action=extra.get("device_action"),
         charging=dev.charging,
         calibration=runtime.tracker_calibration.status(),
+        # Controller link (2026-09-07): the button path's own age plus the
+        # pairing evidence, so the Welcome page can say "paired and moving" vs
+        # "moving but buttons dead" vs "receiver unplugged" (13-tracker §3.5).
+        controller_age_s=dev.controller_age_s,
+        objects=list(dev.objects),
+        dongle_present=dev.dongle_present,
     )
 
 

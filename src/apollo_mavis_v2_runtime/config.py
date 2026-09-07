@@ -3,12 +3,75 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from apollo_mavis_v2_core import ConfigError, WorkcellConfig
 from pydantic import BaseModel, Field, ValidationError, model_validator
+
+# -- self-contained paths (04-runtime §14) --------------------------------------------
+# Every filesystem path in the config resolves inside the workspace so a fresh
+# ``git clone --recurse-submodules`` runs with no ``~/apollo`` (or any other
+# machine-specific) dependency: the config anchors data at ``${APOLLO_HOME}/var/...``.
+# ``${APOLLO_HOME}`` is the workspace root — ``$APOLLO_HOME`` when the launcher /
+# systemd unit exports it, otherwise inferred from the config file's location (and,
+# as a last resort, from this installed package's location). Absolute paths and ``~``
+# still work verbatim, so the rendered ops config may pin FHS paths (/var/lib/...).
+_WS_MARKERS = ("apollo-mavis-v2-core", "apollo-mavis-v2-runtime")
+
+
+def _find_workspace_root(start: Path) -> Path | None:
+    """Nearest ancestor of ``start`` holding the side-by-side sub-repos (the ws
+    root). ``None`` when ``start`` is not inside such a checkout (installed
+    wheel); ``$APOLLO_HOME`` must then be set explicitly."""
+    try:
+        start = start.resolve()
+    except OSError:
+        return None
+    for d in (start, *start.parents):
+        if all((d / m).is_dir() for m in _WS_MARKERS):
+            return d
+    return None
+
+
+@lru_cache(maxsize=1)
+def _package_workspace_root() -> Path | None:
+    return _find_workspace_root(Path(__file__).parent)
+
+
+def apollo_home() -> str | None:
+    """Value ``${APOLLO_HOME}`` expands to: ``$APOLLO_HOME`` if exported, else the
+    ws root inferred from this package's location. ``load_runtime_config`` also
+    seeds ``$APOLLO_HOME`` from the config file so child processes inherit it."""
+    env = os.environ.get("APOLLO_HOME")
+    if env:
+        return env
+    root = _package_workspace_root()
+    return str(root) if root is not None else None
+
+
+def _resolve_path(value: str | Path) -> Path:
+    """Expand ``${APOLLO_HOME}`` / other ``$VARS`` / ``~`` in a config path and
+    anchor a still-relative result at the workspace root."""
+    s = str(value)
+    home = apollo_home()
+    if "${APOLLO_HOME}" in s or "$APOLLO_HOME" in s:
+        if not home:
+            # Never fall through to a literal "${APOLLO_HOME}/var/..." directory
+            # (2026-09-07): an installed wheel outside a checkout must be told
+            # where the workspace is.
+            raise ConfigError(
+                f"path {s!r} uses ${{APOLLO_HOME}} but $APOLLO_HOME is not set and no "
+                "workspace root (apollo-mavis-v2-core + apollo-mavis-v2-runtime side by "
+                "side) was found above the config file or the installed package"
+            )
+        s = s.replace("${APOLLO_HOME}", home).replace("$APOLLO_HOME", home)
+    p = Path(os.path.expandvars(s)).expanduser()
+    if not p.is_absolute() and home:
+        p = Path(home) / p
+    return p
 
 
 class TeleopRates(BaseModel):
@@ -72,6 +135,10 @@ class ControlConfig(BaseModel):
     # trackpad) do, and they slide the WHOLE arm (the world-frame target and the
     # tracker anchors ride along). True: the rail is an (expensive) IK dof.
     rail_in_ik: bool = False
+    # Control-loop health line period, s (2026-09-07; LoggingConfig): one INFO line
+    # with tick rate / overruns / clutch / tracker ages / gate / IK slip counters /
+    # servo-stream stats. 0 disables it.
+    health_log_every_s: float = Field(default=1.0, ge=0.0)
 
 
 class VideoConfig(BaseModel):
@@ -156,6 +223,16 @@ class TwinOverlayConfig(BaseModel):
     track is not homed (its register is meaningless then) - the tile caption
     says so (``rail not homed - twin assumes X m``); the ``home_rail`` sweep and
     a hardware session's frozen (unselected) arm use the same fallback.
+    ``principal_offset_px`` is a per-camera OVERLAY-ONLY principal-point nudge
+    ``{camera_id: [du, dv]}`` added to that camera's rendered principal point
+    (``cx += du``, ``cy += dv``): it aligns a wrist camera whose physical mount
+    differs slightly from the shared ``xarm7_on_rail.xml`` ``wrist_cam`` pose
+    (solved on the Manipulation Arm), WITHOUT touching the true factory
+    ``CameraConfig.intrinsics`` that get baked into recordings. The residual is
+    a UNIFORM, pose-/depth-independent image shift (measured 2026-09-06: the
+    Perception Arm needed ``[21, 13]`` px, ~2 cm at the arm, while the
+    Manipulation Arm needed 0) so a principal-point offset cancels it exactly at
+    every posture; see 03-sim §4.3 "per-arm wrist camera overlay offset".
     """
 
     enabled: bool = True
@@ -171,6 +248,7 @@ class TwinOverlayConfig(BaseModel):
     rail_fallback_m: dict[str, float] = Field(
         default_factory=lambda: {"grip": 0.65, "view": 0.0}
     )  # used while the track is not homed
+    principal_offset_px: dict[str, tuple[float, float]] = Field(default_factory=dict)
     stream_suffix: str = "_align"
 
 
@@ -301,6 +379,9 @@ class ControllerMapConfig(BaseModel):
     action.
     """
 
+    # The reference map (13-tracker §1.1; the tests and design docs pin it). The
+    # LAB config (configs/mavis_v2.yaml, 2026-09-07) departs from it: gripper on
+    # the two plain buttons, arm switching on the pad - see the comment there.
     clutch: ControllerInput = "trigger_click"
     gripper_open: ControllerInput = "trackpad_up"
     gripper_close: ControllerInput = "trackpad_down"
@@ -383,7 +464,7 @@ class TrackerConfig(BaseModel):
     backend: Literal["none", "fake", "libsurvive"] = "none"
     object_name: str = "WM0"  # libsurvive codename of the dongle-paired tracker
     libsurvive_args: list[str] = Field(default_factory=lambda: ["--lighthousecount", "2"])
-    libsurvive_config_path: Path = Path("~/.config/libsurvive/config.json")
+    libsurvive_config_path: Path = Path("${APOLLO_HOME}/var/libsurvive/config.json")
     yaw_deg: float = 0.0  # lighthouse world -> MJCF world (both z-up; yaw only)
     pos_scale: float = Field(default=1.0, ge=0.1, le=3.0)
     follow_rotation: bool = True
@@ -396,8 +477,37 @@ class TrackerConfig(BaseModel):
 
     def model_post_init(self, __context) -> None:
         object.__setattr__(
-            self, "libsurvive_config_path", Path(self.libsurvive_config_path).expanduser()
+            self, "libsurvive_config_path", _resolve_path(self.libsurvive_config_path)
         )
+
+
+class LoggingConfig(BaseModel):
+    """Process logging (2026-09-07; 04-runtime §14 "Logging").
+
+    Until this existed the runtime had ONE ``basicConfig`` to stderr and the dev
+    launcher appended that stream to an unrotated file (40 MB after two days, a
+    quarter of it uvicorn access lines for three UI poll endpoints) with no
+    level knob, so the first live teleop defects ("the arm froze", "it stops
+    late") could not be read off a log. Now the runtime owns a
+    :class:`logging.handlers.RotatingFileHandler` in ``dir`` (self-contained:
+    ``${APOLLO_HOME}/var/logs`` by default, gitignored with the rest of ``var``;
+    the ops render pins ``$DATA_ROOT/logs``), keeps stderr for journald / the
+    launcher's raw capture, and the control loop writes one INFO health line per
+    ``control.health_log_every_s`` (tick rate, overruns, clutch / tracker / gate
+    state, IK slip counters, servo-stream stats) plus edge lines for every
+    transition that matters to teleop (clutch, tracker fresh/stale, watchdog
+    latch; gate block edges were already the supervisor's ``collision event``).
+    ``level`` applies to both handlers; ``DEBUG`` adds per-event IK slips and
+    driver events. ``access_log`` re-enables uvicorn's per-request lines.
+    ``dir: null`` = stderr only (tests, embedding apps).
+    """
+
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    dir: Path | None = Path("${APOLLO_HOME}/var/logs")
+    file: str = "runtime.log"
+    max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    backup_count: int = Field(default=10, ge=0)
+    access_log: bool = False
 
 
 class RuntimeConfig(BaseModel):
@@ -407,12 +517,12 @@ class RuntimeConfig(BaseModel):
     port: int = 8765  # 8000 is commonly taken on dev boxes (gohttpserver on the lab machine)
     ui_dist: Path | None = None  # built SPA; None = API-only (Vite dev)
     workcells: dict[str, WorkcellConfig] = Field(default_factory=dict)  # "hardware"|"sim"
-    profiles_dir: Path = Path("~/apollo/profiles")
-    datasets_root: Path = Path("~/apollo/datasets")
-    checkpoints_root: Path = Path("~/apollo/checkpoints")
+    profiles_dir: Path = Path("${APOLLO_HOME}/var/profiles")
+    datasets_root: Path = Path("${APOLLO_HOME}/var/datasets")
+    checkpoints_root: Path = Path("${APOLLO_HOME}/var/checkpoints")
     # Tracker calibration artefacts (phase-10): tracker_calibration.json (persisted
     # yaw / install state), temporary + installed libsurvive config copies.
-    calibration_dir: Path = Path("~/apollo/calibration")
+    calibration_dir: Path = Path("${APOLLO_HOME}/var/calibration")
     control: ControlConfig = ControlConfig()
     recorder: RecorderConfig = RecorderConfig()
     dagger: DaggerConfig = DaggerConfig()
@@ -425,12 +535,16 @@ class RuntimeConfig(BaseModel):
     telemetry_hz: float = 25.0
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
+    logging: LoggingConfig = LoggingConfig()  # 2026-09-07
 
     def model_post_init(self, __context) -> None:
         for name in ("profiles_dir", "datasets_root", "checkpoints_root", "calibration_dir"):
-            object.__setattr__(self, name, Path(getattr(self, name)).expanduser())
+            object.__setattr__(self, name, _resolve_path(getattr(self, name)))
         if self.ui_dist is not None:
-            object.__setattr__(self, "ui_dist", Path(self.ui_dist).expanduser())
+            object.__setattr__(self, "ui_dist", _resolve_path(self.ui_dist))
+        if self.logging.dir is not None:
+            lg = self.logging.model_copy(update={"dir": _resolve_path(self.logging.dir)})
+            object.__setattr__(self, "logging", lg)
         # phase-09c: ``twin_overlay.rail_flip`` is the deprecated alias of
         # ``hardware_session.rail_flip``; either key set -> one convention for the
         # overlay, the gate twin and the home_rail sweep.
@@ -455,6 +569,13 @@ def load_runtime_config(path: str | Path | None = None) -> RuntimeConfig:
     if path is None:
         return RuntimeConfig()
     p = Path(path)
+    # Seed ${APOLLO_HOME} from the config file's own workspace so a config that uses
+    # ${APOLLO_HOME}/var/... resolves without the launcher, and child processes
+    # (dagger trainer, libsurvive) inherit the same anchor. An explicit env wins.
+    if "APOLLO_HOME" not in os.environ:
+        root = _find_workspace_root(p.parent)
+        if root is not None:
+            os.environ["APOLLO_HOME"] = str(root)
     try:
         text = p.read_text(encoding="utf-8")
     except OSError as e:
@@ -500,6 +621,7 @@ __all__ = [
     "HardwareMonitorConfig",
     "TwinOverlayConfig",
     "HardwareSessionConfig",
+    "LoggingConfig",
     "RuntimeConfig",
     "load_runtime_config",
 ]

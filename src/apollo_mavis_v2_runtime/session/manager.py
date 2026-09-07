@@ -81,12 +81,14 @@ from .hardware import (
     RailHoldWorkcell,
     SessionStateProvider,
     apply_executor_caps,
+    apply_teleop_caps,
     arm_label,
     bringup_rows,
     executor_caps_for,
     frozen_state,
     scale_control_config,
     scale_driver_config,
+    teleop_rate_caps,
 )
 from .types import SessionState
 
@@ -516,6 +518,7 @@ class SessionManager:
             twin=twin if safety.safety_debug else None,
             report_watchdog=ArmReportWatchdog(safety.twin_staleness_s),
             warn_clearance_m=safety.warn_clearance_m,
+            clearance_sweep_m=safety.clearance_sweep_m,
         )
         session_id = uuid.uuid4().hex
         recorder_thread = None
@@ -527,8 +530,15 @@ class SessionManager:
                 )
             if spec.mode in ("dagger", "inference"):
                 loop, recorder_thread, policy_session = self._build_policy_stack(
-                    spec, session_cfg, workcell, scene, session_id,
-                    ik, kin, twin, supervisor,
+                    spec,
+                    session_cfg,
+                    workcell,
+                    scene,
+                    session_id,
+                    ik,
+                    kin,
+                    twin,
+                    supervisor,
                 )
             else:
                 loop = ControlLoop(
@@ -850,8 +860,7 @@ class SessionManager:
                 rail = str(getattr(st, "rail", "unknown"))
                 if error or not getattr(st, "connected", False):
                     failures.append(
-                        f"{arm_label(arm_id)}: {_bringup_step(st)} - "
-                        f"{error or 'not connected'}"
+                        f"{arm_label(arm_id)}: {_bringup_step(st)} - {error or 'not connected'}"
                     )
                 elif meta.rail.get(arm_id, False) and rail not in accepted_rail:
                     # connected with a track that is not READY (e.g. the driver latched
@@ -891,9 +900,7 @@ class SessionManager:
             # 6. FRESH gate twin (never the cached status scene: inflation mutates the model)
             overrides = SceneOverrides(
                 microphones={a.id: bool(a.microphone) for a in wc.arms if a.id in meta.arm_ids},
-                base_pose={
-                    k: v for k, v in base_pose_overrides(wc).items() if k in meta.arm_ids
-                },
+                base_pose={k: v for k, v in base_pose_overrides(wc).items() if k in meta.arm_ids},
             )
             try:
                 twin = DigitalTwin(
@@ -930,6 +937,7 @@ class SessionManager:
                 twin=twin,
                 report_watchdog=ArmReportWatchdog(safety.twin_staleness_s),
                 warn_clearance_m=safety.warn_clearance_m,
+                clearance_sweep_m=safety.clearance_sweep_m,
             )
             start_report = twin.check({a: states[a].q for a in arms})
             if start_report.blocked:
@@ -950,13 +958,32 @@ class SessionManager:
             control_cfg = scale_control_config(self.cfg.control, scale)
             caps = executor_caps_for((inner.arms[a] for a in arms), control_cfg)
             control_cfg = apply_executor_caps(control_cfg, caps)
+            # TELEOP is capped the same way (2026-09-07): the tracker target chain ran
+            # at target_rate (1.0 m/s) against a streamer that executes 0.2 m/s at
+            # scale 1.0, so every fast hand motion hit the 0.025 m leash and the
+            # truncation was folded into the anchor - hand travel silently DISCARDED,
+            # and the remainder still arriving up to a leash after the hand stopped.
+            control_cfg = apply_teleop_caps(control_cfg, caps)
             if caps.source == "servo":
+                unscaled = scale_control_config(self.cfg.control, scale)
+                tcp_mps, joint_radps = teleop_rate_caps(unscaled, caps)
                 logger.info(
                     "hardware loop: plan executor capped by the servo stream - slew %.5f rad/tick, "
                     "cart %.5f m/tick (host slew %.5f)",
                     caps.slew_rad_per_tick,
                     caps.cart_step_m if caps.cart_step_m is not None else float("nan"),
-                    scale_control_config(self.cfg.control, scale).jog.slew_rad_per_tick,
+                    unscaled.jog.slew_rad_per_tick,
+                )
+                logger.info(
+                    "hardware loop: teleop capped by the servo stream - tcp %.4f m/s, "
+                    "joint %.4f rad/s, dq_max %.5f rad/tick (requested target_rate %.3f m/s / "
+                    "%.3f rad/s, dq_max %.5f)",
+                    tcp_mps if tcp_mps is not None else float("nan"),
+                    joint_radps if joint_radps is not None else float("nan"),
+                    control_cfg.dq_max_rad,
+                    unscaled.target_rate.v_mps,
+                    unscaled.target_rate.w_radps,
+                    unscaled.dq_max_rad,
                 )
             loop = ControlLoop(
                 workcell,
@@ -1278,9 +1305,7 @@ class SessionManager:
             spec.model_dump(mode="json"),
             {
                 "kind": "sim",
-                "config_sha256": hashlib.sha256(
-                    session_cfg.model_dump_json().encode()
-                ).hexdigest(),
+                "config_sha256": hashlib.sha256(session_cfg.model_dump_json().encode()).hexdigest(),
                 "arm_ids": list(spec.arms),
                 "rail": {a.arm_id: a.has_rail for a in arms},
             },
@@ -1299,9 +1324,9 @@ class SessionManager:
         initial = self.profile_store.initial_for("sim")
         profile_snapshot = None
         if spec.start_from.startswith("profile:"):
-            profile_snapshot = self.profile_store.get(
-                spec.start_from.split(":", 1)[1]
-            ).model_dump(mode="json")
+            profile_snapshot = self.profile_store.get(spec.start_from.split(":", 1)[1]).model_dump(
+                mode="json"
+            )
         meta_base = {
             "session_id": session_id,
             "scene_xml_sha256": scene_sha,
@@ -1321,9 +1346,7 @@ class SessionManager:
                 out[cam_id] = {
                     "T_W_C": pose_json(kin.camera_world(cam_id, q_by_arm)),
                     "extrinsics_frame": "world" if kin.camera_static(cam_id) else None,
-                    "intrinsics": (
-                        cfg.intrinsics.model_dump() if cfg and cfg.intrinsics else None
-                    ),
+                    "intrinsics": (cfg.intrinsics.model_dump() if cfg and cfg.intrinsics else None),
                     "calibration_file": None,  # sim: pose comes from the MJCF
                     "calibration_sha256": None,
                 }
@@ -1361,8 +1384,16 @@ class SessionManager:
         )
 
     def _build_policy_stack(
-        self, spec: SessionSpec, session_cfg: WorkcellConfig, workcell, scene,
-        session_id: str, ik, kin, twin, supervisor,
+        self,
+        spec: SessionSpec,
+        session_cfg: WorkcellConfig,
+        workcell,
+        scene,
+        session_id: str,
+        ik,
+        kin,
+        twin,
+        supervisor,
     ):
         """DAgger/inference bringup (12-dagger §1): -> (loop, recorder, session)."""
         import shutil
@@ -1387,17 +1418,13 @@ class SessionManager:
         resolved = resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)
         info = resolved.info
         frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
-        if info.action_space != "delta_ee" or any(
-            f != info.action_frame for f in frames.values()
-        ):
+        if info.action_space != "delta_ee" or any(f != info.action_frame for f in frames.values()):
             raise SessionError("policy/dataset frame mismatch")
         from ..dagger.policies import MLPPolicy, resolve_device
 
         device = resolve_device(dcfg.policy_device)
         try:
-            policy = MLPPolicy.from_bundle(
-                str(resolved.state_dict_path), info.version, device
-            )
+            policy = MLPPolicy.from_bundle(str(resolved.state_dict_path), info.version, device)
         except Exception as e:
             raise SessionError(f"policy load failed: {e!r}") from e
         gate = TakeoverGateImpl(list(spec.arms), dcfg.t_blend_s)
@@ -1405,22 +1432,40 @@ class SessionManager:
         policy_lock = threading.Lock()
         runner = PolicyRunner(
             policy,
-            make_obs_fn(self.bus, arms_meta,
-                        RecordingFrameConverter(frames, {}), RecorderKinematics(scene)),
+            make_obs_fn(
+                self.bus, arms_meta, RecordingFrameConverter(frames, {}), RecorderKinematics(scene)
+            ),
             rate_hz=dcfg.policy_rate_hz,
             policy_lock=policy_lock,
         )
-        anchor = ActionAnchor(ik, kin, SlewLimits(window_s=dcfg.slew_window_s),
-                              action_space=info.action_space)
-        common = dict(ik=ik, kin=kin, planner=twin, profile_store=self.profile_store,
-                      workcell_kind="sim", gripper_arms=_gripper_arms(scene, spec.arms),
-                      tracker=self._tracker_provider())
+        anchor = ActionAnchor(
+            ik, kin, SlewLimits(window_s=dcfg.slew_window_s), action_space=info.action_space
+        )
+        common = dict(
+            ik=ik,
+            kin=kin,
+            planner=twin,
+            profile_store=self.profile_store,
+            workcell_kind="sim",
+            gripper_arms=_gripper_arms(scene, spec.arms),
+            tracker=self._tracker_provider(),
+        )
         if spec.mode == "inference":
             loop = GatedPolicyExecutor(
-                workcell, self.cfg.control, self.bus, supervisor, list(spec.arms),
-                gate=gate, runner=runner, anchor=anchor, arms_meta=arms_meta,
-                session_mode="inference", version_label=resolved.policy_id,
-                recorder=None, recorder_fps=self.cfg.recorder.fps, **common,
+                workcell,
+                self.cfg.control,
+                self.bus,
+                supervisor,
+                list(spec.arms),
+                gate=gate,
+                runner=runner,
+                anchor=anchor,
+                arms_meta=arms_meta,
+                session_mode="inference",
+                version_label=resolved.policy_id,
+                recorder=None,
+                recorder_fps=self.cfg.recorder.fps,
+                **common,
             )
             return loop, None, InferenceSession(loop, runner)
 
@@ -1433,44 +1478,77 @@ class SessionManager:
         v0 = store.version_dir(0)
         v0.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(resolved.state_dict_path, v0 / STATE_DICT)
-        store.write_manifest(CheckpointInfo(
-            run_id=run_id, version=0, path=str(v0), parent_version=None,
-            trained_on_frames=info.trained_on_frames, trained_on_episodes=[],
-            action_frame=info.action_frame, action_space=info.action_space,
-            sanity_ok=True, mean_loss=info.mean_loss,
-            sha256=sha256_file(v0 / STATE_DICT), created_wallclock_ns=time.time_ns(),
-        ))
+        store.write_manifest(
+            CheckpointInfo(
+                run_id=run_id,
+                version=0,
+                path=str(v0),
+                parent_version=None,
+                trained_on_frames=info.trained_on_frames,
+                trained_on_episodes=[],
+                action_frame=info.action_frame,
+                action_space=info.action_space,
+                sanity_ok=True,
+                mean_loss=info.mean_loss,
+                sha256=sha256_file(v0 / STATE_DICT),
+                created_wallclock_ns=time.time_ns(),
+            )
+        )
         policy.set_version(0)
         recorder_thread = self._build_collect_recorder(
-            spec, session_cfg, workcell, scene, session_id,
+            spec,
+            session_cfg,
+            workcell,
+            scene,
+            session_id,
             dagger_ctx={"run_id": run_id, "gate": gate},
         )
         state_dim = sum(len(arm_state_names(a, r)) for a, r in arms_meta)
         action_dim = sum(len(arm_action_names(a, r, "delta_ee")) for a, r in arms_meta)
         tcfg = TrainerConfig(
-            run_id=run_id, checkpoints_root=str(self.cfg.checkpoints_root),
+            run_id=run_id,
+            checkpoints_root=str(self.cfg.checkpoints_root),
             spool_dir=str(recorder_thread.spool_dir),
             seed_bundle=str(v0 / STATE_DICT),
-            port=dcfg.trainer.port, device=dcfg.trainer.device,
+            port=dcfg.trainer.port,
+            device=dcfg.trainer.device,
             cuda_visible_devices=dcfg.trainer.cuda_visible_devices,
-            action_frame=info.action_frame, action_space=info.action_space,
-            state_dim=state_dim, action_dim=action_dim,
+            action_frame=info.action_frame,
+            action_space=info.action_space,
+            state_dim=state_dim,
+            action_dim=action_dim,
             min_new_labels=dcfg.trainer.min_new_labels,
             push_period_s=dcfg.trainer.push_period_s,
-            batch_size=dcfg.trainer.batch_size, lr=dcfg.trainer.lr,
+            batch_size=dcfg.trainer.batch_size,
+            lr=dcfg.trainer.lr,
         )
         client = AsyncTrainerClientImpl(tcfg, workdir=store.root)
         reloader = PolicyReloaderImpl(
-            policy, store, info.action_frame, info.action_space,
-            policy_lock=policy_lock, current_version=0,
+            policy,
+            store,
+            info.action_frame,
+            info.action_space,
+            policy_lock=policy_lock,
+            current_version=0,
             on_rollback=client.notify_rollback,
         )
         loop = GatedPolicyExecutor(
-            workcell, self.cfg.control, self.bus, supervisor, list(spec.arms),
-            gate=gate, runner=runner, anchor=anchor, arms_meta=arms_meta,
-            session_mode="dagger", run_id=run_id, reloader=reloader,
-            trainer_client=client, recorder=recorder_thread,
-            recorder_fps=self.cfg.recorder.fps, **common,
+            workcell,
+            self.cfg.control,
+            self.bus,
+            supervisor,
+            list(spec.arms),
+            gate=gate,
+            runner=runner,
+            anchor=anchor,
+            arms_meta=arms_meta,
+            session_mode="dagger",
+            run_id=run_id,
+            reloader=reloader,
+            trainer_client=client,
+            recorder=recorder_thread,
+            recorder_fps=self.cfg.recorder.fps,
+            **common,
         )
         recorder_thread.on_episode_saved = loop.on_episode_saved
         return loop, recorder_thread, DaggerSession(loop, runner, reloader, client)
@@ -1528,31 +1606,33 @@ class SessionManager:
                 result = session.twin.plan(PlanRequest(q_start=q_start, q_goal=q_goal))
                 waypoints = result.waypoints
             if result is not None and not result.ok:
-                logger.error("start_from plan failed: %s %s", result.failure,
-                             result.failing_pair)
+                logger.error("start_from plan failed: %s %s", result.failure, result.failing_pair)
                 session.fault_detail = f"start_from plan failed: {result.failure}"
                 if session.state is SessionState.START_FROM:
                     session.state = SessionState.RUNNING  # arms stay held; operator decides
                 session.start_from_progress = None
-                self.bus.commands.submit(Command(
-                    op="_plan_ready",
-                    args={"arms": list(q_goal), "result": result, "detail": ""},
-                    source="internal",
-                ))
+                self.bus.commands.submit(
+                    Command(
+                        op="_plan_ready",
+                        args={"arms": list(q_goal), "result": result, "detail": ""},
+                        source="internal",
+                    )
+                )
                 return
             total = sum(len(w) for w in waypoints.values()) or 1
-            self.bus.commands.submit(Command(
-                op="execute_plan",
-                args={"waypoints": waypoints, "gripper": grippers},
-                source="internal",
-            ))
+            self.bus.commands.submit(
+                Command(
+                    op="execute_plan",
+                    args={"waypoints": waypoints, "gripper": grippers},
+                    source="internal",
+                )
+            )
             plans = session.loop.plans
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline and session.state == SessionState.START_FROM:
                 active = plans.active_arms
                 remaining = sum(
-                    len(plans._waypoints.get(a, ())) - plans._index.get(a, 0)
-                    for a in active
+                    len(plans._waypoints.get(a, ())) - plans._index.get(a, 0) for a in active
                 )
                 session.start_from_progress = 1.0 - remaining / total
                 if not active and session.loop.tick_count > 1:
@@ -1610,8 +1690,9 @@ class SessionManager:
             ):
                 session.start_from_progress = None
                 session.state = SessionState.RECOVERING
-                logger.info("session %s RECOVERING (release every input to resume)",
-                            session.session_id)
+                logger.info(
+                    "session %s RECOVERING (release every input to resume)", session.session_id
+                )
         elif state is None:
             if current in (SessionState.FAULT, SessionState.RECOVERING):
                 session.state = SessionState.RUNNING
@@ -1685,9 +1766,7 @@ class SessionManager:
         code = int(getattr(res, "error_code", 0) or 0)
         title = controller_error_title(code)
         if res.ok:
-            detail = (
-                f"recovered from {title}" if title else "re-seeded from the measured position"
-            )
+            detail = f"recovered from {title}" if title else "re-seeded from the measured position"
         else:
             reason = str(getattr(res, "detail", "") or "recovery failed")
             detail = f"{title} - {reason}" if title else reason
@@ -1767,8 +1846,11 @@ class SessionManager:
         fps = self.cfg.video.preview_fps
         for name in scene.meta.cameras:
             cam = SimCamera(
-                camera_id=name, render_service=rs, mjcf_camera=name,
-                fps=fps, source="preview",
+                camera_id=name,
+                render_service=rs,
+                mjcf_camera=name,
+                fps=fps,
+                source="preview",
             )
             cam.start()
             self.hub.add_stream(name, cam, fps)
@@ -1876,16 +1958,28 @@ class SessionManager:
         out = []
         if self.session is not None:
             for cam_id, cam in self.session.workcell.cameras.items():
-                out.append(CameraInfo(
-                    camera_id=cam_id, kind="sim", label=cam_id,
-                    resolution=cam.resolution, fps=int(cam.fps), live=True,
-                ))
+                out.append(
+                    CameraInfo(
+                        camera_id=cam_id,
+                        kind="sim",
+                        label=cam_id,
+                        resolution=cam.resolution,
+                        fps=int(cam.fps),
+                        live=True,
+                    )
+                )
             return out
         for cam in self._preview_sources:
-            out.append(CameraInfo(
-                camera_id=cam.camera_id, kind="sim", label=cam.camera_id,
-                resolution=cam.resolution, fps=int(cam.fps), live=True,
-            ))
+            out.append(
+                CameraInfo(
+                    camera_id=cam.camera_id,
+                    kind="sim",
+                    label=cam.camera_id,
+                    resolution=cam.resolution,
+                    fps=int(cam.fps),
+                    live=True,
+                )
+            )
         return out
 
     def hardware_camera_infos(self) -> list:
@@ -1902,20 +1996,31 @@ class SessionManager:
         for cam_cfg in wc.cameras:
             live = self.hardware_camera(cam_cfg.id) is not None
             live_cams[cam_cfg.id] = live
-            out.append(CameraInfo(
-                camera_id=cam_cfg.id, kind=cam_cfg.kind, label=cam_cfg.id,
-                resolution=tuple(cam_cfg.resolution), fps=int(cam_cfg.fps), live=live,
-            ))
+            out.append(
+                CameraInfo(
+                    camera_id=cam_cfg.id,
+                    kind=cam_cfg.kind,
+                    label=cam_cfg.id,
+                    resolution=tuple(cam_cfg.resolution),
+                    fps=int(cam_cfg.fps),
+                    live=live,
+                )
+            )
         # Twin alignment overlays (phase-09a): kind "twin", live iff the real camera
         # underneath is live AND the overlay is compositing (live / stale tint).
         overlay = self.twin_overlay
         if overlay is not None:
             for src in overlay.streams.values():
-                out.append(CameraInfo(
-                    camera_id=src.stream_id, kind="twin", label=src.label,
-                    resolution=src.resolution, fps=int(overlay.cfg.fps),
-                    live=bool(live_cams.get(src.camera_id)) and src.status in ("live", "stale"),
-                ))
+                out.append(
+                    CameraInfo(
+                        camera_id=src.stream_id,
+                        kind="twin",
+                        label=src.label,
+                        resolution=src.resolution,
+                        fps=int(overlay.cfg.fps),
+                        live=bool(live_cams.get(src.camera_id)) and src.status in ("live", "stale"),
+                    )
+                )
         return out
 
     def scene_infos(self, kind: str) -> list:
@@ -1934,12 +2039,16 @@ class SessionManager:
                 continue
             if kind not in meta.suitable_for:
                 continue
-            out.append(SceneInfo(
-                scene_id=meta.id, label=getattr(meta, "title", None) or meta.description,
-                num_arms=meta.n_arms,
-                rail_flags=[meta.rail[a] for a in meta.arm_ids],
-                cameras=list(meta.cameras), kind=kind,  # type: ignore[arg-type]
-            ))
+            out.append(
+                SceneInfo(
+                    scene_id=meta.id,
+                    label=getattr(meta, "title", None) or meta.description,
+                    num_arms=meta.n_arms,
+                    rail_flags=[meta.rail[a] for a in meta.arm_ids],
+                    cameras=list(meta.cameras),
+                    kind=kind,  # type: ignore[arg-type]
+                )
+            )
         return out
 
     def workcell_status(self, kind: str | None = None):
@@ -1959,8 +2068,10 @@ class SessionManager:
         available = [k for k in ("hardware", "sim") if k in self.cfg.workcells]
         requested = kind
         if kind is None:
-            kind = self.session.spec.kind if self.session else (
-                "sim" if "sim" in available else (available[0] if available else "sim")
+            kind = (
+                self.session.spec.kind
+                if self.session
+                else ("sim" if "sim" in available else (available[0] if available else "sim"))
             )
         arms: list[ArmStatusInfo]
         if kind == "hardware":
@@ -1971,7 +2082,10 @@ class SessionManager:
             cameras = self.camera_infos() if requested is None else self.sim_camera_infos()
         probe = self.hardware_probe
         return WorkcellStatus(
-            kind=kind, available_kinds=available, arms=arms, cameras=cameras,
+            kind=kind,
+            available_kinds=available,
+            arms=arms,
+            cameras=cameras,
             policies_available=bool(scan_policies(self.cfg.checkpoints_root)),
             hardware_ready=bool(probe is not None and probe.hardware_ready),
         )
@@ -1992,14 +2106,18 @@ class SessionManager:
         if scene is not None:
             for arm_id in _manipulation_first(scene.meta.arm_ids):
                 limits = self._joint_limits(scene, arm_id)
-                arms.append(ArmStatusInfo(
-                    arm_id=arm_id, ip=None, connected=connected,
-                    has_rail=scene.meta.rail[arm_id],
-                    gripper="xarm" if scene.addressing[arm_id].has_gripper else "none",
-                    gripper_force_capable=False,  # sim grippers are position-only
-                    error_code=states[arm_id].error_code if arm_id in states else 0,
-                    joint_limits=limits,
-                ))
+                arms.append(
+                    ArmStatusInfo(
+                        arm_id=arm_id,
+                        ip=None,
+                        connected=connected,
+                        has_rail=scene.meta.rail[arm_id],
+                        gripper="xarm" if scene.addressing[arm_id].has_gripper else "none",
+                        gripper_force_capable=False,  # sim grippers are position-only
+                        error_code=states[arm_id].error_code if arm_id in states else 0,
+                        joint_limits=limits,
+                    )
+                )
         return arms
 
     def _twin_scene(self, scene_id: str | None):
@@ -2035,15 +2153,19 @@ class SessionManager:
         arms: list[ArmStatusInfo] = []
         for arm in sorted(wc.arms, key=lambda a: a.id != DEFAULT_ACTIVE_ARM):  # grip first
             in_twin = twin is not None and arm.id in twin.meta.arm_ids
-            arms.append(ArmStatusInfo(
-                arm_id=arm.id, ip=arm.ip, connected=connected,
-                reachable=probe.reachable(arm.id) if probe is not None else "unknown",
-                has_rail=twin.meta.rail[arm.id] if in_twin else arm.expect_rail == "yes",
-                gripper=arm.gripper,
-                gripper_force_capable=arm.gripper == "xarm_g2",
-                error_code=monitor.error_code(arm.id) if monitor is not None else 0,
-                joint_limits=self._joint_limits(twin, arm.id) if in_twin else [],
-            ))
+            arms.append(
+                ArmStatusInfo(
+                    arm_id=arm.id,
+                    ip=arm.ip,
+                    connected=connected,
+                    reachable=probe.reachable(arm.id) if probe is not None else "unknown",
+                    has_rail=twin.meta.rail[arm.id] if in_twin else arm.expect_rail == "yes",
+                    gripper=arm.gripper,
+                    gripper_force_capable=arm.gripper == "xarm_g2",
+                    error_code=monitor.error_code(arm.id) if monitor is not None else 0,
+                    joint_limits=self._joint_limits(twin, arm.id) if in_twin else [],
+                )
+            )
         return arms
 
     @staticmethod

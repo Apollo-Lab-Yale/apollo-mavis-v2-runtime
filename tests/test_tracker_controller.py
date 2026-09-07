@@ -122,8 +122,12 @@ def test_button_touch_and_axis_events_fold_into_state():
 def _pad(x: float = 0.0, y: float = 0.0, click: bool = True, trigger: bool = False):
     """Raw (unclassified) controller state with the pad at (x, y)."""
     return ControllerState(
-        trigger=1.0 if trigger else 0.0, trigger_pressed=trigger,
-        trackpad_touch=True, trackpad_click=click, trackpad_x=x, trackpad_y=y,
+        trigger=1.0 if trigger else 0.0,
+        trigger_pressed=trigger,
+        trackpad_touch=True,
+        trackpad_click=click,
+        trackpad_x=x,
+        trackpad_y=y,
     )
 
 
@@ -140,13 +144,21 @@ def _btn(prev=None, **fields) -> ControllerState:
 @pytest.mark.parametrize(
     ("x", "y", "expect"),
     [
-        (0.9, 0.0, "trackpad_right"), (-0.9, 0.0, "trackpad_left"),
-        (0.0, 0.9, "trackpad_up"), (0.0, -0.9, "trackpad_down"),
-        (0.6, 0.5, "trackpad_right"), (-0.6, 0.5, "trackpad_left"),  # x dominant
-        (0.5, 0.6, "trackpad_up"), (-0.5, -0.6, "trackpad_down"),  # y dominant
+        (0.9, 0.0, "trackpad_right"),
+        (-0.9, 0.0, "trackpad_left"),
+        (0.0, 0.9, "trackpad_up"),
+        (0.0, -0.9, "trackpad_down"),
+        (0.6, 0.5, "trackpad_right"),
+        (-0.6, 0.5, "trackpad_left"),  # x dominant
+        (0.5, 0.6, "trackpad_up"),
+        (-0.5, -0.6, "trackpad_down"),  # y dominant
         (0.5, -0.5, "trackpad_right"),  # tie: x wins
-        (0.31, 0.0, "trackpad_right"), (0.0, -0.31, "trackpad_down"),  # just outside
-        (0.3, 0.3, None), (0.2, -0.2, None), (0.0, 0.0, None), (-0.3, 0.0, None),  # inside
+        (0.31, 0.0, "trackpad_right"),
+        (0.0, -0.31, "trackpad_down"),  # just outside
+        (0.3, 0.3, None),
+        (0.2, -0.2, None),
+        (0.0, 0.0, None),
+        (-0.3, 0.0, None),  # inside
     ],
 )
 def test_classify_trackpad_dominant_axis_and_deadzone(x, y, expect):
@@ -159,7 +171,7 @@ def test_classify_trackpad_honours_custom_deadzone():
     assert classify_trackpad(0.0, 0.9, 1.0) is None  # deadzone 1.0: every click ignored
 
 
-def test_click_classified_once_at_press_edge_and_held_until_release():
+def test_click_classified_at_press_edge_and_held_until_release():
     s1 = _click(0.9, 0.0)  # press edge at the right
     assert s1.edge_seq == 1 and s1.edge_input == "trackpad_right"
     assert s1.trackpad_dir == "trackpad_right" and active_inputs(s1) == {"trackpad_right"}
@@ -175,8 +187,16 @@ def test_click_classified_once_at_press_edge_and_held_until_release():
     s6 = note_edges(s5, _pad(0.1, 0.1), DZ)  # press inside the deadzone: counted, unclassified
     assert s6.edge_seq == 3 and s6.edge_input is None and s6.trackpad_dir is None
     assert active_inputs(s6) == frozenset()
-    s7 = note_edges(s6, _pad(0.9, 0.0), DZ)  # slides out afterwards: still ignored
-    assert s7.edge_seq == 3 and s7.edge_input is None and active_inputs(s7) == frozenset()
+    # Slides out while still held: LATE CLASSIFICATION resolves it and appends
+    # its own edge, so the pad is not dead for the rest of the click (2026-09-07
+    # — the press-edge axes can be stale on a controller that has been idle).
+    s7 = note_edges(s6, _pad(0.9, 0.0), DZ)
+    assert s7.edge_seq == 4 and s7.edge_input == "trackpad_right"
+    assert s7.trackpad_dir == "trackpad_right" and active_inputs(s7) == {"trackpad_right"}
+    # It resolves ONCE: sliding on does not re-fire, so a discrete action bound
+    # to the pad executes exactly once per click.
+    s7b = note_edges(s7, _pad(0.0, 0.9), DZ)
+    assert s7b.edge_seq == 4 and s7b.trackpad_dir == "trackpad_right"
     # Trigger is independent of the pad and registers no edge; a raw (never
     # classified) click holds nothing.
     assert active_inputs(_pad(0.9, 0.0, trigger=True)) == {"trigger_click"}
@@ -186,8 +206,9 @@ def test_click_classified_once_at_press_edge_and_held_until_release():
     # A scripted state arriving with prev=None while already clicked counts as a press edge.
     assert note_edges(None, _pad(0.0, 0.9), DZ).edge_seq == 1
     # Unclicked states carry the previous accounting and never classify.
-    s8 = note_edges(s7, ControllerState(trigger_pressed=True), DZ)
-    assert s8.edge_seq == 3 and s8.edge_input is None
+    s8 = note_edges(s7b, ControllerState(trigger_pressed=True), DZ)
+    assert s8.edge_seq == 4 and s8.edge_input == "trackpad_right"
+    assert s8.trackpad_dir is None  # released: the classification is dropped
 
 
 def test_menu_and_grip_press_edges_advance_edge_seq_and_keep_trackpad_dir():
@@ -453,8 +474,12 @@ def test_on_button_event_reads_pysurvive_like_struct():
     reader, slot, clock = _reader()
     reader._publish(Pose(np.zeros(3), IDENT), np.zeros(3), np.zeros(3), 0.0)
     be = SimpleNamespace(
-        time=1.5, object=object(), event_type=EVENT_BUTTON_DOWN, button_id=BUTTON_TRIGGER,
-        axis_count=1, axis_ids=[AXIS_TRIGGER, 0, 0, 0, 0, 0, 0, 0],
+        time=1.5,
+        object=object(),
+        event_type=EVENT_BUTTON_DOWN,
+        button_id=BUTTON_TRIGGER,
+        axis_count=1,
+        axis_ids=[AXIS_TRIGGER, 0, 0, 0, 0, 0, 0, 0],
         axis_val=[1.0, 0, 0, 0, 0, 0, 0, 0],
     )
     reader._on_button_event(be)
@@ -462,7 +487,10 @@ def test_on_button_event_reads_pysurvive_like_struct():
     assert s.seq == 2 and s.controller.trigger_pressed and s.controller.trigger == 1.0
     assert s.controller.rx_mono == clock.t and s.held_codes == {CLUTCH_CODE}
     be2 = SimpleNamespace(
-        time=1.6, object=object(), event_type=EVENT_AXIS_CHANGED, button_id=255,
+        time=1.6,
+        object=object(),
+        event_type=EVENT_AXIS_CHANGED,
+        button_id=255,
         axis_count=99,  # bogus count is clamped to the 8-slot arrays
         axis_ids=[AXIS_TRACKPAD_X, AXIS_TRACKPAD_Y, 0, 0, 0, 0, 0, 0],
         axis_val=[0.25, -0.5, 0, 0, 0, 0, 0, 0],
@@ -473,8 +501,13 @@ def test_on_button_event_reads_pysurvive_like_struct():
     assert (c.trackpad_x, c.trackpad_y) == (0.25, -0.5) and c.trigger_pressed
     # Trackpad press: classified from the axes in force (y dominant, negative -> down).
     be3 = SimpleNamespace(
-        time=1.7, object=object(), event_type=EVENT_BUTTON_DOWN, button_id=BUTTON_TRACKPAD,
-        axis_count=0, axis_ids=[0] * 8, axis_val=[0.0] * 8,
+        time=1.7,
+        object=object(),
+        event_type=EVENT_BUTTON_DOWN,
+        button_id=BUTTON_TRACKPAD,
+        axis_count=0,
+        axis_ids=[0] * 8,
+        axis_val=[0.0] * 8,
     )
     reader._on_button_event(be3)
     s3 = slot.get()[0]
@@ -483,8 +516,13 @@ def test_on_button_event_reads_pysurvive_like_struct():
     assert s3.held_codes == {CLUTCH_CODE, GRIPPER_CLOSE_CODE}  # trigger still held; down = KeyF
     # Menu press: discrete switch_arm rides on the re-published sample.
     be4 = SimpleNamespace(
-        time=1.8, object=object(), event_type=EVENT_BUTTON_DOWN, button_id=BUTTON_MENU,
-        axis_count=0, axis_ids=[0] * 8, axis_val=[0.0] * 8,
+        time=1.8,
+        object=object(),
+        event_type=EVENT_BUTTON_DOWN,
+        button_id=BUTTON_MENU,
+        axis_count=0,
+        axis_ids=[0] * 8,
+        axis_val=[0.0] * 8,
     )
     reader._on_button_event(be4)
     s4 = slot.get()[0]
@@ -495,8 +533,13 @@ def test_on_button_event_reads_pysurvive_like_struct():
     # click_actions still carry the bound menu edge (lossless within a tick).
     clock.t += 0.003
     be5 = SimpleNamespace(
-        time=1.803, object=object(), event_type=EVENT_BUTTON_DOWN, button_id=BUTTON_GRIP,
-        axis_count=0, axis_ids=[0] * 8, axis_val=[0.0] * 8,
+        time=1.803,
+        object=object(),
+        event_type=EVENT_BUTTON_DOWN,
+        button_id=BUTTON_GRIP,
+        axis_count=0,
+        axis_ids=[0] * 8,
+        axis_val=[0.0] * 8,
     )
     reader._on_button_event(be5)
     s5 = slot.get()[0]
@@ -664,7 +707,9 @@ def _obj(name, kind=StubPS.SurviveSimpleObject_OBJECT, serial=None, pose=None):
 
 def _pose(obj, pos, t, rot=(1.0, 0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0)):
     return SimpleNamespace(
-        object=obj, time=t, pose=SimpleNamespace(Pos=list(pos), Rot=list(rot)),
+        object=obj,
+        time=t,
+        pose=SimpleNamespace(Pos=list(pos), Rot=list(rot)),
         velocity=SimpleNamespace(Pos=list(vel), AxisAngleRot=[0.0, 0.0, 0.0]),
     )
 
@@ -673,8 +718,13 @@ def _button(obj, et, bid, axes=()):
     ids = [a for a, _ in axes] + [0] * (8 - len(axes))
     vals = [v for _, v in axes] + [0.0] * (8 - len(axes))
     return SimpleNamespace(
-        time=0.0, object=obj, event_type=et, button_id=bid, axis_count=len(axes),
-        axis_ids=ids, axis_val=vals,
+        time=0.0,
+        object=obj,
+        event_type=et,
+        button_id=bid,
+        axis_count=len(axes),
+        axis_ids=ids,
+        axis_val=vals,
     )
 
 
@@ -693,18 +743,24 @@ def _spy_publish(reader):
 
 def test_libsurvive_event_loop_routes_pose_and_button_events_by_object():
     wm0, wm1, lh = _obj("WM0"), _obj("WM1"), _obj("LH0", StubPS.SurviveSimpleObject_LIGHTHOUSE)
-    ps = StubPS([
-        (1, _button(wm0, EVENT_BUTTON_DOWN, BUTTON_TRIGGER)),  # before any pose: state only
-        (3, _pose(lh, [9.0, 9.0, 9.0], 0.1)),  # lighthouse: ignored
-        (3, _pose(wm1, [5.0, 0.0, 0.0], 0.2)),  # other tracker: ignored
-        (3, _pose(wm0, [0.1, 0.0, 0.0], 0.3)),  # seq 1, carries trigger pressed
-        (1, _button(wm1, EVENT_BUTTON_DOWN, BUTTON_TRACKPAD, [(AXIS_TRACKPAD_Y, 1.0)])),  # ignored
-        (1, _button(wm0, EVENT_BUTTON_UP, BUTTON_TRIGGER)),  # edge: seq 2 re-publish
-        (1, _button(wm0, EVENT_AXIS_CHANGED, 255, [(AXIS_TRACKPAD_X, -0.9)])),  # no edge
-        NONE_EV,  # idle poll: nothing happens
-        (1, _button(wm0, EVENT_BUTTON_DOWN, BUTTON_TRACKPAD)),  # edge: left -> ArrowLeft, seq 3
-        (3, _pose(wm0, [0.11, 0.0, 0.0], 0.4)),  # seq 4 keeps ArrowLeft
-    ], objects=[lh, wm0, wm1])
+    ps = StubPS(
+        [
+            (1, _button(wm0, EVENT_BUTTON_DOWN, BUTTON_TRIGGER)),  # before any pose: state only
+            (3, _pose(lh, [9.0, 9.0, 9.0], 0.1)),  # lighthouse: ignored
+            (3, _pose(wm1, [5.0, 0.0, 0.0], 0.2)),  # other tracker: ignored
+            (3, _pose(wm0, [0.1, 0.0, 0.0], 0.3)),  # seq 1, carries trigger pressed
+            (
+                1,
+                _button(wm1, EVENT_BUTTON_DOWN, BUTTON_TRACKPAD, [(AXIS_TRACKPAD_Y, 1.0)]),
+            ),  # ignored
+            (1, _button(wm0, EVENT_BUTTON_UP, BUTTON_TRIGGER)),  # edge: seq 2 re-publish
+            (1, _button(wm0, EVENT_AXIS_CHANGED, 255, [(AXIS_TRACKPAD_X, -0.9)])),  # no edge
+            NONE_EV,  # idle poll: nothing happens
+            (1, _button(wm0, EVENT_BUTTON_DOWN, BUTTON_TRACKPAD)),  # edge: left -> ArrowLeft, seq 3
+            (3, _pose(wm0, [0.11, 0.0, 0.0], 0.4)),  # seq 4 keeps ArrowLeft
+        ],
+        objects=[lh, wm0, wm1],
+    )
     reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
     seen = _spy_publish(reader)
     reader._libsurvive_events(ps, object(), FAKE_CTYPES)
@@ -727,17 +783,28 @@ def test_libsurvive_loop_survives_bad_events(caplog):
     caplog.set_level(logging.WARNING, logger="apollo_mavis_v2_runtime.devices.tracker")
     wm0 = _obj("WM0")
     broken = SimpleNamespace(kind=StubPS.SurviveSimpleObject_OBJECT)  # no .name -> raises
-    ps = StubPS([
-        (3, _pose(wm0, [0.1, 0.0, 0.0], 0.1)),  # seq 1
-        (3, _pose(wm0, [float("nan"), 0.0, 0.0], 0.2)),  # NaN position: dropped
-        (3, _pose(wm0, [0.1, 0.0, 0.0], 0.3, rot=(0.5, 0.0, 0.0, 0.0))),  # non-unit: dropped
-        (3, _pose(wm0, [0.1, float("inf"), 0.0], 0.4)),  # inf: dropped
-        (3, _pose(broken, [0.1, 0.0, 0.0], 0.5)),  # handler raises: dropped
-        (1, _button(broken, EVENT_BUTTON_DOWN, BUTTON_TRIGGER)),  # handler raises: dropped
-        (3, _pose(wm0, [0.1, 0.0, 0.0], 0.6, rot=(0.0, 0.0, 0.0, 1.0),
-                  vel=(float("nan"), 0.0, 0.0))),  # seq 2: NaN velocity sanitised to 0
-        (3, _pose(wm0, [0.12, 0.0, 0.0], 0.7)),  # seq 3
-    ], objects=[wm0])
+    ps = StubPS(
+        [
+            (3, _pose(wm0, [0.1, 0.0, 0.0], 0.1)),  # seq 1
+            (3, _pose(wm0, [float("nan"), 0.0, 0.0], 0.2)),  # NaN position: dropped
+            (3, _pose(wm0, [0.1, 0.0, 0.0], 0.3, rot=(0.5, 0.0, 0.0, 0.0))),  # non-unit: dropped
+            (3, _pose(wm0, [0.1, float("inf"), 0.0], 0.4)),  # inf: dropped
+            (3, _pose(broken, [0.1, 0.0, 0.0], 0.5)),  # handler raises: dropped
+            (1, _button(broken, EVENT_BUTTON_DOWN, BUTTON_TRIGGER)),  # handler raises: dropped
+            (
+                3,
+                _pose(
+                    wm0,
+                    [0.1, 0.0, 0.0],
+                    0.6,
+                    rot=(0.0, 0.0, 0.0, 1.0),
+                    vel=(float("nan"), 0.0, 0.0),
+                ),
+            ),  # seq 2: NaN velocity sanitised to 0
+            (3, _pose(wm0, [0.12, 0.0, 0.0], 0.7)),  # seq 3
+        ],
+        objects=[wm0],
+    )
     reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
     seen = _spy_publish(reader)
     reader._libsurvive_events(ps, object(), FAKE_CTYPES)  # must return, never raise
@@ -775,8 +842,15 @@ def test_no_pose_status_error_vs_searching_by_object_enumeration():
     # Lighthouses only (count 2, but no OBJECT-type device): error with the how-to.
     st = _run_no_pose([lh0, lh1]).status()
     assert st.status == "error", st
-    for needle in ("no tracked device", "dongle busy", "LIBUSB_ERROR_BUSY", "udev",
-                   "tracker off", "unpaired", "01-sudo-udev-and-deps.sh"):
+    for needle in (
+        "no tracked device",
+        "dongle busy",
+        "LIBUSB_ERROR_BUSY",
+        "udev",
+        "tracker off",
+        "unpaired",
+        "01-sudo-udev-and-deps.sh",
+    ):
         assert needle in st.detail, (needle, st.detail)
     # The libusb line from the logger callback is appended.
     st = _run_no_pose([], log_line=b"libusb: LIBUSB_ERROR_BUSY claiming interface").status()
@@ -829,8 +903,12 @@ def test_libsurvive_warnings_are_rate_limited_per_message_class(caplog):
 
 # -- calibration hooks: lighthouse snapshot, INFO lines, restart -----------------------------------
 def test_libsurvive_loop_snapshots_lighthouse_objects_by_ps_constants():
-    lh0 = _obj("LH0", StubPS.SurviveSimpleObject_LIGHTHOUSE, serial="2684858188",
-               pose=([3.8, 1.2, 1.8], [0.5, 0.5, 0.5, 0.5]))
+    lh0 = _obj(
+        "LH0",
+        StubPS.SurviveSimpleObject_LIGHTHOUSE,
+        serial="2684858188",
+        pose=([3.8, 1.2, 1.8], [0.5, 0.5, 0.5, 0.5]),
+    )
     lh1 = _obj("LH1", StubPS.SurviveSimpleObject_LIGHTHOUSE)  # unsolved: zero quaternion
     wm0 = _obj("WM0", serial="LHR-FFFFFFFF", pose=([0.1, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]))
     reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
@@ -846,7 +924,8 @@ def test_libsurvive_loop_snapshots_lighthouse_objects_by_ps_constants():
     snap = reader.lighthouses()
     assert [type(s) for s in snap] == [LighthouseSnapshot, LighthouseSnapshot]
     assert [(s.index, s.name, s.serial) for s in snap] == [
-        (0, "LH0", "2684858188"), (1, "LH1", None)
+        (0, "LH0", "2684858188"),
+        (1, "LH1", None),
     ]
     assert snap[0].pose is not None and np.allclose(snap[0].pose.position, [3.8, 1.2, 1.8])
     assert np.allclose(snap[0].pose.orientation, [0.5, 0.5, 0.5, 0.5])
@@ -880,7 +959,9 @@ def test_info_lines_are_kept_ansi_free_and_handed_to_on_info(caplog):
     reader._on_survive_log(None, 2, b"\x1b[0;32mInfo: Global solve with 3 scenes for 1\x1b[0m")
     reader._on_survive_log(None, 1, b"Lighthouse 2 not seen")  # warning: not an INFO line
     reader._on_survive_log(
-        None, 3, "Using LH 2 (\x1b[0;31m596c9a8b\x1b[0m) as reference lighthouse"  # str, level 3
+        None,
+        3,
+        "Using LH 2 (\x1b[0;31m596c9a8b\x1b[0m) as reference lighthouse",  # str, level 3
     )
     assert list(reader.info_lines) == [
         (clock.t, "Info: Global solve with 3 scenes for 1"),
@@ -993,17 +1074,44 @@ def test_restart_swaps_libsurvive_args_after_a_clean_close(monkeypatch):
         deadline = time.monotonic() + 3.0
         while stub.inits < 1 and time.monotonic() < deadline:
             time.sleep(0.005)
-        assert stub.argvs == [["apollo-mavis-v2-runtime", "--lighthousecount", "3"]]
+        # normal startup appends --configfile <libsurvive_config_path> (13-tracker-teleop:
+        # the reader must load the calibration the wizard wrote, not libsurvive's default)
+        assert stub.argvs == [
+            [
+                "apollo-mavis-v2-runtime",
+                "--lighthousecount",
+                "3",
+                "--configfile",
+                str(cfg.libsurvive_config_path),
+            ]
+        ]
         assert reader.status().status == "searching"
-        reader.restart(["--lighthousecount", "3", "--configfile", "/tmp/bs.json",
-                        "--force-calibrate", "1", "--globalscenesolver", "1"])
+        reader.restart(
+            [
+                "--lighthousecount",
+                "3",
+                "--configfile",
+                "/tmp/bs.json",
+                "--force-calibrate",
+                "1",
+                "--globalscenesolver",
+                "1",
+            ]
+        )
         deadline = time.monotonic() + 3.0
         while stub.inits < 2 and time.monotonic() < deadline:
             time.sleep(0.005)
         assert stub.closes == 1 and stub.inits == 2  # closed BEFORE the new init (dongle owner)
         assert stub.argvs[1] == [
-            "apollo-mavis-v2-runtime", "--lighthousecount", "3", "--configfile", "/tmp/bs.json",
-            "--force-calibrate", "1", "--globalscenesolver", "1",
+            "apollo-mavis-v2-runtime",
+            "--lighthousecount",
+            "3",
+            "--configfile",
+            "/tmp/bs.json",
+            "--force-calibrate",
+            "1",
+            "--globalscenesolver",
+            "1",
         ]
         assert cfg.libsurvive_args == ["--lighthousecount", "3"]  # shared config untouched
         assert reader.cfg is not cfg and reader.restarts == 0  # operator restarts are not failures
@@ -1069,3 +1177,78 @@ def test_restart_refuses_while_the_old_libsurvive_close_is_pending(monkeypatch):
         stub.release.set()
         reader.stop()
     assert reader._thread is None and stub.closes == stub.inits == 2
+
+
+# -- controller link fields (2026-09-07): the button path's own liveness -------------------------
+def test_controller_age_is_independent_of_the_pose_age():
+    """The 2026-09-06 failure: poses keep flowing while libsurvive stops
+    delivering button events, so the frozen ``controller`` state still looks
+    plausible. ``controller_age_s`` is the only field that shows it."""
+    wm0 = _obj("WM0")
+    reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
+    # No controller state at all -> no age (not "0 s ago").
+    assert reader.status().controller_age_s is None
+
+    ps = StubPS(
+        [
+            (1, _button(wm0, EVENT_BUTTON_DOWN, BUTTON_TRIGGER, axes=[(AXIS_TRIGGER, 1.0)])),
+            (3, _pose(wm0, [0.1, 0.0, 0.0], 0.1)),
+        ],
+        objects=[wm0],
+    )
+    reader._libsurvive_events(ps, object(), FAKE_CTYPES)
+    st = reader.status()
+    assert st.controller is not None and st.controller.trigger_pressed is True
+    assert st.controller_age_s == 0.0 and st.age_s == 0.0  # both fresh
+
+    # 60 s of poses with NO further input event: the pose age stays tiny while
+    # the controller age grows, and the frozen state keeps reading "pressed".
+    for i in range(3):
+        clock.t += 20.0
+        reader._publish(Pose(np.array([0.1, 0.0, 0.0]), IDENT), [0, 0, 0], [0, 0, 0], 1.0 + i)
+    st = reader.status()
+    assert st.age_s == 0.0 and st.controller_age_s == 60.0
+    assert st.controller is not None and st.controller.trigger_pressed is True
+
+
+def test_objects_snapshot_is_the_pairing_evidence():
+    lh = _obj("LH0", StubPS.SurviveSimpleObject_LIGHTHOUSE)
+    wm0 = _obj("WM0")
+    reader, slot, clock = _reader(TrackerConfig(backend="libsurvive"))
+    assert reader.status().objects == ()  # nothing enumerated yet
+
+    ps = StubPS([NONE_EV], objects=[lh, wm0])  # lighthouses are NOT pairing evidence
+    reader._libsurvive_events(ps, object(), FAKE_CTYPES)
+    assert reader.status().objects == ("WM0",)
+
+    # An empty enumeration (nothing paired / interface not openable) is reported
+    # as empty, not as the previous snapshot, once the loop is gone.
+    ps = StubPS([NONE_EV], objects=[])
+    reader._stop.clear()
+    reader._libsurvive_events(ps, object(), FAKE_CTYPES)
+    assert reader.status().objects == ()
+
+
+def test_dongle_presence_reads_sysfs_and_degrades_to_none(tmp_path, monkeypatch):
+    usb = tmp_path / "usb"
+    (usb / "9-2").mkdir(parents=True)
+    (usb / "9-2" / "idVendor").write_text("1234\n")
+    (usb / "9-2" / "idProduct").write_text("5678\n")
+    assert tracker_mod.dongle_present(str(usb)) is False
+    # The receiver plugged in, plus the interface node that carries no idVendor.
+    (usb / "9-3").mkdir()
+    (usb / "9-3" / "idVendor").write_text("28DE\n")  # case-insensitive
+    (usb / "9-3" / "idProduct").write_text("2101\n")
+    (usb / "9-3:1.0").mkdir()
+    assert tracker_mod.dongle_present(str(usb)) is True
+    assert tracker_mod.dongle_present(str(tmp_path / "gone")) is None  # no sysfs
+
+    # status() caches the answer for DONGLE_POLL_S and never raises.
+    reader, slot, clock = _reader(TrackerConfig(backend="none"))
+    calls = []
+    monkeypatch.setattr(tracker_mod, "dongle_present", lambda: (calls.append(1), True)[1])
+    assert reader.status().dongle_present is True
+    assert reader.status().dongle_present is True and len(calls) == 1  # cached
+    clock.t += tracker_mod.DONGLE_POLL_S + 0.1
+    monkeypatch.setattr(tracker_mod, "dongle_present", lambda: 1 / 0)
+    assert reader.status().dongle_present is True  # a raising probe keeps the last value

@@ -71,3 +71,35 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
 def test_shipped_configs_load(name):
     cfg = load_runtime_config(CONFIGS / name)
     assert cfg.port == 8765
+
+
+def test_shipped_paths_are_self_contained_under_the_workspace():
+    """The tracked config anchors every path at ${APOLLO_HOME}/var (04-runtime §14.1):
+    no ~/apollo, no absolute machine path. ${APOLLO_HOME} is inferred from the config
+    file's own workspace (CONFIGS is inside apollo-mavis-v2-runtime)."""
+    # comments may mention ~/apollo (the thing we moved away from); check values only
+    values = "\n".join(line.split("#", 1)[0] for line in
+                       (CONFIGS / "mavis_v2.yaml").read_text().splitlines())
+    assert "~/apollo" not in values and "/home/" not in values
+    cfg = load_runtime_config(CONFIGS / "mavis_v2.yaml")
+    ws = CONFIGS.resolve().parents[1]  # <ws>/apollo-mavis-v2-runtime/configs -> <ws>
+    for p in (cfg.profiles_dir, cfg.datasets_root, cfg.checkpoints_root,
+              cfg.calibration_dir, cfg.tracker.libsurvive_config_path):
+        assert p.is_absolute() and str(p).startswith(str(ws / "var"))
+
+
+def test_apollo_home_expansion_and_anchoring(tmp_path, monkeypatch):
+    """${APOLLO_HOME} / bare-relative resolve against $APOLLO_HOME; ~ and absolute pass through."""
+    monkeypatch.setenv("APOLLO_HOME", str(tmp_path))
+    cfg_file = tmp_path / "c.yaml"
+    cfg_file.write_text(
+        "profiles_dir: ${APOLLO_HOME}/var/profiles\n"
+        "datasets_root: relative/datasets\n"
+        "checkpoints_root: /absolute/ckpts\n"
+        "calibration_dir: ~/cal\n"
+    )
+    cfg = load_runtime_config(cfg_file)
+    assert cfg.profiles_dir == tmp_path / "var" / "profiles"   # ${APOLLO_HOME} expanded
+    assert cfg.datasets_root == tmp_path / "relative" / "datasets"  # bare relative anchored
+    assert cfg.checkpoints_root == Path("/absolute/ckpts")     # absolute untouched
+    assert cfg.calibration_dir == Path("~/cal").expanduser()   # ~ still works

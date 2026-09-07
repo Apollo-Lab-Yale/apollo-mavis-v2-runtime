@@ -203,8 +203,9 @@ class RailEvent:
 class FakeServoLimits:
     """Duck-typed hardware ``ServoLimits`` (same field names) with the EFFECTIVE,
     i.e. already speed-scaled, caps a connected ``XArmDriver.cfg.servo`` carries.
-    Defaults = the hardware package's caps at scale 0.1 (0.03 rad/s per joint,
-    0.2 mm per 10 ms tick over the conservative lever arms)."""
+    Defaults = the hardware package's ORIGINAL first-run caps at scale 0.1 (0.03
+    rad/s per joint, 0.2 mm per 10 ms tick over the conservative lever arms; the
+    real defaults doubled on 2026-09-07 - these stay put, the tests pin them)."""
 
     rate_hz: float = 100.0
     max_joint_vel: tuple[float, ...] = (0.03,) * 7

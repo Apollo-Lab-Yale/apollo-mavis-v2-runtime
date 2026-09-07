@@ -107,6 +107,12 @@ class TrackerTeleop:
             filter_config_from_settings(filter_cfg or PoseFilterConfig(), self._applied)
         )
         self._pose_filtered: Pose | None = None  # newest filtered aligned pose (telemetry)
+        # Slip accounting for the loop's health line (2026-09-07): every slip is
+        # hand travel the arm did NOT perform (leash truncation or an IK residual
+        # freeze) folded into the anchor for good, so a rising total while the
+        # operator moves is the "it does not follow my hand" symptom in numbers.
+        self.slip_count = 0
+        self.slip_pos_total_m = 0.0
 
     @property
     def applied_settings(self) -> TrackerSettingsValues:
@@ -231,8 +237,11 @@ class TrackerTeleop:
             return
         dpos = achieved.position - intended.position
         dq_b = se3.quat_mul(se3.quat_conj(intended.orientation), achieved.orientation)
-        if float(np.linalg.norm(dpos)) < _EPS and abs(abs(dq_b[0]) - 1.0) < _EPS:
+        dpos_norm = float(np.linalg.norm(dpos))
+        if dpos_norm < _EPS and abs(abs(dq_b[0]) - 1.0) < _EPS:
             return
+        self.slip_count += 1
+        self.slip_pos_total_m += dpos_norm
         self._a_ee = Pose(self._a_ee.position + dpos, se3.quat_mul(self._a_ee.orientation, dq_b))
         if self._intent is not None:  # the still-hand raw target shifts with A_ee
             self._intent = Pose(

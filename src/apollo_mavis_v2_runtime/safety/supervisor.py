@@ -21,6 +21,7 @@ from .watchdog import ArmReportWatchdog, InputWatchdog
 logger = logging.getLogger(__name__)
 
 CLEARANCE_EVERY_N_TICKS = 4  # 25 Hz sweep on the measured config (§7.2)
+CLEARANCE_SWEEP_M = 0.10  # default sweep range, m (SafetyConfig.clearance_sweep_m)
 
 
 class SafetySupervisor:
@@ -33,12 +34,17 @@ class SafetySupervisor:
         twin=None,
         report_watchdog: ArmReportWatchdog | None = None,
         warn_clearance_m: float = 0.025,
+        clearance_sweep_m: float = CLEARANCE_SWEEP_M,
     ) -> None:
         self.gate = gate
         self.watchdog = watchdog
         self.twin = twin  # None in plain sim mode (NullGate)
         self.report_watchdog = report_watchdog or ArmReportWatchdog()
         self.warn_clearance_m = float(warn_clearance_m)
+        # Sweep range (SafetyConfig.clearance_sweep_m): pairs farther apart than this
+        # are not in ``clearances``. The Cockpit's proximity frame (05-ui §8.2) fades
+        # in from this distance, so it must exceed the UI's 0.05 m "close" grade.
+        self.clearance_sweep_m = float(clearance_sweep_m)
         self._tick = 0
         self._stale = False
         self._clearances: list[tuple[tuple[str, str], float]] = []
@@ -55,7 +61,7 @@ class SafetySupervisor:
         try:
             self.twin.sync(states)
             if self._tick % CLEARANCE_EVERY_N_TICKS == 0:
-                sweep = self.twin.clearance(distmax=0.05)
+                sweep = self.twin.clearance(distmax=self.clearance_sweep_m)
                 self._clearances = [(pc.body_pair, pc.dist_m) for pc in sweep[:5]]
         except Exception:
             logger.exception("twin sync/clearance failed; failing closed")
@@ -109,4 +115,4 @@ class SafetySupervisor:
         return report
 
 
-__all__ = ["CLEARANCE_EVERY_N_TICKS", "SafetySupervisor"]
+__all__ = ["CLEARANCE_EVERY_N_TICKS", "CLEARANCE_SWEEP_M", "SafetySupervisor"]

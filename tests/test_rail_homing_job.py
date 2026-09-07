@@ -643,7 +643,10 @@ def test_confirm_after_the_arm_moved_refuses_a_changed_plan(
         return plan.model_copy(update={"waypoints": plan.waypoints + 1}), wps
 
     monkeypatch.setattr(planner, "evaluate", different_plan)
-    moved = (PI, 0.8, 0.0, 0.5, 0.0, 0.3, 0.05)  # 0.05 rad on joint 7 > START_POSTURE_TOL_RAD
+    # 0.05 rad on joint 5 > START_POSTURE_TOL_RAD, and still blocked-but-plannable on the
+    # measured mavis_v2 (2026-09-06): the same nudge on joint 7 now puts the finger 6.8 mm
+    # from the table and the straight path to the keyframe fails the position-agnostic check
+    moved = (PI, 0.8, 0.0, 0.5, 0.05, 0.3, 0.0)
     grip.sample = replace(original, q=moved, seq=original.seq + 1)
     try:
         r = client.post(URL.format("grip"), json={"op": "home_rail"})

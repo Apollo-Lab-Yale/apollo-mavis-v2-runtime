@@ -111,10 +111,13 @@ workcells:
         intrinsics: {fx: 606.36, fy: 606.38, cx: 311.90, cy: 249.45}
     safety:
       enabled: true               # hardware refuses to start without the safety gate
-profiles_dir: ~/apollo/profiles
-datasets_root: ~/apollo/datasets
-checkpoints_root: ~/apollo/checkpoints
-calibration_dir: ~/apollo/calibration   # tracker_calibration.json (applied yaw, base-station install) + libsurvive config copies (phase-10 wizard)
+# Data + calibration live inside the workspace (${APOLLO_HOME} = ws root, resolved by
+# config.py: $APOLLO_HOME if the launcher/systemd export it, else inferred from this
+# file's location). A fresh clone runs with everything under <ws>/var and no ~/apollo.
+profiles_dir: ${APOLLO_HOME}/var/profiles
+datasets_root: ${APOLLO_HOME}/var/datasets
+checkpoints_root: ${APOLLO_HOME}/var/checkpoints
+calibration_dir: ${APOLLO_HOME}/var/calibration   # tracker_calibration.json (applied yaw, base-station install) + libsurvive config copies (phase-10 wizard)
 control:
   rate_hz: 100
   teleop: {linear_mps: 0.12, angular_rps: 0.6, rail_mps: 0.10, gripper_frac_ps: 1.2}
@@ -123,9 +126,22 @@ control:
   dq_max_rad: 0.04
   jog: {slew_rad_per_tick: 0.02, rail_m_per_tick: 0.002, goto_threshold_rad: 0.15}
   watchdog: {stale_s: 0.2, ramp_s: 0.1}
+  health_log_every_s: 1.0   # control-loop INFO health line period (tick rate, clutch, tracker ages, gate, IK slips, servo stats); 0 = off
 telemetry_hz: 25
 video: {preview_fps: 15, session_fps: 30, jpeg_quality: 80}
 egl_device_id: 0
+# Process log (2026-09-07): a rotating file the runtime writes itself, next to the rest of
+# the machine state under ${APOLLO_HOME}/var (gitignored); stderr keeps the same lines for
+# journald / the dev launcher's raw capture (var/logs/runtime.stderr.log, which is ALSO where
+# libsurvive's C-side prints land - they never pass through Python logging). level DEBUG adds
+# per-event IK slips and driver events; access_log re-enables uvicorn's per-request lines.
+logging:
+  level: INFO                      # DEBUG | INFO | WARNING | ERROR (both handlers)
+  dir: ${APOLLO_HOME}/var/logs     # null = stderr only
+  file: runtime.log
+  max_bytes: 20971520              # 20 MB per file ...
+  backup_count: 10                 # ... x 10 kept (runtime.log.1 .. .10)
+  access_log: false
 # Perception Arm (`view`) microphone preview (phase-11; 04-runtime §13.3/§14). Captured THROUGH
 # PulseAudio only (the daemon owns the RØDE NT-USB Mini; a direct hw: open fails
 # with EBUSY and stalls every other Pulse client). backend: auto = sounddevice
@@ -185,6 +201,15 @@ twin_overlay:
   # rail_flip moved to hardware_session.rail_flip (phase-09c; the old key is still
   # accepted as an alias for one release and unified with the new one).
   rail_fallback_m: {grip: 0.65, view: 0.0}  # assumed rail position while the track is not homed (see the hardware workcell header); also the home_rail sweep's / frozen arm's assumption
+  # Per-camera OVERLAY-ONLY principal-point nudge {camera_id: [du, dv]} (cx += du, cy += dv);
+  # aligns a wrist camera whose real mount differs slightly from the shared xarm7_on_rail.xml
+  # `wrist_cam` pose (solved on the Manipulation Arm) WITHOUT touching the true factory
+  # intrinsics above (those get baked into recordings). Measured 2026-09-06 (03-sim §4.3 "per-arm
+  # wrist camera overlay offset"): the Perception Arm's overlay was a uniform ~2 cm (21 px x,
+  # 13 px y) image shift across all links at all depths -> a fixed view-camera mount offset, not
+  # parallax; the Manipulation Arm needed 0. A principal-point offset cancels a uniform, pose-
+  # independent shift exactly (residual < 1 px after the fix).
+  principal_offset_px: {view_wrist: [21.0, 13.0]}
   stream_suffix: _align
 # Real-cell sessions (phase-09c/09d; 04-runtime §5/§14). default_speed_scale is what
 # the Hardware tab pre-selects (first live runs at 10 %; SessionSpec.speed_scale
@@ -218,7 +243,7 @@ tracker:
   backend: fake
   object_name: WM0                            # dongle-paired tracker codename
   libsurvive_args: ["--lighthousecount", "4", "--globalscenesolver", "0", "--disable-calibrate", "1"]  # freeze the lighthouse calibration during teleop (2026-09-03: the online scene solver moved a station 32 cm mid-session)
-  libsurvive_config_path: ~/.config/libsurvive/config.json  # replaced ONLY by the base-station wizard's install step (backup .bak-<ts> next to it)
+  libsurvive_config_path: ${APOLLO_HOME}/var/libsurvive/config.json  # libsurvive reads/writes this at teleop (tracker.py passes --configfile); replaced ONLY by the base-station wizard's install step (backup .bak-<ts> next to it)
   yaw_deg: 0.0                                # lighthouse -> MJCF world yaw; first-start default only: a yaw applied by the wizard (calibration_dir/tracker_calibration.json, yaw_valid) overrides it
   pos_scale: 1.0                              # tracker -> EE displacement gain (0.1-3)
   follow_rotation: true                       # apply tracker orientation deltas
@@ -242,14 +267,23 @@ tracker:
   # accept any input except trigger_click (held-only). The system button is not
   # bindable (menu+system = dongle pairing combo). The `fake` backend has no
   # buttons; unit/e2e tests script a controller state.
+  # 2026-09-07: the GRIPPER moved OFF the trackpad onto the two plain buttons.
+  # The wand has exactly six bindable inputs once the trigger is the clutch (four
+  # trackpad directions + menu + grip), so four actions must live on the pad; a
+  # trackpad click is only usable once its direction is classified from the pad
+  # position at the press edge, which makes it the least reliable input. The
+  # operator reported the gripper needing "a trigger press first" before it
+  # responded, so the two actions that must never miss are now plain buttons and
+  # arm switching (which the keyboard and the UI also offer) took their place on
+  # the pad. Swap them back here if the pad turns out to be reliable.
   controller_map:
     clutch: trigger_click                     # trigger button (id 0) pressed (held)
-    gripper_open: trackpad_up                 # trackpad click, y dominant and positive (held, rate)
-    gripper_close: trackpad_down              # trackpad click, y dominant and negative (held, rate)
+    gripper_close: grip_click                 # side grip button (id 7) held -> closes (held, rate)
+    gripper_open: menu_click                  # menu button (id 6) held -> opens (held, rate)
     rail_neg: trackpad_left                   # trackpad click, x dominant and negative (held)
     rail_pos: trackpad_right                  # trackpad click, x dominant and positive (held)
-    arm_next: menu_click                      # menu button (id 6) press edge (discrete)
-    arm_prev: none                            # keyboard KeyZ / gamepad LB only
+    arm_next: trackpad_up                     # trackpad click, y dominant and positive (discrete)
+    arm_prev: trackpad_down                   # trackpad click, y dominant and negative (discrete)
   trackpad_deadzone: 0.3                      # |x| and |y| both within this -> click ignored
   # One Euro pose filter on the aligned tracker pose, run in the provider at the
   # 100 Hz tick before the anchor/delta math (13-tracker §4 "Pose filter"):

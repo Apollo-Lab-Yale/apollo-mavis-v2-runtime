@@ -15,8 +15,7 @@ def submit(bus, op, **args):
 
 def test_jog_slew_limited(fake_loop):
     cell, bus, loop = fake_loop
-    fut = submit(bus, "joint_target", arm_id="arm0",
-                 positions=[0.1] * 7 + [0.05], mode="jog")
+    fut = submit(bus, "joint_target", arm_id="arm0", positions=[0.1] * 7 + [0.05], mode="jog")
     t = run_ticks(loop, cell, 1)
     assert fut.result(0).ok
     # After one tick: exactly one slew step (0.02 rad joints, 0.002 m rail).
@@ -30,8 +29,7 @@ def test_jog_slew_limited(fake_loop):
 
 def test_jog_above_goto_threshold_nacked(fake_loop):
     cell, bus, loop = fake_loop
-    fut = submit(bus, "joint_target", arm_id="arm0",
-                 positions=[0.2] * 7 + [0.0], mode="jog")
+    fut = submit(bus, "joint_target", arm_id="arm0", positions=[0.2] * 7 + [0.0], mode="jog")
     run_ticks(loop, cell, 1)
     res = fut.result(0)
     assert not res.ok and "goto" in res.detail
@@ -40,8 +38,7 @@ def test_jog_above_goto_threshold_nacked(fake_loop):
 def test_jog_nacked_while_recording(fake_loop):
     cell, bus, loop = fake_loop
     loop.episode_state = "recording"
-    fut = submit(bus, "joint_target", arm_id="arm0",
-                 positions=[0.05] * 7 + [0.0], mode="jog")
+    fut = submit(bus, "joint_target", arm_id="arm0", positions=[0.05] * 7 + [0.0], mode="jog")
     run_ticks(loop, cell, 1)
     res = fut.result(0)
     assert not res.ok and res.detail == "recording"
@@ -153,8 +150,12 @@ def test_gripper_keys_and_targets_skip_gripperless_arm():
     cell.start()
     bus = RuntimeBus()
     loop = ControlLoop(
-        cell, ControlConfig(), bus, SafetySupervisor(NullGate(), InputWatchdog()),
-        ["arm0", "arm1"], gripper_arms=["arm1"],
+        cell,
+        ControlConfig(),
+        bus,
+        SafetySupervisor(NullGate(), InputWatchdog()),
+        ["arm0", "arm1"],
+        gripper_arms=["arm1"],
     )
     senders = {a: _Sender() for a in ("arm0", "arm1")}
     loop._senders.update(senders)  # what start() wires, minus the threads
@@ -206,8 +207,13 @@ def _loop_over(tmp_path, arm_ids: list[str]):
     cell.start()
     bus = RuntimeBus()
     loop = ControlLoop(
-        cell, ControlConfig(), bus, SafetySupervisor(NullGate(), InputWatchdog()),
-        list(arm_ids), profile_store=ProfileStore(tmp_path / "profiles"), workcell_kind="sim",
+        cell,
+        ControlConfig(),
+        bus,
+        SafetySupervisor(NullGate(), InputWatchdog()),
+        list(arm_ids),
+        profile_store=ProfileStore(tmp_path / "profiles"),
+        workcell_kind="sim",
     )
     return cell, bus, loop
 
@@ -246,3 +252,63 @@ def test_session_with_view_then_grip_starts_on_grip(tmp_path):
 def test_session_without_grip_starts_on_first_arm(tmp_path):
     _, _, loop = _loop_over(tmp_path, ["view", "aux"])
     assert loop.active_arm == "view"
+
+
+def test_health_line_once_per_period_with_window_deltas(fake_loop, caplog):
+    """2026-09-07 (04-runtime §14 "Logging"): one INFO `loop:` line per
+    control.health_log_every_s, carrying window deltas (ticks, overruns, IK
+    slips) plus the gate verdict and the command-vs-measured lag; nothing at all
+    with the period at 0."""
+    import logging
+
+    cell, bus, loop = fake_loop
+    loop.cfg = loop.cfg.model_copy(update={"health_log_every_s": 0.5})
+    caplog.set_level(logging.INFO, logger="apollo_mavis_v2_runtime.control.loop")
+    t = run_ticks(loop, cell, 49)  # first tick at 0.01 s arms the period: due at 0.51 s
+    assert not [r for r in caplog.records if r.getMessage().startswith("loop:")]
+    t = run_ticks(loop, cell, 2, t)  # 0.51 s
+    lines = [r for r in caplog.records if r.getMessage().startswith("loop:")]
+    assert len(lines) == 1 and lines[0].levelno == logging.INFO
+    msg = lines[0].getMessage()
+    assert msg.startswith("loop: 50 ticks/0.5s (100 Hz") and "+0 overruns" in msg
+    assert "active=arm0" in msg and "src=teleop" in msg and "held=[]" in msg
+    assert "gate=ok" in msg and "ik_slips=+0" in msg and "ik_diverged=+0" in msg
+    assert "cmd-meas={arm0:" in msg and "arm1:" in msg
+    assert "servo=" not in msg and "tracker=" not in msg  # sim, no tracker: omitted
+    # Steady state: exactly one more line per period, counters as window deltas.
+    loop.ik_slips += 3
+    t = run_ticks(loop, cell, 50, t)  # 1.01 s
+    lines = [r for r in caplog.records if r.getMessage().startswith("loop:")]
+    assert len(lines) == 2 and "ik_slips=+3" in lines[1].getMessage()
+    t = run_ticks(loop, cell, 50, t)  # 1.51 s: the delta resets
+    lines = [r for r in caplog.records if r.getMessage().startswith("loop:")]
+    assert len(lines) == 3 and "ik_slips=+0" in lines[2].getMessage()
+    # Period 0 disables it.
+    caplog.clear()
+    loop.cfg = loop.cfg.model_copy(update={"health_log_every_s": 0.0})
+    run_ticks(loop, cell, 200, t + 0.5)
+    assert not [r for r in caplog.records if r.getMessage().startswith("loop:")]
+
+
+def test_watchdog_latch_and_clear_are_logged_once_per_edge(fake_loop, caplog):
+    import logging
+
+    cell, bus, loop = fake_loop
+    caplog.set_level(logging.INFO, logger="apollo_mavis_v2_runtime.control.loop")
+    t = run_ticks(loop, cell, 2)
+    bus.held_keys.put(HeldState(held=frozenset({"KeyW"}), seq=1, rx_mono=t))
+    loop.supervisor.watchdog.on_keys(HeldState(frozenset({"KeyW"}), 1, t))
+    t = run_ticks(loop, cell, 2, t)
+    # Silence from the browser: the WS watchdog latches after stale_s (0.2 s).
+    t = run_ticks(loop, cell, 40, t)
+    latched = [r for r in caplog.records if "watchdog LATCHED" in r.getMessage()]
+    assert len(latched) == 1 and latched[0].levelno == logging.WARNING
+    assert "KeyW" in latched[0].getMessage()
+    t = run_ticks(loop, cell, 40, t)  # stays latched: no repeat
+    assert len([r for r in caplog.records if "watchdog LATCHED" in r.getMessage()]) == 1
+    # Every key released -> cleared, once.
+    bus.held_keys.put(HeldState(held=frozenset(), seq=2, rx_mono=t))
+    loop.supervisor.watchdog.on_keys(HeldState(frozenset(), 2, t))
+    run_ticks(loop, cell, 5, t)
+    cleared = [r for r in caplog.records if "watchdog cleared" in r.getMessage()]
+    assert len(cleared) == 1

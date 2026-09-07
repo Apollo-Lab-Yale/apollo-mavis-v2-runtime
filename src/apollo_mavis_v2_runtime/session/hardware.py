@@ -427,6 +427,11 @@ class ExecutorCaps:
     cart_step_m: float | None  # sum|dq_j| * lever_j bound per loop tick (None = unbounded)
     lever_arm_m: tuple[float, ...] | None  # conservative lever per joint (7)
     source: str = "host"  # "servo" when derived from a driver's ServoLimits
+    # The streamer's own per-joint step per loop tick (max_joint_vel / rate_hz), NOT
+    # bounded by the host jog slew like ``slew_rad_per_tick`` is - the teleop caps
+    # (``apply_teleop_caps``) must follow the servo bound alone, never the jog's.
+    # None = no driver published one (host-only caps: teleop is left untouched).
+    joint_step_rad: float | None = None
 
 
 def servo_executor_caps(
@@ -452,6 +457,7 @@ def servo_executor_caps(
         cart_step_m=cart,
         lever_arm_m=tuple(float(v) for v in servo.lever_arm_m)[:7],
         source="servo",
+        joint_step_rad=vel,
     )
 
 
@@ -487,7 +493,79 @@ def executor_caps_for(
     tight = min(found, key=lambda c: c.slew_rad_per_tick)
     cart = min(c.cart_step_m for c in found if c.cart_step_m is not None)
     lever = max((c.lever_arm_m for c in found if c.lever_arm_m is not None), key=lambda lv: sum(lv))
-    return ExecutorCaps(tight.slew_rad_per_tick, cart, lever, source="servo")
+    joint = min(c.joint_step_rad for c in found if c.joint_step_rad is not None)
+    return ExecutorCaps(tight.slew_rad_per_tick, cart, lever, source="servo", joint_step_rad=joint)
+
+
+def teleop_rate_caps(cfg: ControlConfig, caps: ExecutorCaps) -> tuple[float | None, float | None]:
+    """``(tcp_mps, joint_radps)`` the servo streamer can actually execute, from
+    per-loop-tick :class:`ExecutorCaps` and the loop rate. Either is ``None``
+    when the driver published no such bound (host-only caps: both ``None``).
+    The joint rate comes from ``joint_step_rad`` (the streamer's own bound),
+    not from ``slew_rad_per_tick``, which the PlanExecutor also bounds by the
+    host JOG slew - a jog cap must not leak into teleop."""
+    hz = float(cfg.rate_hz)
+    tcp = None if caps.cart_step_m is None else float(caps.cart_step_m) * hz
+    joint = None if caps.joint_step_rad is None else float(caps.joint_step_rad) * hz
+    return tcp, joint
+
+
+def apply_teleop_caps(cfg: ControlConfig, caps: ExecutorCaps) -> ControlConfig:
+    """``cfg`` with the TELEOP command chain bounded by what the connected
+    driver's servo streamer can execute (2026-09-07).
+
+    WHY. The clutched tracker target is rate-limited to ``target_rate`` (1.0 m/s
+    / 2.0 rad/s in the lab config) and then leash-clamped to ``leash.pos_m``
+    (0.025 m) around the MEASURED TCP, while the streamer executes at most
+    ``max_cart_step_m`` per streamer tick - 0.002 m, i.e. 0.2 m/s at
+    ``speed_scale`` 1.0 and 0.02 m/s at the 0.1 default. Hand motion faster than
+    that ran the target into the leash and
+    :meth:`~apollo_mavis_v2_runtime.control.tracker_teleop.TrackerTeleop.slip`
+    folded the truncation into the engagement anchor, so the excess hand travel
+    was silently DISCARDED; the part that did get through kept arriving for up
+    to one leash (0.125 s at scale 1.0, 1.25 s at 0.1) after the hand stopped.
+    Those are exactly the two symptoms the operator reported after the
+    2026-09-06 session: moving the controller down barely moved the end
+    effector, and the arm kept going after the trigger was released.
+
+    Capping the host chain at the streamer's own rate makes the mapping
+    FAITHFUL instead of clipped: slower than the hand, but never truncated, so
+    the commanded direction is the hand's direction and releasing the clutch
+    stops the arm within one streamer tick. The arm's top speed is unchanged -
+    it always was the streamer's - so no safety bound is relaxed here. Raising
+    the FEEL means raising ``ServoLimits`` / ``speed_scale``, deliberately.
+
+    Capped: ``target_rate.v_mps`` / ``.w_radps`` (tracker chain),
+    ``teleop.linear_mps`` / ``.angular_rps`` (keyboard chain) and
+    ``dq_max_rad`` (the loop's per-tick joint clamp). ``teleop.rail_mps`` is a
+    separate track axis with its own controller-side speed and is left alone.
+    """
+    tcp_mps, joint_radps = teleop_rate_caps(cfg, caps)
+    if tcp_mps is None and joint_radps is None:
+        return cfg  # host-only caps (no driver bound published): nothing to cap against
+
+    def cap(value: float, bound: float | None) -> float:
+        return float(value) if bound is None else min(float(value), float(bound))
+
+    teleop = cfg.teleop.model_copy(
+        update={
+            "linear_mps": cap(cfg.teleop.linear_mps, tcp_mps),
+            "angular_rps": cap(cfg.teleop.angular_rps, joint_radps),
+        }
+    )
+    target_rate = cfg.target_rate.model_copy(
+        update={
+            "v_mps": cap(cfg.target_rate.v_mps, tcp_mps),
+            "w_radps": cap(cfg.target_rate.w_radps, joint_radps),
+        }
+    )
+    return cfg.model_copy(
+        update={
+            "teleop": teleop,
+            "target_rate": target_rate,
+            "dq_max_rad": cap(cfg.dq_max_rad, caps.joint_step_rad),
+        }
+    )
 
 
 def apply_executor_caps(cfg: ControlConfig, caps: ExecutorCaps) -> ControlConfig:
@@ -750,6 +828,7 @@ __all__ = [
     "SessionStateProvider",
     "StateSample",
     "apply_executor_caps",
+    "apply_teleop_caps",
     "arm_label",
     "bringup_rows",
     "default_servo_limits",
@@ -761,4 +840,5 @@ __all__ = [
     "scale_control_config",
     "scale_driver_config",
     "servo_executor_caps",
+    "teleop_rate_caps",
 ]

@@ -142,9 +142,7 @@ class DaggerRig:
     scripted policy pushes arm0 +x, ``_tick_once`` mirrors tests/dagger."""
 
     def __init__(self, mode: str = "inference"):
-        self.cell = FakeWorkcell(
-            {"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")}
-        )
+        self.cell = FakeWorkcell({"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")})
         self.cell.start()
         self.bus = RuntimeBus()
         self.gate = TakeoverGateImpl(["arm0", "arm1"])
@@ -152,8 +150,10 @@ class DaggerRig:
         self.policy = ScriptedPolicy(spec, script=lambda k: _dx(0.01))
         self.t = 0.0
         self.runner = PolicyRunner(
-            self.policy, lambda: Observation(np.zeros(4, np.float32), {}, self.t, 0),
-            rate_hz=20.0, clock=lambda: self.t,
+            self.policy,
+            lambda: Observation(np.zeros(4, np.float32), {}, self.t, 0),
+            rate_hz=20.0,
+            clock=lambda: self.t,
         )
         ik, kin = PoseIK(), PoseKin()
         self.settings = TrackerSettings(filter_enabled=False)
@@ -161,12 +161,21 @@ class DaggerRig:
             self.bus.tracker, self.settings, stale_s=0.2, leash_pos_m=0.025, leash_rot_rad=0.2
         )
         self.loop = GatedPolicyExecutor(
-            self.cell, ControlConfig(target_rate=TargetRateConfig(v_mps=1e9, w_radps=1e9)),
-            self.bus, SafetySupervisor(NullGate(), InputWatchdog()),
-            ["arm0", "arm1"], gate=self.gate, runner=self.runner,
-            anchor=ActionAnchor(ik, kin, SlewLimits()), arms_meta=ARMS_META,
-            session_mode=mode, version_label="deploy/v001", ik=ik, kin=kin,
-            tracker=self.tracker, clock=lambda: self.t,
+            self.cell,
+            ControlConfig(target_rate=TargetRateConfig(v_mps=1e9, w_radps=1e9)),
+            self.bus,
+            SafetySupervisor(NullGate(), InputWatchdog()),
+            ["arm0", "arm1"],
+            gate=self.gate,
+            runner=self.runner,
+            anchor=ActionAnchor(ik, kin, SlewLimits()),
+            arms_meta=ARMS_META,
+            session_mode=mode,
+            version_label="deploy/v001",
+            ik=ik,
+            kin=kin,
+            tracker=self.tracker,
+            clock=lambda: self.t,
         )
         self.loop._seed_from_measured()
         self.sample_seq = 0
@@ -179,11 +188,21 @@ class DaggerRig:
         from apollo_mavis_v2_runtime.devices.tracker import TrackerSample
 
         self.sample_seq += 1
-        self.bus.tracker.put(TrackerSample(
-            Pose(np.asarray(pos, float), IDENT), np.zeros(3), np.zeros(3), self.t,
-            self.t - age, self.sample_seq, True, self.controller, self.codes, self.click_actions,
-            pose_rx_mono=self.t - age,
-        ))
+        self.bus.tracker.put(
+            TrackerSample(
+                Pose(np.asarray(pos, float), IDENT),
+                np.zeros(3),
+                np.zeros(3),
+                self.t,
+                self.t - age,
+                self.sample_seq,
+                True,
+                self.controller,
+                self.codes,
+                self.click_actions,
+                pose_rx_mono=self.t - age,
+            )
+        )
         self.pose = np.asarray(pos, float)
 
     def device(self, *codes, controller=None, click_action=None):
@@ -336,9 +355,7 @@ def test_settings_change_while_clutched_reanchors_and_never_moves_the_target():
     rig.tick()
     q_before = rig.cmd()
     assert q_before[0] == pytest.approx(0.01) and q_before[5] == pytest.approx(0.03, abs=1e-9)
-    res = rig.act(
-        "tracker_settings", {"pos_scale": 2.0, "yaw_deg": 90.0, "follow_rotation": False}
-    )
+    res = rig.act("tracker_settings", {"pos_scale": 2.0, "yaw_deg": 90.0, "follow_rotation": False})
     assert res.ok
     assert np.allclose(rig.cmd(), q_before, atol=1e-12)  # the arm did not move
     rig.tick(5)
@@ -381,7 +398,7 @@ def _jitter_run(rig: Rig, n: int, seed: int = 0) -> np.ndarray:
         rig.sample(centre + rng.normal(0.0, 0.003, 3))  # 3 mm lighthouse jitter
         rig.tick()
         xs.append(rig.cmd()[:3])
-    return np.array(xs[n // 3:])
+    return np.array(xs[n // 3 :])
 
 
 def test_filter_reduces_target_jitter_versus_passthrough():
@@ -553,3 +570,39 @@ def test_entry_point_configures_logging_only_when_unconfigured(monkeypatch):
     assert configure_logging() is False and len(root.handlers) == 1  # idempotent
     monkeypatch.setattr(root, "handlers", [object()])  # an embedding app's handler
     assert configure_logging() is False
+
+
+def test_configure_file_logging_adds_one_rotating_handler(monkeypatch, tmp_path):
+    """2026-09-07: RuntimeConfig.logging -> a RotatingFileHandler in logging.dir next
+    to the stderr handler; the root level follows logging.level; dir null = stderr
+    only; a second call never stacks a second file handler."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    from apollo_mavis_v2_runtime.__main__ import LOG_FORMAT, configure_file_logging
+    from apollo_mavis_v2_runtime.config import LoggingConfig, RuntimeConfig
+
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [logging.StreamHandler()])
+    monkeypatch.setattr(root, "level", logging.INFO)
+    cfg = LoggingConfig(level="DEBUG", dir=tmp_path / "logs", max_bytes=1024, backup_count=2)
+    handler = configure_file_logging(cfg)
+    assert isinstance(handler, RotatingFileHandler) and handler in root.handlers
+    assert handler.baseFilename == str(tmp_path / "logs" / "runtime.log")
+    assert handler.maxBytes == 1024 and handler.backupCount == 2
+    assert handler.formatter is not None and handler.formatter._fmt == LOG_FORMAT
+    assert root.level == logging.DEBUG and (tmp_path / "logs").is_dir()
+    assert logging.getLogger("asyncio").level == logging.INFO  # third-party noise pinned
+    assert configure_file_logging(cfg) is None and len(root.handlers) == 2  # idempotent
+    logging.getLogger("apollo_mavis_v2_runtime.test").info("hello file")
+    handler.flush()
+    assert "hello file" in (tmp_path / "logs" / "runtime.log").read_text()
+    root.removeHandler(handler)
+    handler.close()
+    assert configure_file_logging(LoggingConfig(dir=None, level="WARNING")) is None
+    assert root.level == logging.WARNING
+    # The default lives with the rest of the machine state, resolved like every path.
+    rc = RuntimeConfig()
+    assert rc.logging.dir is not None and rc.logging.dir.is_absolute()
+    assert rc.logging.dir.parts[-2:] == ("var", "logs") and rc.logging.file == "runtime.log"
+    assert rc.control.health_log_every_s == 1.0

@@ -49,6 +49,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -78,6 +79,13 @@ RATE_WINDOW_S = 1.0  # rate_hz is measured over this window; decays to 0 when sa
 LOG_RATE_LIMIT_S = 1.0  # forwarded libsurvive warnings: <= 1 line/s per message class
 CHARGE_POLL_S = 2.0  # re-read simple_object_charging at most this often (cheap device read)
 LIBSURVIVE_LIGHTHOUSE_POLL_S = 0.5  # refresh the lighthouse snapshot (name/serial/pose) this often
+DONGLE_POLL_S = 5.0  # re-scan sysfs for the Watchman receiver at most this often (~1 ms/scan)
+# Valve Watchman dongle = the Vive controller's RF receiver (13-tracker §6; the
+# udev rule in scripts/tracker/01-sudo-udev-and-deps.sh names the same ids).
+# Presence is read from sysfs, NOT from libsurvive, so the Setting panel can
+# tell "receiver unplugged" from "nothing paired to it".
+DONGLE_USB_IDS: tuple[tuple[str, str], ...] = (("28de", "2101"),)
+USB_DEVICES_SYSFS = "/sys/bus/usb/devices"
 INFO_LINES_MAX = 256  # libsurvive INFO lines kept for the calibration FSM (ANSI stripped)
 STOP_JOIN_TIMEOUT_S = 5.0  # stop(): wait this long for the backend thread (simple_close)
 RESTART_JOIN_TIMEOUT_S = 20.0  # restart(): a slow simple_close (USB stall) gets this long
@@ -101,6 +109,34 @@ AXIS_TRACKPAD_X = 2  # -1..1
 AXIS_TRACKPAD_Y = 3  # -1..1, +y = top
 
 TrackpadDir = Literal["trackpad_left", "trackpad_right", "trackpad_up", "trackpad_down"]
+
+
+def dongle_present(sysfs: str = USB_DEVICES_SYSFS) -> bool | None:
+    """Is a Valve Watchman receiver plugged in? ``None`` when sysfs is absent.
+
+    A read-only scan of ``/sys/bus/usb/devices/*/{idVendor,idProduct}`` — no
+    libusb open, so it works while libsurvive owns the interface and while the
+    tracker backend is ``fake``/``none``. Answers the Setting panel's first
+    question ("is the receiver even there?") independently of pairing.
+    """
+    root = Path(sysfs)
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return None
+    for dev in entries:
+        # Device nodes are "<bus>-<port>[.<port>]"; interfaces carry a ':'
+        # ("9-2:1.0") and have no idVendor. Skipping them halves the reads.
+        if ":" in dev.name:
+            continue
+        try:
+            vendor = (dev / "idVendor").read_text().strip().lower()
+            product = (dev / "idProduct").read_text().strip().lower()
+        except OSError:
+            continue  # root hubs and stale nodes
+        if (vendor, product) in DONGLE_USB_IDS:
+            return True
+    return False
 
 
 def _code_for(action: str) -> str:
@@ -185,8 +221,12 @@ class ControllerState:
     def buttons(self) -> tuple[bool, ...]:
         """Boolean inputs only (edge detection ignores the analog axes)."""
         return (
-            self.trigger_pressed, self.trackpad_touch, self.trackpad_click,
-            self.grip, self.menu, self.system,
+            self.trigger_pressed,
+            self.trackpad_touch,
+            self.trackpad_click,
+            self.grip,
+            self.menu,
+            self.system,
         )
 
 
@@ -198,7 +238,9 @@ _BUTTON_FIELDS = {
     BUTTON_SYSTEM: "system",
 }
 _AXIS_FIELDS = {
-    AXIS_TRIGGER: "trigger", AXIS_TRACKPAD_X: "trackpad_x", AXIS_TRACKPAD_Y: "trackpad_y"
+    AXIS_TRIGGER: "trigger",
+    AXIS_TRACKPAD_X: "trackpad_x",
+    AXIS_TRACKPAD_Y: "trackpad_y",
 }
 
 
@@ -249,15 +291,27 @@ def note_edges(
 
     Compares ``state`` with ``prev`` (the previously adopted state; ``None`` =
     first observation, every pressed button counts as an edge): a trackpad
-    press edge is classified ONCE from the pad position (``trackpad_dir``,
-    carried until release; a click that starts inside the deadzone stays
-    ignored however far the finger moves afterwards), and every press edge of
-    the trackpad click, the menu button and the grip button appends
-    ``(seq, input)`` to ``edges`` (the deadzone click appends ``None`` as the
-    input); the history keeps the newest ``EDGE_HISTORY`` entries.
-    Simultaneous edges in one state (scripted states only: libsurvive delivers
-    one button per event) are appended in the order trackpad, menu, grip.
-    Held or released states carry the previous accounting unchanged.
+    press edge is classified from the pad position (``trackpad_dir``, carried
+    until release), and every press edge of the trackpad click, the menu button
+    and the grip button appends ``(seq, input)`` to ``edges`` (a click whose
+    press edge fell inside the deadzone appends ``None`` as the input); the
+    history keeps the newest ``EDGE_HISTORY`` entries. Simultaneous edges in
+    one state (scripted states only: libsurvive delivers one button per event)
+    are appended in the order trackpad, menu, grip. Held or released states
+    carry the previous accounting unchanged.
+
+    LATE CLASSIFICATION (2026-09-07): a click that starts inside the deadzone is
+    reclassified while it is STILL HELD, the first time the finger leaves the
+    deadzone, and that classification appends its own edge. Until then the pad
+    was dead for the rest of the click however far the finger moved, which is
+    the input-side half of the operator's report that trackpad-bound actions
+    "only work after the trigger" — the pad axes are only refreshed by an
+    event, so the position read at the press edge is whatever the last axis
+    event carried, and a controller that has been idle (or has just woken) reads
+    a stale or zeroed centre. Squeezing the trigger produced axis events and so
+    appeared to "unlock" the pad. One click therefore yields at most two edges,
+    ``(n, None)`` at the press and ``(n + 1, <dir>)`` when it resolves; the
+    ``None`` edge is bound to nothing, so a discrete action fires exactly once.
     """
     seq = prev.edge_seq if prev is not None else 0
     history = prev.edges if prev is not None else ()
@@ -266,6 +320,14 @@ def note_edges(
     if state.trackpad_click and not (prev is not None and prev.trackpad_click):
         trackpad_dir = classify_trackpad(state.trackpad_x, state.trackpad_y, deadzone)
         new.append((seq + len(new) + 1, trackpad_dir))
+    elif state.trackpad_click and trackpad_dir is None:
+        # Still held and still unclassified: resolve it as soon as the finger
+        # leaves the deadzone (see LATE CLASSIFICATION above).
+        trackpad_dir = classify_trackpad(state.trackpad_x, state.trackpad_y, deadzone)
+        if trackpad_dir is not None:
+            new.append((seq + len(new) + 1, trackpad_dir))
+    if not state.trackpad_click:
+        trackpad_dir = None  # released: drop the classification, do not carry it
     if state.menu and not (prev is not None and prev.menu):
         new.append((seq + len(new) + 1, "menu_click"))
     if state.grip and not (prev is not None and prev.grip):
@@ -402,14 +464,20 @@ class TrackerSettings:
     ) -> None:
         self._lock = threading.Lock()
         self._values = TrackerSettingsValues(
-            float(yaw_deg), float(pos_scale), bool(follow_rotation),
-            bool(filter_enabled), float(filter_min_cutoff_hz), float(filter_beta),
+            float(yaw_deg),
+            float(pos_scale),
+            bool(follow_rotation),
+            bool(filter_enabled),
+            float(filter_min_cutoff_hz),
+            float(filter_beta),
         )
 
     @classmethod
     def from_config(cls, cfg: TrackerConfig) -> TrackerSettings:
         return cls(
-            cfg.yaw_deg, cfg.pos_scale, cfg.follow_rotation,
+            cfg.yaw_deg,
+            cfg.pos_scale,
+            cfg.follow_rotation,
             filter_enabled=cfg.filter.enabled,
             filter_min_cutoff_hz=cfg.filter.min_cutoff_hz,
             filter_beta=cfg.filter.beta,
@@ -479,6 +547,11 @@ class TrackerDeviceStatus:
     bad_events: int = 0  # libsurvive events dropped by the per-event guard
     restarts: int = 0  # libsurvive loop auto-restarts so far
     charging: bool | None = None  # controller on external (USB) power; None = not reported
+    # Controller link (2026-09-07): the BUTTON path's own liveness, separate from
+    # the pose path's `age_s` — they fail apart (13-tracker §3.5).
+    controller_age_s: float | None = None  # now - rx_mono of the newest input event
+    objects: tuple[str, ...] = ()  # OBJECT-type devices libsurvive reports
+    dongle_present: bool | None = None  # USB 28de:2101 in sysfs; None = not checked
 
 
 class TrackerReader:
@@ -543,6 +616,14 @@ class TrackerReader:
         self.info_lines: deque[tuple[float, str]] = deque(maxlen=INFO_LINES_MAX)
         self.on_info: Callable[[float, str], None] | None = None
         self._lighthouses: list[LighthouseSnapshot] = []
+        # Controller-link evidence for the Welcome page's Setting panel
+        # (2026-09-07): the OBJECT-type devices libsurvive currently reports
+        # (empty = nothing paired / dongle not openable) and the USB presence of
+        # the Watchman receiver, both refreshed by the reader thread / a
+        # throttled sysfs read so `status()` stays cheap.
+        self._objects: list[str] = []
+        self._dongle_present: bool | None = None
+        self._dongle_next = 0.0  # next monotonic time to re-scan sysfs
 
     @property
     def backend(self) -> str:
@@ -629,6 +710,7 @@ class TrackerReader:
             self.cfg = self.cfg.model_copy(update={"libsurvive_args": list(libsurvive_args)})
             with self._lock:
                 self._lighthouses = []
+                self._objects = []  # re-enumerated by the fresh loop
             self.start()
 
     def lighthouses(self) -> list[LighthouseSnapshot]:
@@ -652,6 +734,18 @@ class TrackerReader:
             rx = [t for t in self._rx_times if t > now - RATE_WINDOW_S]
             controller = self._controller
             charging = self._charging
+            objects = tuple(self._objects)
+        dongle = self._dongle(now)
+        # Controller INPUT age, from the newest button/touch/axis event folded into
+        # the state (`ControllerState.rx_mono`) — NOT the pose age: on 2026-09-06
+        # poses ran at 135 Hz while libsurvive delivered no input event for
+        # minutes, which froze the controller state at a plausible-looking value.
+        # 0.0 = the state predates any event (the fake backend's scripted state).
+        controller_age = (
+            None
+            if controller is None or controller.rx_mono <= 0.0
+            else max(0.0, now - controller.rx_mono)
+        )
         # Pose age: the last REAL pose (an edge re-publish carries an old pose).
         age = None if pose_rx is None else max(0.0, now - pose_rx)
         if status == "tracking" and age is not None and age > self.cfg.stale_s:
@@ -675,7 +769,27 @@ class TrackerReader:
             bad_events=self.bad_events,
             restarts=self.restarts,
             charging=charging,
+            controller_age_s=controller_age,
+            objects=objects,
+            dongle_present=dongle,
         )
+
+    def _dongle(self, now: float) -> bool | None:
+        """Throttled sysfs presence check for the Watchman receiver.
+
+        Read from ``status()`` (the telemetry thread), so it must stay cheap: at
+        most one directory scan every ``DONGLE_POLL_S``, cached in between. The
+        check is independent of the backend — an operator with ``backend: fake``
+        still wants to know whether the receiver is plugged in.
+        """
+        if now < self._dongle_next:
+            return self._dongle_present
+        self._dongle_next = now + DONGLE_POLL_S
+        try:
+            self._dongle_present = dongle_present()
+        except Exception:  # noqa: BLE001 - a status read must never raise
+            logger.debug("dongle presence check failed", exc_info=True)
+        return self._dongle_present
 
     # -- publishing (backend threads) ----------------------------------------------------
     def _publish(
@@ -741,7 +855,9 @@ class TrackerReader:
         elif stale_edge:
             logger.debug(
                 "tracker sample %d re-published on a controller edge with a pose older than "
-                "%.2f s: invalid", sample.seq, self.cfg.stale_s,
+                "%.2f s: invalid",
+                sample.seq,
+                self.cfg.stale_s,
             )
         self.slot.put(sample)
         return sample
@@ -866,7 +982,9 @@ class TrackerReader:
             self.restarts += 1
             logger.warning(
                 "tracker: libsurvive loop ended (%s); restart %d in %.1f s",
-                self.status().detail or "no detail", self.restarts, backoff,
+                self.status().detail or "no detail",
+                self.restarts,
+                backoff,
             )
             self._stop.wait(backoff)
             backoff = min(backoff * 2.0, cap)
@@ -877,6 +995,12 @@ class TrackerReader:
         ptr = None
         try:
             args = ["apollo-mavis-v2-runtime", *self.cfg.libsurvive_args]
+            # Read/write the workspace-anchored config file (self-contained; no reliance
+            # on libsurvive's implicit ~/.config default). The calibration wizard strips
+            # --configfile (CALIBRATION_ARGS) and points at its own temp copy, so an
+            # explicit value here never collides with capture/validation.
+            if "--configfile" not in args and self.cfg.libsurvive_config_path:
+                args += ["--configfile", str(self.cfg.libsurvive_config_path)]
             argv = (ctypes.POINTER(ctypes.c_char) * (len(args) + 1))()
             for i, arg in enumerate(args):
                 argv[i] = ctypes.create_string_buffer(arg.encode("utf-8"))
@@ -898,6 +1022,10 @@ class TrackerReader:
                 except Exception:
                     logger.exception("libsurvive close failed")
             self._log_cb = None
+            with self._lock:
+                # A dead loop knows nothing: never report a stale object list as
+                # pairing evidence (telemetry `objects`).
+                self._objects = []
 
     def _libsurvive_events(self, ps, ptr, ctypes) -> None:
         """Drain libsurvive's event queue (non-blocking ``simple_next_event`` +
@@ -944,8 +1072,10 @@ class TrackerReader:
         pos = np.array(pe.pose.Pos[:3], dtype=np.float64)
         rot = np.array(pe.pose.Rot[:4], dtype=np.float64)  # wxyz, same as core Pose
         if (
-            pos.shape != (3,) or rot.shape != (4,)
-            or not np.all(np.isfinite(pos)) or not np.all(np.isfinite(rot))
+            pos.shape != (3,)
+            or rot.shape != (4,)
+            or not np.all(np.isfinite(pos))
+            or not np.all(np.isfinite(rot))
             or abs(float(np.linalg.norm(rot)) - 1.0) > QUAT_NORM_TOL
         ):
             self.bad_events += 1
@@ -982,12 +1112,23 @@ class TrackerReader:
         """Enumerate libsurvive's LIGHTHOUSE objects (``ps.<constant>`` comparison
         only: the test stub's enum values differ from the real library) into the
         lock-protected snapshot. Every accessor is guarded so a missing symbol or
-        a half-initialised station degrades to ``None``, never kills the thread."""
+        a half-initialised station degrades to ``None``, never kills the thread.
+
+        The same walk records the OBJECT-type codenames (``_objects``, telemetry
+        ``objects``): an empty list is the pairing evidence the Setting panel
+        needs — nothing is paired to the receiver, or the interface is not
+        openable — while ``["WM0"]`` says paired and leaves only the base-station
+        fix in question.
+        """
         try:
             out: list[LighthouseSnapshot] = []
+            names: list[str] = []
             obj = ps.simple_get_first_object(ptr)
             order = 0
             while obj:
+                if ps.simple_object_get_type(obj) == ps.SurviveSimpleObject_OBJECT:
+                    nm = ps.simple_object_name(obj)
+                    names.append(nm.decode(errors="replace") if isinstance(nm, bytes) else str(nm))
                 if ps.simple_object_get_type(obj) == ps.SurviveSimpleObject_LIGHTHOUSE:
                     name = ps.simple_object_name(obj)
                     name = name.decode(errors="replace") if isinstance(name, bytes) else str(name)
@@ -1009,7 +1150,8 @@ class TrackerReader:
                         pos = np.array(lp.Pos[:3], dtype=np.float64)
                         rot = np.array(lp.Rot[:4], dtype=np.float64)  # wxyz
                         if (
-                            np.all(np.isfinite(pos)) and np.all(np.isfinite(rot))
+                            np.all(np.isfinite(pos))
+                            and np.all(np.isfinite(rot))
                             and abs(float(np.linalg.norm(rot)) - 1.0) <= QUAT_NORM_TOL
                         ):
                             pose = Pose(pos, rot)
@@ -1020,6 +1162,7 @@ class TrackerReader:
                 obj = ps.simple_get_next_object(ptr, obj)
             with self._lock:
                 self._lighthouses = out
+                self._objects = names
         except Exception:
             logger.debug("lighthouse enumeration failed", exc_info=True)
 
@@ -1085,8 +1228,11 @@ class TrackerReader:
         n = max(0, min(int(be.axis_count), 8))
         prev = self._controller or ControllerState()
         state = apply_button_event(
-            prev, int(be.event_type), int(be.button_id),
-            [be.axis_ids[i] for i in range(n)], [be.axis_val[i] for i in range(n)],
+            prev,
+            int(be.event_type),
+            int(be.button_id),
+            [be.axis_ids[i] for i in range(n)],
+            [be.axis_val[i] for i in range(n)],
             self._clock(),
         )
         self._on_controller(state)

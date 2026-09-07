@@ -18,7 +18,10 @@ from the SAME wrist camera:
   segmentation ids at edges into OTHER valid geom ids), the wrist camera's
   ``resolution / sensor_size / focal_pixel / principal_pixel`` from
   ``CameraConfig.intrinsics`` (MuJoCo's principal-point offset has the
-  OPPOSITE sign of OpenCV's: ``principal_pixel = [W/2 - cx, H/2 - cy]``), and
+  OPPOSITE sign of OpenCV's: ``principal_pixel = [W/2 - cx, H/2 - cy]``, plus
+  the per-camera overlay-only ``principal_offset_px`` nudge - ``cx += du``,
+  ``cy += dv`` - that aligns a wrist camera mounted slightly off the shared
+  ``wrist_cam`` pose WITHOUT changing the recorded intrinsics), and
   moves the environment geoms (floor / table / obstacle) to geom group 4 so
   ``MjvOption.geomgroup[4] = 0`` hides them in the robot passes;
 * an RGB pass gives the twin's shading, a segmentation pass the robot mask
@@ -105,22 +108,43 @@ def arm_for_camera(cam: CameraConfig, arm_ids: list[str]) -> str | None:
     return max(matches, key=len) if matches else None
 
 
-def principal_pixel(intr: CameraIntrinsics, width: int, height: int) -> tuple[float, float]:
+def principal_pixel(
+    intr: CameraIntrinsics,
+    width: int,
+    height: int,
+    offset: tuple[float, float] = (0.0, 0.0),
+) -> tuple[float, float]:
     """MuJoCo principal-point offset from OpenCV intrinsics: the SIGN is
-    opposite (verified < 0.5 px on this box), so ``[W/2 - cx, H/2 - cy]``."""
-    return (width / 2.0 - float(intr.cx), height / 2.0 - float(intr.cy))
+    opposite (verified < 0.5 px on this box), so ``[W/2 - cx, H/2 - cy]``.
+
+    ``offset`` is a per-camera overlay-only nudge ``(du, dv)`` applied as
+    ``cx += du``, ``cy += dv`` (module docstring / ``principal_offset_px``): it
+    aligns a wrist camera whose physical mount differs from the shared
+    ``wrist_cam`` pose without touching the true recorded intrinsics."""
+    cx = float(intr.cx) + float(offset[0])
+    cy = float(intr.cy) + float(offset[1])
+    return (width / 2.0 - cx, height / 2.0 - cy)
 
 
-def apply_intrinsics(cam: Any, intr: CameraIntrinsics | None, width: int, height: int) -> None:
+def apply_intrinsics(
+    cam: Any,
+    intr: CameraIntrinsics | None,
+    width: int,
+    height: int,
+    principal_offset: tuple[float, float] = (0.0, 0.0),
+) -> None:
     """Configure an ``MjsCamera`` to render exactly ``width x height`` pixels
-    with the given pinhole intrinsics (``fovy`` fallback without them)."""
+    with the given pinhole intrinsics (``fovy`` fallback without them).
+
+    ``principal_offset`` nudges only the rendered principal point (see
+    :func:`principal_pixel`); it does not change ``intr``."""
     if intr is None:
         cam.fovy = DEFAULT_COLOUR_FOVY_DEG
         return
     cam.resolution = [int(width), int(height)]
     cam.sensor_size = [width * 1e-5, height * 1e-5]
     cam.focal_pixel = [float(intr.fx), float(intr.fy)]
-    cam.principal_pixel = list(principal_pixel(intr, width, height))
+    cam.principal_pixel = list(principal_pixel(intr, width, height, principal_offset))
 
 
 def subtree_bodies(model: Any, root: int) -> set[int]:
@@ -189,6 +213,7 @@ class TwinOverlaySource:
         resolution: tuple[int, int],
         fps: float,
         intrinsics: CameraIntrinsics | None,
+        principal_offset: tuple[float, float] = (0.0, 0.0),
     ) -> None:
         self.stream_id = stream_id
         self.camera_id = camera_id
@@ -197,6 +222,7 @@ class TwinOverlaySource:
         self.resolution = (int(resolution[0]), int(resolution[1]))  # (W, H)
         self.fps = float(fps)
         self.intrinsics = intrinsics
+        self.principal_offset = (float(principal_offset[0]), float(principal_offset[1]))
         self.label = overlay_label(arm_id)
         self.slot: LatestSlot[CameraFrame] = LatestSlot()
         self._lock = threading.Lock()
@@ -397,6 +423,7 @@ class TwinOverlayRenderer:
             ):
                 logger.error("twin overlay stream id %r is not allowed; skipped", stream_id)
                 continue
+            offset = self.cfg.principal_offset_px.get(cam.id, (0.0, 0.0))
             self.streams[stream_id] = TwinOverlaySource(
                 stream_id,
                 cam.id,
@@ -405,6 +432,7 @@ class TwinOverlayRenderer:
                 tuple(cam.resolution),
                 self.cfg.fps,
                 cam.intrinsics,
+                (float(offset[0]), float(offset[1])),
             )
             if cam.intrinsics is None:
                 logger.warning(
@@ -531,7 +559,7 @@ class TwinOverlayRenderer:
             except Exception as e:  # noqa: BLE001 - camera-less arm in the scene
                 src.set_status("error", f"twin camera {src.twin_camera!r} missing: {e}")
                 continue
-            apply_intrinsics(cam, src.intrinsics, width, height)
+            apply_intrinsics(cam, src.intrinsics, width, height, src.principal_offset)
             spec.visual.global_.offwidth = max(int(spec.visual.global_.offwidth), width)
             spec.visual.global_.offheight = max(int(spec.visual.global_.offheight), height)
         model = spec.compile()

@@ -220,6 +220,21 @@ class ControlLoop:
         self.tick_count = 0
         self.overrun_count = 0
         self.tick_durations: list[float] = []  # perf harness (bounded)
+        # Health line + edge logging (2026-09-07; 04-runtime §14 "Logging"). The
+        # loop is the one place that sees every teleop input and every output, so
+        # it writes ONE INFO line per ``cfg.health_log_every_s`` summarising the
+        # window (tick rate / overruns / clutch / tracker ages / gate / IK slips /
+        # servo-stream stats) and an edge line on every transition that changes
+        # what the operator's hand does: clutch, controller stream fresh/stale, WS
+        # watchdog latch. Counters are cumulative; the line prints window deltas.
+        self.ik_slips = 0  # _solve_target residual freezes (target re-anchored)
+        self.ik_diverged = 0  # _solve_target divergences (tick held)
+        self._health_next: float | None = None
+        self._health_durations: list[float] = []
+        self._health_prev = {"tick": 0, "overrun": 0, "slip": 0, "diverged": 0, "tslip": 0}
+        self._clutch_logged = False
+        self._device_fresh_logged: bool | None = None
+        self._watchdog_logged = False
         self._senders: dict = {}
         self._thread: threading.Thread | None = None
         self._running = False
@@ -255,8 +270,11 @@ class ControlLoop:
                 self.run_tick(t0)
             except Exception:
                 logger.exception("control tick failed")
+            dur = self._clock() - t0
             if len(self.tick_durations) < 10000:
-                self.tick_durations.append(self._clock() - t0)
+                self.tick_durations.append(dur)
+            if len(self._health_durations) < 10000:
+                self._health_durations.append(dur)
             next_t += self.dt
             lag = self._clock() - next_t
             if lag > self.dt:  # overrun: skip catch-up, no burst commands
@@ -302,12 +320,31 @@ class ControlLoop:
         held_ws: frozenset[str] = got[0].held if got is not None else frozenset()
         scale = self.supervisor.watchdog.scale(now)  # WS-source scale
         watchdog_tripped = self.supervisor.watchdog.tripped
+        if watchdog_tripped != self._watchdog_logged:
+            self._watchdog_logged = watchdog_tripped
+            if watchdog_tripped:
+                logger.warning(
+                    "ws input watchdog LATCHED: browser keys ignored until every key is "
+                    "released (held %s); device-held codes keep working",
+                    sorted(held_ws),
+                )
+            else:
+                logger.info("ws input watchdog cleared")
         device_codes, device_scale = self._device_inputs(now)
         self.sources = HeldSources(held_ws, scale, device_codes, device_scale)
         held = self.sources.held  # held_eff = held ∪ device_codes (13-tracker §1.1)
         if self.tracker is not None:
-            self.tracker.clutch = TRACKER_CLUTCH_CODE in held
-            if TRACKER_CLUTCH_CODE not in held:
+            clutch = TRACKER_CLUTCH_CODE in held
+            self.tracker.clutch = clutch
+            if clutch != self._clutch_logged:
+                self._clutch_logged = clutch
+                logger.info(
+                    "clutch %s (arm %s, source %s)",
+                    "ENGAGED" if clutch else "released",
+                    self.active_arm,
+                    "device" if TRACKER_CLUTCH_CODE in device_codes else "ws",
+                )
+            if not clutch:
                 self._clutch_arm = None  # clutch up -> next press is a rising edge
 
         states = self.workcell.states()  # 3 (driver caches; never blocks)
@@ -393,7 +430,141 @@ class ControlLoop:
             },
         )
         self.bus.snapshot.put(snap)
+        self._health_log(now, held, source, states)
         return snap
+
+    # -- health line (2026-09-07; 04-runtime §14 "Logging") -----------------------------
+    def _health_log(
+        self, now: float, held: frozenset[str], source: CommandSource, states: dict[str, ArmState]
+    ) -> None:
+        """One INFO line per ``cfg.health_log_every_s`` (0 = off). Everything on it
+        is already in hand at the end of the tick; the only extra work is a sort
+        of this window's tick durations and one ``tick_stats()`` call per
+        hardware arm, once a second."""
+        every = float(getattr(self.cfg, "health_log_every_s", 0.0) or 0.0)
+        if every <= 0.0:
+            return
+        if self._health_next is None:
+            self._health_next = now + every
+            self._health_snapshot_counters()
+            return
+        if now < self._health_next:
+            return
+        prev = self._health_prev
+        window = now - (self._health_next - every)
+        ticks = self.tick_count - prev["tick"]
+        d = sorted(self._health_durations)
+        n = len(d)
+        p50 = d[n // 2] if n else 0.0
+        p99 = d[min(n - 1, int(n * 0.99))] if n else 0.0
+        tslip = self.tracker.slip_count if self.tracker is not None else 0
+        lag = self._cmd_lag(states)
+        try:
+            logger.info(
+                "loop: %d ticks/%.1fs (%.0f Hz, tick p50 %.1f ms p99 %.1f ms, +%d overruns) "
+                "active=%s src=%s held=%s%s%s gate=%s%s ik_slips=+%d ik_diverged=+%d "
+                "cmd-meas=%s%s%s",
+                ticks,
+                window,
+                ticks / window if window > 0 else 0.0,
+                p50 * 1e3,
+                p99 * 1e3,
+                self.overrun_count - prev["overrun"],
+                self.active_arm,
+                getattr(source, "value", source),
+                sorted(held) if held else "[]",
+                self._tracker_health(now, tslip - prev["tslip"]),
+                " watchdog=LATCHED" if self._watchdog_logged else "",
+                self._gate_health(),
+                f" faulted={sorted(self._faulted)}" if self._faulted else "",
+                self.ik_slips - prev["slip"],
+                self.ik_diverged - prev["diverged"],
+                lag,
+                f" recovering={sorted(self._recovering)}" if self._recovering else "",
+                self._servo_health(),
+            )
+        except Exception:  # noqa: BLE001 - a health line must never break the tick
+            logger.exception("health line failed")
+        self._health_next = now + every
+        self._health_snapshot_counters()
+
+    def _health_snapshot_counters(self) -> None:
+        self._health_prev = {
+            "tick": self.tick_count,
+            "overrun": self.overrun_count,
+            "slip": self.ik_slips,
+            "diverged": self.ik_diverged,
+            "tslip": self.tracker.slip_count if self.tracker is not None else 0,
+        }
+        self._health_durations.clear()
+
+    def _tracker_health(self, now: float, slips: int) -> str:
+        """`` tracker=<state> pose_age=<ms> ctl_age=<s> engaged=<arm> leash_slips=+N``:
+        the pose path and the button path AGE separately (2026-09-06: poses at
+        135 Hz while no button event arrived for minutes), so both ages are
+        printed; ``leash_slips`` is the hand travel discarded this window."""
+        if self.tracker is None:
+            return ""
+        got = self.tracker.slot.get()
+        if got is None:
+            return " tracker=no-sample"
+        sample = got[0]
+        pose_age = now - sample.pose_rx_mono
+        state = (
+            "tracking"
+            if sample.valid and pose_age <= self.tracker.stale_s
+            else ("stale" if sample.valid else "invalid")
+        )
+        ctl = sample.controller
+        ctl_age = f"{now - ctl.rx_mono:.1f}s" if ctl is not None else "none"
+        out = f" tracker={state} pose_age={pose_age * 1e3:.0f}ms ctl_age={ctl_age}"
+        if self.tracker.engaged_arm is not None:
+            out += f" engaged={self.tracker.engaged_arm}"
+        if slips:
+            out += f" leash_slips=+{slips} (+{self.tracker.slip_pos_total_m:.3f} m total)"
+        return out
+
+    def _gate_health(self) -> str:
+        report = self.supervisor.merged_report()
+        if report.severity == "ok":
+            return "ok"
+        return f"{report.severity} min={report.min_clearance_m:.4f}m pairs={report.pairs[:2]}"
+
+    def _cmd_lag(self, states: dict[str, ArmState]) -> str:
+        """Per-arm ``max|q_cmd - q_meas|`` (rad, joints only): how far the last
+        command runs ahead of the measured arm. A hardware arm that stops
+        following shows a lag that stays put while the hand keeps moving."""
+        parts = []
+        for arm_id in self.session_arms:
+            st = states.get(arm_id)
+            q_cmd = self._last_cmd.get(arm_id)
+            if st is None or q_cmd is None:
+                continue
+            n = min(7, len(st.q), len(q_cmd))
+            parts.append(f"{arm_id}:{float(np.max(np.abs(q_cmd[:n] - st.q[:n]))):.4f}")
+        return "{" + " ".join(parts) + "}" if parts else "n/a"
+
+    def _servo_health(self) -> str:
+        """Hardware servo-stream stats per arm (``XArmDriver.tick_stats()``, duck
+        typed: the runtime never imports the hardware package). Empty for sim."""
+        parts = []
+        for arm_id in self.session_arms:
+            try:
+                arm = self.workcell.arms[arm_id]
+            except (KeyError, TypeError):
+                continue
+            stats_fn = getattr(arm, "tick_stats", None)
+            if not callable(stats_fn):
+                continue
+            try:
+                st = stats_fn()
+            except Exception:  # noqa: BLE001
+                continue
+            parts.append(
+                f"{arm_id}: {st.ticks} ticks, {st.late_ticks} late, {st.faults} faults, "
+                f"p99 {st.p99_s * 1e3:.1f} ms"
+            )
+        return f" servo={{{'; '.join(parts)}}}" if parts else ""
 
     # -- mode hooks (overridden by dagger.loop.GatedPolicyExecutor, phase-08) -------
     def _resolve_arms(
@@ -660,9 +831,10 @@ class ControlLoop:
             rail_new = min(max(float(q_last[7]) + rail_v * self.dt, 0.0), RAIL_TRAVEL_M)
             q_rail = np.array(q_last, dtype=np.float64)
             q_rail[7] = rail_new
-            d_rail = self.kin.tcp_world(arm_id, q_rail).position - self.kin.tcp_world(
-                arm_id, q_last
-            ).position
+            d_rail = (
+                self.kin.tcp_world(arm_id, q_rail).position
+                - self.kin.tcp_world(arm_id, q_last).position
+            )
 
         def with_rail(q: np.ndarray) -> np.ndarray:
             q = np.array(q, dtype=np.float64)
@@ -776,6 +948,12 @@ class ControlLoop:
         """IK + residual handling shared by the keyboard and tracker paths."""
         result = self.ik.solve(arm_id, target, q_last)
         if result.diverged or not np.isfinite(result.pos_err_m):
+            self.ik_diverged += 1
+            logger.debug(
+                "%s: IK diverged (pos_err %.4f m) - target re-anchored to measured, tick held",
+                arm_id,
+                result.pos_err_m,
+            )
             self.integrator.reanchor(arm_id, measured_tcp)
             if self.tracker is not None:
                 self.tracker.slip(target, measured_tcp)
@@ -783,6 +961,19 @@ class ControlLoop:
         over_pos = result.pos_err_m > self.cfg.residual_max_pos_m
         over_rot = result.rot_err_rad > self.cfg.residual_max_rot_rad
         if over_pos or over_rot:
+            self.ik_slips += 1
+            logger.debug(
+                "%s: IK residual over threshold (pos %.4f m, rot %.3f rad) - target frozen "
+                "back to the achieved pose%s",
+                arm_id,
+                result.pos_err_m,
+                result.rot_err_rad,
+                " (position)"
+                if over_pos and not over_rot
+                else " (rotation)"
+                if over_rot and not over_pos
+                else " (both)",
+            )
             # Freeze the target back to the achieved pose (glide, don't wind up)
             # COMPONENT-WISE (04-runtime §6): only the component whose residual
             # is over threshold is re-anchored, so a rotation residual never
@@ -843,7 +1034,20 @@ class ControlLoop:
         if got is None:
             return frozenset(), 0.0
         sample = got[0]
-        fresh = now - sample.rx_mono <= self.tracker.stale_s
+        age = now - sample.rx_mono
+        fresh = age <= self.tracker.stale_s
+        if fresh != self._device_fresh_logged:
+            if self._device_fresh_logged is not None or not fresh:  # first fresh: silent
+                if fresh:
+                    logger.info("controller stream fresh again (sample age %.3f s)", age)
+                else:
+                    logger.warning(
+                        "controller stream STALE (sample age %.3f s > stale_s %.2f): device-held "
+                        "codes dropped - clutch, gripper and rail from the controller stop",
+                        age,
+                        self.tracker.stale_s,
+                    )
+            self._device_fresh_logged = fresh
         self._device_click_edge(sample, fresh, now)
         if not fresh:
             return frozenset(), 0.0
@@ -914,9 +1118,7 @@ class ControlLoop:
     # -- plan lifecycle ------------------------------------------------------------
     def _set_plan_status(self, status: str | None, linger: bool = False) -> None:
         self._plan_status = status
-        self._plan_status_clear_at = (
-            self.tick_count + PLAN_STATUS_LINGER_TICKS if linger else None
-        )
+        self._plan_status_clear_at = self.tick_count + PLAN_STATUS_LINGER_TICKS if linger else None
 
     def _finish_plan(self, arm_id: str, ok: bool) -> None:
         if ok:
@@ -937,10 +1139,7 @@ class ControlLoop:
         logger.info("plan cancelled: %s", reason)
 
     def _expire_plan_status(self) -> None:
-        if (
-            self._plan_status_clear_at is not None
-            and self.tick_count >= self._plan_status_clear_at
-        ):
+        if self._plan_status_clear_at is not None and self.tick_count >= self._plan_status_clear_at:
             self._plan_status = None
             self._plan_status_clear_at = None
         for arm_id, at in list(self._plan_clear_at.items()):
@@ -984,12 +1183,16 @@ class ControlLoop:
         except Exception as e:
             return CommandResult(cmd.corr_id, False, f"invalid tracker_settings args: {e}")
         v = self.tracker.settings.update(
-            yaw_deg=args.yaw_deg, pos_scale=args.pos_scale, follow_rotation=args.follow_rotation,
-            filter_enabled=args.filter_enabled, filter_min_cutoff_hz=args.filter_min_cutoff_hz,
+            yaw_deg=args.yaw_deg,
+            pos_scale=args.pos_scale,
+            follow_rotation=args.follow_rotation,
+            filter_enabled=args.filter_enabled,
+            filter_min_cutoff_hz=args.filter_min_cutoff_hz,
             filter_beta=args.filter_beta,
         )
         return CommandResult(
-            cmd.corr_id, True,
+            cmd.corr_id,
+            True,
             f"yaw_deg={v.yaw_deg:g} pos_scale={v.pos_scale:g} "
             f"follow_rotation={str(v.follow_rotation).lower()} "
             f"filter_enabled={str(v.filter_enabled).lower()} "
@@ -1040,7 +1243,8 @@ class ControlLoop:
             delta = float(np.max(np.abs(target - self._last_cmd[arm_id])))
             if delta > self.cfg.jog.goto_threshold_rad:
                 return CommandResult(
-                    cmd.corr_id, False,
+                    cmd.corr_id,
+                    False,
                     f"delta {delta:.3f} > goto threshold "
                     f"{self.cfg.jog.goto_threshold_rad}; use goto",
                 )
@@ -1121,8 +1325,12 @@ class ControlLoop:
         if not name:
             return CommandResult(cmd.corr_id, False, "profile name required")
         profile = save_from_states(
-            self.profile_store, self._states, self.session_arms,
-            self.workcell_kind, name, str(cmd.args.get("notes", "")),
+            self.profile_store,
+            self._states,
+            self.session_arms,
+            self.workcell_kind,
+            name,
+            str(cmd.args.get("notes", "")),
         )
         return CommandResult(cmd.corr_id, True, profile.profile_id)
 

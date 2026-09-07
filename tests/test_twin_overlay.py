@@ -231,6 +231,44 @@ def test_principal_point_sign_and_intrinsics_on_a_real_mjs_camera():
     assert default_fovy_deg(608.23, H) == pytest.approx(43.1, abs=0.15)  # ~43.2, not the MJCF 57
 
 
+def test_principal_offset_shifts_only_the_rendered_principal_point():
+    # A per-camera overlay-only nudge (cx += du, cy += dv) leaves the true intrinsics
+    # untouched but moves the rendered principal point by exactly (-du, -dv) in MuJoCo's
+    # opposite-sign convention. Aligns a wrist camera mounted off the shared wrist_cam pose.
+    import mujoco
+
+    intr = CameraIntrinsics(**GRIP_INTR)
+    base = principal_pixel(intr, W, H)
+    shifted = principal_pixel(intr, W, H, (21.0, 13.0))
+    assert shifted == pytest.approx((base[0] - 21.0, base[1] - 13.0))
+    assert intr.cx == pytest.approx(327.39) and intr.cy == pytest.approx(247.90)  # unchanged
+    spec = mujoco.MjSpec()
+    cam = spec.worldbody.add_camera(name="c")
+    apply_intrinsics(cam, intr, W, H, (21.0, 13.0))
+    expected = [320 - (327.39 + 21.0), 240 - (247.90 + 13.0)]
+    assert list(cam.principal_pixel) == pytest.approx(expected)
+    assert list(cam.focal_pixel) == pytest.approx([608.19, 608.23])  # focal untouched
+
+
+def test_config_principal_offset_reaches_the_view_stream(rt):
+    # twin_overlay.principal_offset_px keyed by camera id is carried onto the matching
+    # TwinOverlaySource so the view overlay renders with the corrected principal point;
+    # a camera with no entry keeps the (0, 0) default.
+    wc = WorkcellConfig.model_validate(HW_WORKCELL)
+    renderer = TwinOverlayRenderer(
+        TwinOverlayConfig(principal_offset_px={"view_wrist": (21.0, 13.0)}),
+        wc,
+        SCENE,
+        rt.hardware_monitor,
+        lambda cid: None,
+        rt.hub,
+    )
+    view = next(s for s in renderer.streams.values() if s.camera_id == "view_wrist")
+    grip = next(s for s in renderer.streams.values() if s.camera_id == "grip_wrist")
+    assert view.principal_offset == pytest.approx((21.0, 13.0))
+    assert grip.principal_offset == pytest.approx((0.0, 0.0))  # default: no nudge
+
+
 def test_camera_to_arm_mapping_labels_and_base_pose_overrides():
     wc = WorkcellConfig.model_validate(HW_WORKCELL)
     ids = [a.id for a in wc.arms]

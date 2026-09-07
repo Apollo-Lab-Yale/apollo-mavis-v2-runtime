@@ -13,9 +13,9 @@ workcells:
     cameras: []
     safety:
       safety_debug: false   # true = full hardware safety stack vs the sim cell
-profiles_dir: ~/apollo/profiles
-datasets_root: ~/apollo/datasets
-checkpoints_root: ~/apollo/checkpoints
+profiles_dir: ${APOLLO_HOME}/var/profiles
+datasets_root: ${APOLLO_HOME}/var/datasets
+checkpoints_root: ${APOLLO_HOME}/var/checkpoints
 control:
   rate_hz: 100
   teleop: {linear_mps: 0.12, angular_rps: 0.6, rail_mps: 0.10, gripper_frac_ps: 1.2}

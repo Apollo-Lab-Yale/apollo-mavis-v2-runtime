@@ -34,7 +34,7 @@ import pytest
 from apollo_mavis_v2_core import WorkcellConfig
 from apollo_mavis_v2_core.testing import FakeArm, FakeCamera
 from conftest import FakeMonitorFactory, FakeMonitorSample, make_runtime_config
-from fakes import HardwareFakeWorkcell
+from fakes import FakeServoLimits, HardwareFakeWorkcell
 from starlette.testclient import TestClient
 
 from apollo_mavis_v2_runtime.config import (
@@ -53,11 +53,14 @@ from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
 from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 from apollo_mavis_v2_runtime.server.app import create_app
 from apollo_mavis_v2_runtime.session.hardware import (
+    ExecutorCaps,
     RailFlipWorkcell,
+    apply_teleop_caps,
     bringup_rows,
     frozen_state,
     scale_control_config,
     scale_driver_config,
+    teleop_rate_caps,
 )
 from apollo_mavis_v2_runtime.session.types import SessionState
 
@@ -286,14 +289,81 @@ def test_speed_scale_on_the_host_side_config():
         scale_control_config(cfg, 0.0)
 
 
+def test_teleop_chain_is_capped_at_what_the_servo_stream_executes():
+    """2026-09-07: the tracker target chain ran at target_rate 1.0 m/s against a
+    streamer that executed 0.2 m/s (0.02 m/s at speed_scale 0.1; the caps are 0.4
+    m/s / 0.6 rad/s since the same day); every faster hand motion hit the leash and
+    the truncation was folded into the anchor - hand travel silently DISCARDED, and
+    the remainder still arriving up to a leash after the hand stopped. The caps
+    make the mapping faithful; no bound is lowered below what the streamer enforced
+    anyway. The numbers below are explicit ExecutorCaps, not the driver defaults."""
+    cfg = ControlConfig()  # 100 Hz, target_rate 1.0 m/s / 2.0 rad/s, dq_max 0.04, linear 0.12
+    caps = ExecutorCaps(
+        slew_rad_per_tick=0.003,
+        cart_step_m=0.002,
+        lever_arm_m=(1.0,) * 7,
+        source="servo",
+        joint_step_rad=0.003,
+    )
+    assert teleop_rate_caps(cfg, caps) == (pytest.approx(0.2), pytest.approx(0.3))
+    out = apply_teleop_caps(cfg, caps)
+    assert out.target_rate.v_mps == pytest.approx(0.2)  # 1.0 -> the streamer's 0.2 m/s
+    assert out.target_rate.w_radps == pytest.approx(0.3)  # 2.0 -> max_joint_vel 0.3 rad/s
+    assert out.dq_max_rad == pytest.approx(0.003)  # 0.04 -> 0.3 rad/s / 100 Hz
+    assert out.teleop.linear_mps == pytest.approx(0.12)  # already below the cap: kept
+    assert out.teleop.angular_rps == pytest.approx(0.3)  # 0.6 rad/s -> 0.3
+    # Not a speed of the servo stream: untouched.
+    assert out.teleop.rail_mps == cfg.teleop.rail_mps
+    assert out.teleop.gripper_frac_ps == cfg.teleop.gripper_frac_ps
+    assert out.leash == cfg.leash and out.jog == cfg.jog
+    # At speed_scale 0.1 the streamer executes 0.02 m/s: the chain follows.
+    scaled = scale_control_config(cfg, 0.1)
+    caps01 = ExecutorCaps(
+        slew_rad_per_tick=0.0003,
+        cart_step_m=0.0002,
+        lever_arm_m=(1.0,) * 7,
+        source="servo",
+        joint_step_rad=0.0003,
+    )
+    out01 = apply_teleop_caps(scaled, caps01)
+    assert out01.target_rate.v_mps == pytest.approx(0.02)
+    assert out01.teleop.linear_mps == pytest.approx(0.012)  # 0.12 * 0.1 < 0.02: kept
+    assert out01.dq_max_rad == pytest.approx(0.0003)
+    # No Cartesian bound published: only the joint-rate caps apply.
+    joint_only = ExecutorCaps(
+        slew_rad_per_tick=0.003, cart_step_m=None, lever_arm_m=None, joint_step_rad=0.003
+    )
+    assert teleop_rate_caps(cfg, joint_only) == (None, pytest.approx(0.3))
+    o = apply_teleop_caps(cfg, joint_only)
+    assert o.target_rate.v_mps == cfg.target_rate.v_mps and o.teleop.linear_mps == 0.12
+    assert o.target_rate.w_radps == pytest.approx(0.3)
+    # HOST-only caps (fakes without ServoLimits): the jog slew is NOT a servo bound
+    # and must not leak into teleop - the config comes back untouched.
+    host = ExecutorCaps(slew_rad_per_tick=0.002, cart_step_m=None, lever_arm_m=None)
+    assert teleop_rate_caps(cfg, host) == (None, None) and apply_teleop_caps(cfg, host) == cfg
+    # Caps looser than the host config change nothing either.
+    loose = ExecutorCaps(
+        slew_rad_per_tick=1.0, cart_step_m=1.0, lever_arm_m=None, source="servo", joint_step_rad=1.0
+    )
+    assert apply_teleop_caps(cfg, loose) == cfg
+    # The real driver's caps: joint_step_rad is the servo bound, slew the jog-bounded one.
+    from apollo_mavis_v2_runtime.session.hardware import servo_executor_caps
+
+    servo_caps = servo_executor_caps(FakeServoLimits(), 100.0, 0.002)  # scale-0.1 fakes
+    assert servo_caps.joint_step_rad == pytest.approx(0.0003)
+    assert servo_caps.slew_rad_per_tick == pytest.approx(0.0003)
+    assert teleop_rate_caps(cfg, servo_caps) == (pytest.approx(0.02), pytest.approx(0.03))
+
+
 def test_speed_scale_on_the_driver_side_config():
     hw = pytest.importorskip("apollo_mavis_v2_hardware")
     cfg = hw.XArmDriverConfig(arm_id="grip", ip="192.168.1.201", gripper="xarm_g2")
-    assert cfg.servo.max_joint_vel == (0.3,) * 7 and cfg.servo.max_cart_step_m == 0.002  # D2 caps
+    # D2 caps at scale 1.0, raised 2026-09-07 (0.3 rad/s / 2 mm were "over-conservative")
+    assert cfg.servo.max_joint_vel == (0.6,) * 7 and cfg.servo.max_cart_step_m == 0.004
     assert cfg.rail_speed_mm_s == 50
     scaled = scale_driver_config(cfg, 0.1)
-    assert scaled.servo.max_joint_vel == pytest.approx((0.03,) * 7)
-    assert scaled.servo.max_cart_step_m == pytest.approx(0.0002)
+    assert scaled.servo.max_joint_vel == pytest.approx((0.06,) * 7)
+    assert scaled.servo.max_cart_step_m == pytest.approx(0.0004)
     assert scaled.rail_speed_mm_s == 5 and isinstance(scaled.rail_speed_mm_s, int)
     assert scaled.servo.max_joint_acc == cfg.servo.max_joint_acc  # not a speed cap
     assert (scaled.arm_id, scaled.ip, scaled.tcp_load_kg) == ("grip", "192.168.1.201", 0.82)
@@ -428,9 +498,12 @@ def test_bringup_order_camera_adoption_gate_scale_and_teardown(client, rt, facto
         assert session.supervisor.twin is session.twin and session.twin is not None
         assert session.loop.workcell_kind == "hardware" and session.loop.gripper_arms == {"grip"}
         assert session.workcell is cell and session.inner_workcell is cell  # rail_flip off
-        # (f) speed scale 0.1 on the host side
+        # (f) speed scale 0.1 on the host side. These fakes publish no ServoLimits, so
+        #     the caps are host-only and the teleop chain is NOT capped further (the
+        #     servo-capped case is test_driver_factory_seam_receives_the_speed_scaled_caps).
         assert session.loop.cfg.dq_max_rad == pytest.approx(0.004)
         assert session.loop.cfg.teleop.linear_mps == pytest.approx(0.012)
+        assert session.loop.cfg.target_rate.v_mps == pytest.approx(0.1)
         # (h) phase-09d: both arms are session arms - nothing is frozen (D1 is the
         #     rail-homing job's mechanism now); the twin tracks both from the drivers
         assert session.frozen_arms == [] and session.planned_start is None
@@ -533,10 +606,14 @@ def test_driver_factory_seam_receives_the_speed_scaled_caps(client, rt, cells):
         base = hw.XArmDriverConfig(arm_id="grip", ip="192.168.1.201", gripper="xarm_g2")
         driver = driver_factory(base)  # an inert XArmDriver (nothing connects in the ctor)
         assert isinstance(driver, hw.XArmDriver)
-        assert driver.cfg.servo.max_joint_vel == pytest.approx((0.09,) * 7)
-        assert driver.cfg.servo.max_cart_step_m == pytest.approx(0.0006)
+        assert driver.cfg.servo.max_joint_vel == pytest.approx((0.18,) * 7)
+        assert driver.cfg.servo.max_cart_step_m == pytest.approx(0.0012)
         assert driver.cfg.rail_speed_mm_s == 15
+        # The session's cell is the FAKE workcell (its arms carry no ServoLimits), so the
+        # loop sees host-only caps and the teleop chain stays at the plain speed scale;
+        # the servo-capped values are pinned by test_teleop_chain_is_capped_... above.
         assert rt.manager.session.loop.cfg.dq_max_rad == pytest.approx(0.012)
+        assert rt.manager.session.loop.cfg.target_rate.v_mps == pytest.approx(0.3)
     finally:
         assert client.delete("/api/session").status_code == 204
 
@@ -914,7 +991,7 @@ def test_real_hardware_workcell_and_driver_over_fake_xarm_api(client, rt, factor
         assert driver.dof == 8 and driver.has_rail
         assert driver.cfg.rail_speed_mm_s == 5 and driver.cfg.servo.max_joint_vel[
             0
-        ] == pytest.approx(0.03)
+        ] == pytest.approx(0.06)
         assert driver.cfg.rail_homing == "require_homed"  # sessions never allow_unhomed
         assert api.rail_speed == 5 and api.homing_started == 0  # never homes at connect
         assert "set_linear_track_back_origin" not in api.call_names()
