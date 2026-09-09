@@ -85,6 +85,7 @@ def test_collect_session_rejects_moving_camera_frame(tmp_path):
         mode="collect", kind="sim", arms=["arm0"],
         frames={"arm0": "camera:arm0_wrist_cam"},
         sim_scene="single_rail", task="t",
+        return_to_start=False,  # no profile in this store: the D6 409 would come first
     )
     try:
         with pytest.raises(SessionError, match="not static"):

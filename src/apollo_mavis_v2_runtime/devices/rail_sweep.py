@@ -186,6 +186,7 @@ class RailSweepChecker:
             REGISTRY.build(self.scene_id, overrides),
             inflation_m=self.inflation_m,
             allowed_pairs_extra=self.workcell.safety.allowed_pairs_extra,
+            hysteresis_m=self.workcell.safety.hysteresis_m,
         )
         self._mujoco = mujoco
         logger.info(
@@ -365,11 +366,14 @@ class RailSweepChecker:
         rail_fallback_m: Mapping[str, float] | None = None,
         *,
         timeout_s: float = PLAN_TIMEOUT_S,
+        speed_scale: float = 0.1,
     ) -> PlanResult:
         """RRT-Connect on this twin from ``q_start7`` to ``q_goal7`` with the arm's
         rail slot LOCKED at its fallback (module docstring). Other arms are posed
         from ``samples`` like ``check``. Every returned waypoint is 8-dof with the
-        fallback in the rail slot; the twin's own qpos is restored afterwards."""
+        fallback in the rail slot; the twin's own qpos is restored afterwards.
+        ``speed_scale`` is the speed the plan will run at (the rail-homing job's 10 %):
+        a pinched start's escape is judged tick by tick at it (``PlanRequest``)."""
         from apollo_mavis_v2_sim.planner import ResetPlanner
 
         fallback = dict(rail_fallback_m or {})
@@ -402,6 +406,7 @@ class RailSweepChecker:
                         q_start={arm_id: [*map(float, q_start), rail_m]},
                         q_goal={arm_id: [*map(float, q_goal), rail_m]},
                         timeout_s=float(timeout_s),
+                        speed_scale=float(speed_scale),
                     )
                 )
             finally:

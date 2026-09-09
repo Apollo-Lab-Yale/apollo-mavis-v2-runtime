@@ -425,13 +425,35 @@ class HardwareFakeWorkcell(EventFakeWorkcell):
         self.on_bring_up = on_bring_up
         self.bringup_calls: list[float] = []  # timeout_s per call
         self.statuses: dict[str, FakeBringupStatus] = {}
+        self._follow_lock = threading.Lock()
+        self._followed_at: float | None = None
 
     def states(self):
         now = self._clock()
+        self._follow(now)
         return {
             arm_id: replace(arm.get_state(), t_mono=now, wallclock_ns=time.time_ns())
             for arm_id, arm in self.arms.items()
         }
+
+    def _follow(self, now: float) -> None:
+        """A real driver's servo stream follows the command between two state reads; a
+        plain ``FakeArm`` only moves when stepped and nothing steps it in a live session.
+        Step every plain ``FakeArm`` by the wall time since the last read (measured q
+        trails the command at the fake's 1 rad/s / 0.2 m/s), so the manager's
+        measured-arrival hand-over (2026-09-08) sees the arms arrive. A
+        ``FakeRailDriverArm`` has its own instant / servo-streamer model and is left
+        alone. Bounded to 0.1 s per read (a paused test must not teleport the fake)."""
+        with self._follow_lock:
+            last, self._followed_at = self._followed_at, now
+            if last is None:
+                return
+            dt = min(now - last, 0.1)
+            if dt <= 0.0:
+                return
+            for arm in self.arms.values():
+                if type(arm) is FakeArm:
+                    arm.step(dt)
 
     def bring_up(self, status_cb=None, timeout_s: float = 180.0) -> dict[str, FakeBringupStatus]:
         self.bringup_calls.append(float(timeout_s))

@@ -10,6 +10,7 @@ from apollo_mavis_v2_core.protocol import (
     ArmTelemetry,
     ClearanceItem,
     ControllerTelemetry,
+    DatasetsTelemetry,
     HardwareMonitorTelemetry,
     MicrophoneTelemetry,
     PoseMsg,
@@ -120,6 +121,26 @@ def build_hardware_monitor_telemetry(runtime) -> HardwareMonitorTelemetry:
     return block
 
 
+def build_datasets_telemetry(runtime) -> DatasetsTelemetry | None:
+    """``datasets`` block (2026-09-07; 04-runtime §13.3): the running / last LeRobot v3
+    export job's progress from the manager's ``DatasetStore``; ``None`` until an
+    export has run in this process. Session-less like ``microphone``."""
+    export = runtime.manager.dataset_store.export_telemetry()
+    return DatasetsTelemetry(export=export) if export is not None else None
+
+
+def build_external_telemetry(runtime, now: float):
+    """``external`` block (phase-12; 14-dora §13): bridge state + external-policy facts
+    + the idle arm reader's status. ``None`` never: the block always validates."""
+    dora = getattr(runtime, "dora", None)
+    if dora is None:
+        return None
+    try:
+        return dora.external_status(now)
+    except Exception:  # noqa: BLE001 - telemetry must never fail on the bridge
+        return None
+
+
 def build_telemetry(runtime, seq: int) -> TelemetryMsg:
     """One frame from the latest StateSnapshot + session manager state."""
     got = runtime.bus.snapshot.get()
@@ -127,6 +148,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
     snap = got[0] if got is not None and session is not None else None
     now = time.monotonic()
     arms: list[ArmTelemetry] = []
+    faults: dict = {}
     if snap is not None:
         # phase-09b (04-runtime §15): the loop's per-arm driver-fault text (kept
         # through RECOVERING, or a lingering Studio-conflict warning) + re-seed flag.
@@ -170,19 +192,35 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
         session=SessionTelemetry(
             state=runtime.manager.state.value,
             start_from_progress=session.start_from_progress if session else None,
-            plan_status=(
-                snap.session_extra.get("plan_status") if snap is not None else None
-            ),
+            plan_status=(snap.session_extra.get("plan_status") if snap is not None else None),
+            # in-process AsyncTrainer: not "dead"; Online DAgger (phase-14; 15-online-dagger
+            # §5): a fresh trainer_status (<= spec_stale_s) from the policy node's trainer role
             trainer_alive=(
-                dagger.trainer.state != "dead"
+                dagger.online_dagger.trainer_alive
+                if dagger is not None and dagger.online_dagger is not None
+                else dagger.trainer.state != "dead"
                 if dagger is not None and dagger.trainer is not None
                 else None
             ),
             bringup=runtime.manager.bringup_telemetry(),  # hardware bring-up rows (phase-09c)
+            # Which frame the translate keys act in right now (2026-09-08): read off the
+            # SESSION's control config, which the hardware bring-up scales/copies, not the
+            # top-level one.
+            translate_frame=(session.loop.cfg.translate_frame if session else None),
+            # 2026-09-08: the manager's session-level notice the arm rows do not carry -
+            # a refused / unplannable start_from, a Go-to-profile / `R` outcome, else the
+            # fault text while no arm row shows one (ActiveSession.notice).
+            fault_detail=(
+                session.notice(arms_carry_faults=any(str(v or "") for v in faults.values()))
+                if session
+                else ""
+            ),
         ),
         tracker=build_tracker_telemetry(runtime, snap, now),
         microphone=build_microphone_telemetry(runtime, now),
+        external=build_external_telemetry(runtime, now),
         hardware_monitor=build_hardware_monitor_telemetry(runtime),
+        datasets=build_datasets_telemetry(runtime),
     )
 
 
@@ -208,5 +246,7 @@ __all__ = [
     "build_telemetry",
     "build_tracker_telemetry",
     "build_microphone_telemetry",
+    "build_external_telemetry",
     "build_hardware_monitor_telemetry",
+    "build_datasets_telemetry",
 ]

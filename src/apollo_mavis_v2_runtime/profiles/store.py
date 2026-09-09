@@ -9,9 +9,7 @@ from apollo_mavis_v2_core import ArmPosture, ArmState, ProfileStore, StateProfil
 INITIAL_PROFILE_NAME = "initial"
 
 
-def _postures(
-    states: Mapping[str, ArmState], arms: list[str]
-) -> dict[str, ArmPosture]:
+def _postures(states: Mapping[str, ArmState], arms: list[str]) -> dict[str, ArmPosture]:
     out: dict[str, ArmPosture] = {}
     for arm_id in arms:
         st = states[arm_id]
@@ -58,11 +56,7 @@ def save_initial_overwrite(
     """Save the current state as the ``"initial"`` profile (OVERWRITE the
     existing same-name profile of this kind) and designate it initial."""
     existing = next(
-        (
-            p
-            for p in store.list()
-            if p.name == INITIAL_PROFILE_NAME and p.workcell_kind == kind
-        ),
+        (p for p in store.list() if p.name == INITIAL_PROFILE_NAME and p.workcell_kind == kind),
         None,
     )
     profile = StateProfile(

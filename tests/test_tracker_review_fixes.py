@@ -162,7 +162,10 @@ class DaggerRig:
         )
         self.loop = GatedPolicyExecutor(
             self.cell,
-            ControlConfig(target_rate=TargetRateConfig(v_mps=1e9, w_radps=1e9)),
+            ControlConfig(
+                target_rate=TargetRateConfig(v_mps=1e9, w_radps=1e9),
+                translate_frame="base",  # fake kin: TCP in q[:3] (see Rig in test_tracker_teleop)
+            ),
             self.bus,
             SafetySupervisor(NullGate(), InputWatchdog()),
             ["arm0", "arm1"],
@@ -407,7 +410,12 @@ def test_filter_reduces_target_jitter_versus_passthrough():
     raw_std = raw.std(axis=0).mean()
     filt_std = filt.std(axis=0).mean()
     assert raw_std > 0.002  # passthrough: the target jitters like the hand
-    assert filt_std < raw_std / 5, (raw_std, filt_std)
+    # >= 4x, not the 5x this asked for until 2026-09-07: an ADAPTIVE cutoff trades rest
+    # rejection for lag by construction, and the retune to beta 5.0 (which cut the ramp
+    # lag 131 -> 25 ms) measures 4.99x here. Rest jitter this size never reaches the arm
+    # anyway - the filter's own `deadband_m` (0 in this rig, 1 mm in the config) freezes
+    # the output exactly. Raising this bar again means lowering beta and paying the lag.
+    assert filt_std < raw_std / 4, (raw_std, filt_std)
     assert np.linalg.norm(filt.mean(axis=0)) < 2e-3  # centred, not biased
 
 
@@ -467,7 +475,7 @@ def test_filter_resets_on_engage_and_after_stale_gap():
 def test_filter_retune_via_tracker_settings_and_validation():
     rig = Rig(filter=True, filter_cfg=PoseFilterConfig(d_cutoff_hz=2.0, deadband_m=0.0))
     f = rig.tracker.pose_filter
-    assert (f.enabled, f.min_cutoff_hz, f.beta, f.cfg.d_cutoff_hz) == (True, 1.0, 0.05, 2.0)
+    assert (f.enabled, f.min_cutoff_hz, f.beta, f.cfg.d_cutoff_hz) == (True, 1.0, 5.0, 2.0)
     res = rig.act("tracker_settings", {"filter_min_cutoff_hz": 10.0, "filter_beta": 1.5})
     assert res.ok and "filter_min_cutoff_hz=10" in res.detail and "filter_beta=1.5" in res.detail
     assert (f.min_cutoff_hz, f.beta, f.enabled) == (10.0, 1.5, True)

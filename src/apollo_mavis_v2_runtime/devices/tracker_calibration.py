@@ -154,10 +154,14 @@ def validation_args(normal: Sequence[str], tmp_config: Path) -> list[str]:
     """Validation mode: frozen solution + the moving-mode sensor window."""
     return [
         *strip_calibration_args(normal),
-        "--configfile", str(tmp_config),
-        "--globalscenesolver", "0",
-        "--disable-calibrate", "1",
-        "--use-stationary-sensor-window", "0",
+        "--configfile",
+        str(tmp_config),
+        "--globalscenesolver",
+        "0",
+        "--disable-calibrate",
+        "1",
+        "--use-stationary-sensor-window",
+        "0",
     ]
 
 
@@ -334,7 +338,8 @@ def apply_persisted_yaw(cfg: RuntimeConfig) -> PersistedCalibration:
     if persisted.yaw_valid and persisted.yaw_deg is not None:
         cfg.tracker.yaw_deg = float(persisted.yaw_deg)
         logger.info(
-            "tracker yaw_deg %.2f from %s", cfg.tracker.yaw_deg,
+            "tracker yaw_deg %.2f from %s",
+            cfg.tracker.yaw_deg,
             PersistedCalibration.path_for(cfg.calibration_dir),
         )
     return persisted
@@ -1018,8 +1023,10 @@ class TrackerCalibration:
             steps = np.linalg.norm(np.diff(P, axis=0), axis=1)
             max_step = float(steps.max()) if len(steps) else 0.0
             passed = bool(
-                np.all(std < ccfg.validation_std_mm) and max_step < ccfg.validation_step_mm
-                and n >= min_samples and not lost
+                np.all(std < ccfg.validation_std_mm)
+                and max_step < ccfg.validation_step_mm
+                and n >= min_samples
+                and not lost
             )
             self._validation = CalibrationValidation(
                 samples=n,

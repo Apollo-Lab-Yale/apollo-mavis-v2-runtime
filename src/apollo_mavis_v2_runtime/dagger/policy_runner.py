@@ -127,8 +127,9 @@ class PolicyRunner:
         with self._out_lock:
             return self._out, self._out_t
 
-    def drop_and_requery(self) -> None:
-        """Handback: clear stale output, ``policy.reset()`` before next act."""
+    def drop_and_requery(self, reason: str = "handback") -> None:
+        """Handback / boundary: clear stale output, ``policy.reset()`` before next act
+        (``reason`` is the wire spelling an external source publishes; unused here)."""
         with self._out_lock:
             self._out = None
             self._out_t = -1e9
@@ -147,6 +148,17 @@ class PolicyRunner:
     def paused(self) -> bool:
         return self._paused
 
+    # -- PolicySource surface (14-dora §11.1; the executor reads these) -----------------
+    @property
+    def spec(self):
+        return self.policy.spec
+
+    def version_label(self) -> str:
+        return str(getattr(self.policy.spec, "version", 0))
+
+    def current_version(self) -> int:
+        return int(getattr(self.policy.spec, "version", 0))
+
     def staleness_scale(self, now: float) -> float:
         """1.0 fresh; linear decay to 0 over 5 periods past the timeout."""
         _, t = self.latest()
@@ -154,8 +166,7 @@ class PolicyRunner:
         timeout = self.period + POLICY_TIMEOUT_MARGIN_S
         if age <= timeout:
             return 1.0
-        return float(np.clip(1.0 - (age - timeout) / (STALE_DECAY_PERIODS * self.period),
-                             0.0, 1.0))
+        return float(np.clip(1.0 - (age - timeout) / (STALE_DECAY_PERIODS * self.period), 0.0, 1.0))
 
 
 class ActionAnchor:

@@ -192,9 +192,11 @@ def test_clutch_held_by_both_sources_takes_the_larger_scale():
     rig.tick()
     assert rig.cmd()[0] == pytest.approx(0.01)
     assert rig.loop.sources.scale_for(CLUTCH) == 1.0
-    # WS mid-ramp (scale 0.5) but the device still fresh: full step, not half.
-    t_last_rx = rig.t
-    rig.t = t_last_rx + 0.25
+    # WS mid-ramp (scale 0.5) but the device still fresh: full step, not half. The
+    # browser goes silent while the LOOP KEEPS TICKING (a 0.25 s jump with no ticks
+    # would read as a process stall and be forgiven, 2026-09-07).
+    rig.tick(24, heartbeat=False)
+    rig.t += DT  # 0.25 s after the last KeysMsg
     rig.sample([0.02, 0.0, 0.0])
     rig.loop.run_tick(rig.t)
     assert rig.loop.supervisor.watchdog.scale(rig.t) == pytest.approx(0.5)

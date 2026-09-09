@@ -23,7 +23,8 @@ workcells:
   # side effect; a box that is off shows `reachable: unreachable`. Sessions on this
   # workcell (phase-09c/09d, teleop only): POST /api/session kind=hardware brings up
   # BOTH arms (SessionSpec.arms must list every arm below, phase-09d) at
-  # `speed_scale` (default 10 %), adopts the preview cameras (no UVC re-open) and
+  # `speed_scale` (default 100 % since 2026-09-08 evening; 50 % was the 2026-09-07
+  # call), adopts the preview cameras (no UVC re-open) and
   # gates every command through a fresh mavis_v2 twin; it is refused (409) while an
   # arm's rail is unhomed, its controller has an error latched, the read-only
   # monitor has no sample of it, or a rail homing is in progress. Only the
@@ -115,16 +116,41 @@ workcells:
 # config.py: $APOLLO_HOME if the launcher/systemd export it, else inferred from this
 # file's location). A fresh clone runs with everything under <ws>/var and no ~/apollo.
 profiles_dir: ${APOLLO_HOME}/var/profiles
-datasets_root: ${APOLLO_HOME}/var/datasets
+datasets_root: ${APOLLO_HOME}/var/datasets        # GENERIC dataset root: <root>/<ns>/<name> for every namespace not mapped below (the phase-07..13 apollo/... data stays listable)
+# Per-namespace dataset roots (operator decision 2026-09-08; 15-online-dagger §7 / D5). Repo ids keep
+# the <ns>/<name> grammar; only WHERE a namespace lives changes. A bare `dataset: "<name>"` in a
+# collect launch resolves into default_namespace. Roots expand ~ / ${APOLLO_HOME} like datasets_root.
+datasets:
+  default_namespace: bc_demo                      # Data Collection records demonstrations as bc_demo/<name>
+  namespaces:
+    bc_demo:    {root: ~/data/bc_demo}                       # -> ~/data/bc_demo/<name>
+    online_dagger: {root: ~/data/online_dagger, subdir: rollouts}  # -> ~/data/online_dagger/<session>/rollouts (next to session.json; the trainer's own files live beside them)
 checkpoints_root: ${APOLLO_HOME}/var/checkpoints
+# Online DAgger (phase-14; 15-online-dagger §7): the runtime's side only - it is the
+# algorithm-agnostic shell, the trainer node configures itself. skill_dir null = the skill
+# shipped inside the package (GET /api/online_dagger/skill[.tgz]); session_file_hz caps
+# session.json rewrites outside transitions. Same values as the model defaults.
+online_dagger:
+  skill_dir: null
+  session_file_hz: 1.0
 calibration_dir: ${APOLLO_HOME}/var/calibration   # tracker_calibration.json (applied yaw, base-station install) + libsurvive config copies (phase-10 wizard)
 control:
   rate_hz: 100
   teleop: {linear_mps: 0.12, angular_rps: 0.6, rail_mps: 0.10, gripper_frac_ps: 1.2}
+  # Frame the keyboard TRANSLATE keys (W/S/A/D/E/Q) act in (04-runtime §6). world = the
+  # DEFAULT (operator decision 2026-09-08 evening; camera was that morning's default): the
+  # operator frame, fixed to the table - W away from the operator (-Y), A to their left (+X),
+  # E up. camera = the ACTIVE arm's wrist camera - W along the optical axis, A/D image
+  # left/right, E/Q image up/down, so the keys keep matching the wrist stream after any
+  # rotation (E/Q are then image up/down, not world up/down). base = the pre-2026-09-08
+  # arm-base axes, which in this cell read yawed 180 deg against the operator's view.
+  # Rotations (I/K/J/L/U/O) are about the TCP axes in every setting; the policy action
+  # frame (arm_base:<id>) is unaffected.
+  translate_frame: world
   leash: {pos_m: 0.025, rot_rad: 0.2}
   target_rate: {v_mps: 1.0, w_radps: 2.0}   # tracker target rate limit toward the hand, m/s and rad/s (> 0; per-tick cap = rate*dt; 04-runtime §6)
   dq_max_rad: 0.04
-  jog: {slew_rad_per_tick: 0.02, rail_m_per_tick: 0.002, goto_threshold_rad: 0.15}
+  jog: {slew_rad_per_tick: 0.02, rail_m_per_tick: 0.002}   # joint panel: constant-speed approach, any delta
   watchdog: {stale_s: 0.2, ramp_s: 0.1}
   health_log_every_s: 1.0   # control-loop INFO health line period (tick rate, clutch, tracker ages, gate, IK slips, servo stats); 0 = off
 telemetry_hz: 25
@@ -212,8 +238,16 @@ twin_overlay:
   principal_offset_px: {view_wrist: [21.0, 13.0]}
   stream_suffix: _align
 # Real-cell sessions (phase-09c/09d; 04-runtime §5/§14). default_speed_scale is what
-# the Hardware tab pre-selects (first live runs at 10 %; SessionSpec.speed_scale
-# decides). Since phase-09d a hardware session always includes BOTH arms
+# the Hardware tab pre-selects - 1.0 since the evening of 2026-09-08 (operator decision
+# after a day of live sessions; 0.5 was the 2026-09-07 call, the 10 % default was for the
+# first live runs only; segments 10/50/100 %); SessionSpec.speed_scale decides; the UI's
+# DEFAULT_SPEED_SCALE mirrors it. plan_gate_hold_s (2026-09-08 evening): a twin-planned
+# motion the safety gate holds for longer than this with no waypoint progress is cancelled
+# by the loop at once, naming the blocking pair ("held by the safety gate: <a> / <b> at
+# <mm> mm") instead of sitting still until the 30 s return budget - on 2026-09-08 a
+# reset_to_initial executed both arms' sequentially planned paths at the same time and
+# sat gate-blocked at 5.2 mm; plans now execute ONE ARM AT A TIME in the planner's
+# arm_order (04-runtime §10.5). Since phase-09d a hardware session always includes BOTH arms
 # (SessionSpec.arms must equal the arms above, else 409) - the phase-09c
 # default_arms key is gone. rail_flip maps the track register onto the twin's rail
 # slot as q_sim = 0.65 - q_track for the overlay AND the gate / sweep twins -- home
@@ -225,7 +259,8 @@ twin_overlay:
 hardware_session:
   armed: false                # arming switch: real drivers connect / rails home ONLY when true.
                               # Repo default false (tests, dev instances); the lab render sets true.
-  default_speed_scale: 0.1
+  default_speed_scale: 1.0    # 100 % (2026-09-08 evening); 50 % was the 2026-09-07 call
+  plan_gate_hold_s: 3.0       # gate-held abort of a running plan (s); 0 = the first held tick
   rail_flip: false
   home_rail_inflation_m: 0.025
   home_rail_step_m: 0.005
@@ -267,23 +302,18 @@ tracker:
   # accept any input except trigger_click (held-only). The system button is not
   # bindable (menu+system = dongle pairing combo). The `fake` backend has no
   # buttons; unit/e2e tests script a controller state.
-  # 2026-09-07: the GRIPPER moved OFF the trackpad onto the two plain buttons.
-  # The wand has exactly six bindable inputs once the trigger is the clutch (four
-  # trackpad directions + menu + grip), so four actions must live on the pad; a
-  # trackpad click is only usable once its direction is classified from the pad
-  # position at the press edge, which makes it the least reliable input. The
-  # operator reported the gripper needing "a trigger press first" before it
-  # responded, so the two actions that must never miss are now plain buttons and
-  # arm switching (which the keyboard and the UI also offer) took their place on
-  # the pad. Swap them back here if the pad turns out to be reliable.
+  # THE OPERATOR'S MAPPING - do not change it without being asked (2026-09-07: it
+  # was briefly remapped to work around the trackpad's stale-axes bug and that was
+  # the wrong call; the bug itself is fixed in the reader's late classification,
+  # devices/tracker.py note_edges, so the pad is reliable again).
   controller_map:
     clutch: trigger_click                     # trigger button (id 0) pressed (held)
-    gripper_close: grip_click                 # side grip button (id 7) held -> closes (held, rate)
-    gripper_open: menu_click                  # menu button (id 6) held -> opens (held, rate)
+    gripper_open: trackpad_up                 # trackpad click, y dominant and positive (held, rate)
+    gripper_close: trackpad_down              # trackpad click, y dominant and negative (held, rate)
     rail_neg: trackpad_left                   # trackpad click, x dominant and negative (held)
     rail_pos: trackpad_right                  # trackpad click, x dominant and positive (held)
-    arm_next: trackpad_up                     # trackpad click, y dominant and positive (discrete)
-    arm_prev: trackpad_down                   # trackpad click, y dominant and negative (discrete)
+    arm_next: menu_click                      # menu button (id 6) press edge (discrete)
+    arm_prev: none                            # keyboard KeyZ / gamepad LB only
   trackpad_deadzone: 0.3                      # |x| and |y| both within this -> click ignored
   # One Euro pose filter on the aligned tracker pose, run in the provider at the
   # 100 Hz tick before the anchor/delta math (13-tracker §4 "Pose filter"):
@@ -292,12 +322,21 @@ tracker:
   # on clutch engage and after stale/invalid gaps. enabled / min_cutoff_hz /
   # beta are live-tunable via the tracker_settings action (filter_* fields);
   # telemetry echoes them and reports tracker.pose_filtered.
+  # RETUNED 2026-09-07 after measuring this filter as the OTHER half of the teleop lag
+  # (the first half was the host chain outrunning the servo streamer, see apply_teleop_caps):
+  # beta is Hz per (m/s), so the old 0.05 added 0.015 Hz at a 0.3 m/s hand, the cutoff never
+  # left 1.0 Hz, and it was a FIXED 159 ms low-pass = 39 mm behind at 0.3 m/s, past the 25 mm
+  # leash, so the leash truncated every tick and slip() discarded real hand travel. beta 5.0
+  # is 7.6 mm / ~25 ms there and still passes the >= 4x rest-jitter contract; d_cutoff_hz
+  # stays 1.0 on purpose (raising it buys ~8 ms and costs a third of the jitter rejection —
+  # the wrong trade while libsurvive keeps corrupting the lighthouse calibration).
+  # control/pose_filter.py has the numbers and the two experiments to re-run.
   filter:
     enabled: true
     min_cutoff_hz: 1.0                        # 0.05-50; lower = smoother at rest, more lag
-    beta: 0.05                                # 0-5; higher = less lag during fast motion
-    d_cutoff_hz: 1.0                          # cutoff of the velocity estimate
-    deadband_m: 0.002                         # rest deadband, position (m)
+    beta: 5.0                                 # 0-200, Hz per (m/s); higher = less lag when moving
+    d_cutoff_hz: 1.0                          # velocity-estimate cutoff; raising it couples noise in
+    deadband_m: 0.001                         # rest deadband, position (m)
     deadband_rad: 0.005                       # rest deadband, orientation (rad)
   # Calibration wizard (Devices page; 13-tracker §4 "Calibration modes"). Base
   # station: capture >= min_scenes GSS scenes (controller parked still >= 3 s per
@@ -315,3 +354,52 @@ tracker:
     yaw_min_leg_m: 0.10                       # each horizontal gesture leg at least this long
     yaw_max_residual_deg: 15.0                # mean leg misalignment after the fit
     yaw_capture_average_s: 0.3                # a click averages the raw positions of this window
+# External interface over dora-rs 1.0 (phase-12; docs/design/14-dora-interface.md). OFF in the
+# tracked config: with `enabled: false` the runtime is byte-for-byte the phase-11 runtime. When
+# on, the runtime owns a PRIVATE coordinator + daemon on the ports below (never the machine-
+# global 6013 / 53291), attaches as the dynamic node `mavis_runtime` and publishes, for the
+# whole process lifetime, both wrist cameras (+ the Perception Arm's depth sibling when a
+# producer has depth) with the camera pose stamped on every frame, both arms' states (from the
+# read-only monitor between sessions), the microphone, telemetry, the `session` contract
+# message and `events`; the ONLY inbound command family is the external policy's
+# (`policy_action`, sessions with `policy_source: external`). Nothing on the bus can move an
+# arm outside a session. bind_host: 127.0.0.1 = same-host consumers only; the lab render
+# (DORA_BIND_HOST=wlp38s0 -> the APOLLO Lab Wi-Fi, 192.168.0.88 on 2026-09-07, DHCP) binds the
+# LAN so machines listed under `machines` can join with their own `dora daemon --machine-id`;
+# 0.0.0.0 and the arm-link addresses 192.168.1.11 / 192.168.2.12 are refused. Consumers read
+# the connection facts from GET /api/dora (`python -m apollo_mavis_v2_runtime.dora_bridge.nodes.env`).
+dora:
+  enabled: false
+  node_id: mavis_runtime
+  dataflow_name: mavis_v2
+  bind_host: 127.0.0.1          # IPv4 or interface name (wlp38s0 / tailscale0), resolved at start
+  machine_id: lab
+  machines: []                  # e.g. [{id: gpubox, placeholders: [viewer, observer]}]
+  rescan_s: 5.0                 # registered-daemon poll (dora doctor): REST-visible only - placeholders
+                                # come with POST /api/dora/machines/{id}/join (14-dora §16.1)
+  join_attach_timeout_s: 30.0   # the remote consumer must attach within this after its join
+  auth: null                    # null = on whenever bind_host is not loopback; token in var_dir/.dora-token
+  coordinator_port: 6113
+  daemon_port: 53391
+  zenoh_port: 7447
+  var_dir: ${APOLLO_HOME}/var/dora   # rendered YAML, out/, lock, token, node-stdout.log
+  attach_retry_s: [1.0, 10.0]
+  bus_poll_s: 0.002
+  publish:
+    state_hz: 50                # arm_state / arm_cmd while a session runs (<= control.rate_hz)
+    idle_state_hz: 10           # arm_state between sessions (read-only source)
+    obs_hz: 30                  # obs_state (dagger / inference)
+    obs_in_collect: false
+    cameras: all                # all | [camera ids]
+    depth_cameras: [view_wrist_cam]   # sim depth sibling / hardware depth publish list
+    image_pose: true            # q / tcp_pose_world / camera_pose_world / intrinsics on wrist frames
+    audio: true
+    telemetry: true
+    events: true
+    idle_source: monitor        # hardware arm states between sessions: monitor (phase-09a read-only
+                                #   client, zero extra connections) | driver (own read-only XArmDriver)
+  policy:
+    spec_stale_s: 3.0           # no policy_spec heartbeat -> policy_attached false -> hold
+    max_obs_age_s: 0.5          # actions referencing older observations are dropped
+  log:
+    quiet_node_diagnostics: true   # fd-1 redirect of dora's stdout JSON WARN flood to var_dir/node-stdout.log

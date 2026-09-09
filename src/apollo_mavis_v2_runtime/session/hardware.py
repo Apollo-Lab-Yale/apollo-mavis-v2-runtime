@@ -432,6 +432,15 @@ class ExecutorCaps:
     # (``apply_teleop_caps``) must follow the servo bound alone, never the jog's.
     # None = no driver published one (host-only caps: teleop is left untouched).
     joint_step_rad: float | None = None
+    # The carriage's per-loop-tick step the TRACK can actually follow: the driver
+    # config's ``rail_speed_mm_s`` (already speed-scaled) / the loop rate. Without it
+    # (2026-09-08 review) the executor slewed the rail slot at ``jog.rail_m_per_tick``
+    # x scale = 0.2 m/s at 100 % while the track positions at 50 mm/s x scale toward
+    # latest-wins targets, so an arm was declared arrived up to ~10 s before its
+    # carriage physically got there - and the next arm of a sequence started moving
+    # against a carriage the gate believed parked (it checks the COMMANDED q). None =
+    # no driver published a rail speed (sim, fakes): the host value stands.
+    rail_m_per_tick: float | None = None
 
 
 def servo_executor_caps(
@@ -482,19 +491,34 @@ def executor_caps_for(
     does, ``fallback_servo`` (scaled by ``scale``) or else the host slew alone."""
     host = float(cfg.jog.slew_rad_per_tick)
     found: list[ExecutorCaps] = []
+    rail_caps: list[float] = []  # m per loop tick the connected tracks can follow
     for arm in arms:
-        servo = getattr(getattr(arm, "cfg", None), "servo", None)
+        driver_cfg = getattr(arm, "cfg", None)
+        servo = getattr(driver_cfg, "servo", None)
         if servo is not None and hasattr(servo, "max_joint_vel"):
             found.append(servo_executor_caps(servo, cfg.rate_hz, host))
+        rail_mm_s = getattr(driver_cfg, "rail_speed_mm_s", None)
+        if rail_mm_s is not None and float(rail_mm_s) > 0.0:
+            rail_caps.append(float(rail_mm_s) / 1000.0 / float(cfg.rate_hz))
+    rail = min(rail_caps) if rail_caps else None
     if not found and fallback_servo is not None:
         found.append(servo_executor_caps(fallback_servo, cfg.rate_hz, host, scale=scale))
     if not found:
-        return ExecutorCaps(slew_rad_per_tick=host, cart_step_m=None, lever_arm_m=None)
+        return ExecutorCaps(
+            slew_rad_per_tick=host, cart_step_m=None, lever_arm_m=None, rail_m_per_tick=rail
+        )
     tight = min(found, key=lambda c: c.slew_rad_per_tick)
     cart = min(c.cart_step_m for c in found if c.cart_step_m is not None)
     lever = max((c.lever_arm_m for c in found if c.lever_arm_m is not None), key=lambda lv: sum(lv))
     joint = min(c.joint_step_rad for c in found if c.joint_step_rad is not None)
-    return ExecutorCaps(tight.slew_rad_per_tick, cart, lever, source="servo", joint_step_rad=joint)
+    return ExecutorCaps(
+        tight.slew_rad_per_tick,
+        cart,
+        lever,
+        source="servo",
+        joint_step_rad=joint,
+        rail_m_per_tick=rail,
+    )
 
 
 def teleop_rate_caps(cfg: ControlConfig, caps: ExecutorCaps) -> tuple[float | None, float | None]:
@@ -570,10 +594,16 @@ def apply_teleop_caps(cfg: ControlConfig, caps: ExecutorCaps) -> ControlConfig:
 
 def apply_executor_caps(cfg: ControlConfig, caps: ExecutorCaps) -> ControlConfig:
     """``cfg`` with the ``PlanExecutor`` bounded by ``caps`` (``jog.slew_rad_per_tick``
-    lowered to the cap; ``jog.plan_cart_step_m`` / ``plan_lever_arm_m`` set)."""
+    lowered to the cap; ``jog.plan_cart_step_m`` / ``plan_lever_arm_m`` set;
+    ``jog.rail_m_per_tick`` lowered to the track's own positioning speed when a driver
+    published one - the commanded carriage then never runs ahead of the track)."""
+    rail = float(cfg.jog.rail_m_per_tick)
+    if caps.rail_m_per_tick is not None:
+        rail = min(rail, float(caps.rail_m_per_tick))
     jog = cfg.jog.model_copy(
         update={
             "slew_rad_per_tick": min(float(cfg.jog.slew_rad_per_tick), caps.slew_rad_per_tick),
+            "rail_m_per_tick": rail,
             "plan_cart_step_m": caps.cart_step_m,
             "plan_lever_arm_m": caps.lever_arm_m,
         }

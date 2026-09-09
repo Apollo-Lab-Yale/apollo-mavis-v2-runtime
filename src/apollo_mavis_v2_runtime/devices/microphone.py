@@ -101,6 +101,10 @@ class MicFrame:
     clipping: bool
     env_min: tuple[int, ...]  # bins x int8 (-127..127) relative to the frame peak, time-ordered
     env_max: tuple[int, ...]
+    # additive (phase-12; 14-dora §4.2 "Microphone"): the frame's float32 mono PCM samples
+    # in [-1, 1] (frame_len = sample_rate / frame_hz); None only for producers that never
+    # retained them. Read-only by convention (published latest-wins).
+    samples: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -190,7 +194,10 @@ def list_pulse_sources(timeout_s: float = PACTL_TIMEOUT_S) -> list[PulseSource]:
     ``error`` and retry."""
     proc = subprocess.run(
         ["pactl", "-f", "json", "list", "sources"],
-        capture_output=True, text=True, timeout=timeout_s, check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        check=False,
     )
     if proc.returncode == 0:
         try:
@@ -203,16 +210,21 @@ def list_pulse_sources(timeout_s: float = PACTL_TIMEOUT_S) -> list[PulseSource]:
                 if not isinstance(row, dict) or "name" not in row:
                     continue
                 props = row.get("properties") or {}
-                out.append(PulseSource(
-                    index=int(row.get("index", -1)),
-                    name=str(row["name"]),
-                    description=str(row.get("description") or ""),
-                    properties={str(k): str(v) for k, v in props.items()},
-                ))
+                out.append(
+                    PulseSource(
+                        index=int(row.get("index", -1)),
+                        name=str(row["name"]),
+                        description=str(row.get("description") or ""),
+                        properties={str(k): str(v) for k, v in props.items()},
+                    )
+                )
             return out
     short = subprocess.run(
         ["pactl", "list", "sources", "short"],
-        capture_output=True, text=True, timeout=timeout_s, check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        check=False,
     )
     if short.returncode != 0:
         raise OSError(
@@ -247,14 +259,16 @@ def match_source(sources: list[PulseSource], needle: str) -> PulseSource | None:
         if src.is_monitor:
             continue
         props = src.properties
-        hay = " | ".join([
-            src.name,
-            src.description,
-            props.get("device.product.name", ""),
-            props.get("device.description", ""),
-            props.get("alsa.card_name", ""),
-            props.get("alsa.long_card_name", ""),
-        ])
+        hay = " | ".join(
+            [
+                src.name,
+                src.description,
+                props.get("device.product.name", ""),
+                props.get("device.description", ""),
+                props.get("alsa.card_name", ""),
+                props.get("alsa.long_card_name", ""),
+            ]
+        )
         if want in _norm(hay):
             return src
     return None
@@ -262,8 +276,14 @@ def match_source(sources: list[PulseSource], needle: str) -> PulseSource | None:
 
 def parec_argv(source: str, sample_rate: int) -> list[str]:
     return [
-        "parec", "-d", source, "--format=s16le", f"--rate={int(sample_rate)}",
-        "--channels=1", "--raw", f"--latency-msec={PAREC_LATENCY_MSEC}",
+        "parec",
+        "-d",
+        source,
+        "--format=s16le",
+        f"--rate={int(sample_rate)}",
+        "--channels=1",
+        "--raw",
+        f"--latency-msec={PAREC_LATENCY_MSEC}",
     ]
 
 
@@ -286,8 +306,12 @@ class _SounddeviceCapture:
                 self.overruns += 1
 
         self._stream = sd.InputStream(
-            device="pulse", samplerate=int(sample_rate), channels=1, dtype="float32",
-            blocksize=int(frame_len), callback=callback,
+            device="pulse",
+            samplerate=int(sample_rate),
+            channels=1,
+            dtype="float32",
+            blocksize=int(frame_len),
+            callback=callback,
         )
         self._stream.start()
 
@@ -312,7 +336,10 @@ class _ParecCapture:
     def __init__(self, argv: list[str], frame_len: int) -> None:
         self.overruns = 0
         self._proc = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
             bufsize=0,
         )
         assert self._proc.stdout is not None
@@ -394,17 +421,22 @@ class MicrophoneReader:
         else:
             self._detail = ""
         self._kind: MicKind = (
-            "none" if (not cfg.enabled or cfg.backend == "none")
+            "none"
+            if (not cfg.enabled or cfg.backend == "none")
             else ("fake" if cfg.backend == "fake" else "pulse")
         )
         self._source: str | None = None
         self._seq = 0
+        self._sinks: list[Callable[[np.ndarray, float], None]] = []  # raw-block sinks
         self._last: MicFrame | None = None
         self._rx_times: deque[float] = deque(maxlen=256)
         self._overruns = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lifecycle = threading.RLock()
+        # phase-12 (14-dora §2.5): observers invoked with every published MicFrame on the
+        # capture thread (the dora MicTap); never block, never raise.
+        self.taps: list[Callable[[MicFrame], None]] = []
 
     # -- lifecycle -----------------------------------------------------------------------
     @property
@@ -485,21 +517,52 @@ class MicrophoneReader:
             last=last,
         )
 
+    # -- raw-sample sinks (recorder audio sidecars, 04-runtime §10.5) ----------------------
+    def add_sink(self, fn: Callable[[np.ndarray, float], None]) -> None:
+        """Register ``fn(samples, rx_mono)`` for every captured block (called on the
+        capture thread; the float32 mono block is the reader's own array — copy it).
+        Telemetry keeps publishing stats only; sinks are how an episode recorder
+        gets the raw audio without a second Pulse client."""
+        with self._lock:
+            if fn not in self._sinks:
+                self._sinks = [*self._sinks, fn]
+
+    def remove_sink(self, fn: Callable[[np.ndarray, float], None]) -> None:
+        with self._lock:
+            self._sinks = [s for s in self._sinks if s is not fn]
+
     # -- publishing (capture thread) -------------------------------------------------------
     def _publish(self, samples: np.ndarray, rx: float) -> MicFrame:
         peak_dbfs, rms_dbfs, clipping, env_min, env_max = frame_stats(samples, self.cfg.bins)
         with self._lock:
             self._seq += 1
             frame = MicFrame(
-                seq=self._seq, rx_mono=rx, rms_dbfs=rms_dbfs, peak_dbfs=peak_dbfs,
-                clipping=clipping, env_min=tuple(env_min.tolist()),
+                seq=self._seq,
+                rx_mono=rx,
+                rms_dbfs=rms_dbfs,
+                peak_dbfs=peak_dbfs,
+                clipping=clipping,
+                env_min=tuple(env_min.tolist()),
                 env_max=tuple(env_max.tolist()),
+                samples=np.ascontiguousarray(samples, dtype=np.float32),
             )
             self._last = frame
             self._rx_times.append(rx)
             if self._status != "live":
                 self._status, self._detail = "live", ""
+            sinks = self._sinks
         self.slot.put(frame)
+        for fn in sinks:  # never let a sink break the capture loop
+            try:
+                fn(samples, rx)
+            except Exception:  # noqa: BLE001
+                logger.exception("microphone sink failed; removing it")
+                self.remove_sink(fn)
+        for tap in self.taps:
+            try:
+                tap(frame)
+            except Exception:  # noqa: BLE001 - a tap never breaks capture
+                logger.exception("microphone tap failed")
         return frame
 
     # -- fake backend: amplitude-modulated sine at frame_hz ----------------------------------
@@ -666,9 +729,15 @@ class MicrophoneReader:
 # -- wire conversions (REST + telemetry share one status) ----------------------------------
 def to_info(st: MicrophoneDeviceStatus) -> MicrophoneInfo:
     return MicrophoneInfo(
-        mic_id=st.mic_id, label=st.label, kind=st.kind, source=st.source,
-        sample_rate=st.sample_rate, channels=st.channels, live=st.status == "live",
-        status=st.status, detail=st.detail,
+        mic_id=st.mic_id,
+        label=st.label,
+        kind=st.kind,
+        source=st.source,
+        sample_rate=st.sample_rate,
+        channels=st.channels,
+        live=st.status == "live",
+        status=st.status,
+        detail=st.detail,
     )
 
 

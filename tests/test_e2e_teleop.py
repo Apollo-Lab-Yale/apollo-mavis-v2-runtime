@@ -4,6 +4,7 @@ profiles, start_from (验收标准 items)."""
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import httpx
@@ -64,17 +65,63 @@ class Ctl:
         self.sock.close()
 
 
+class PulsingCtl(Ctl):
+    """``Ctl`` + the Cockpit's 25 Hz heartbeat: the real UI streams its (possibly
+    empty) held set continuously from the hello on, so the runtime's deadman never
+    trips between two key presses and a return-to-start is never skipped as
+    "browser input latched". One lock serialises the socket between the heartbeat
+    thread and the test's actions."""
+
+    def __init__(self, server) -> None:
+        super().__init__(server)
+        self._lock = threading.Lock()
+        self._held: list[str] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._beat, name="ctl-heartbeat", daemon=True)
+        self._thread.start()
+
+    def _beat(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                try:
+                    super().keys(list(self._held))
+                except Exception:  # noqa: BLE001 - socket closed by the test
+                    return
+            self._stop.wait(0.04)
+
+    def keys(self, held: list[str]) -> None:  # type: ignore[override]
+        with self._lock:
+            self._held = list(held)
+            super().keys(list(held))
+
+    def hold(self, held: list[str], duration_s: float) -> None:  # type: ignore[override]
+        self.keys(held)
+        time.sleep(duration_s)
+        self.keys([])
+
+    def action(self, name: str, args: dict | None = None) -> dict:  # type: ignore[override]
+        with self._lock:
+            return super().action(name, args)
+
+    def close(self) -> None:  # type: ignore[override]
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        super().close()
+
+
 class Tele:
     def __init__(self, server):
         self.sock = ws_connect(f"{server.ws}/ws/telemetry")
 
     def latest(self) -> dict:
-        """Drain queued frames; return the newest (blocks for one if empty)."""
-        msg = json.loads(self.sock.recv(timeout=5))
+        """The first frame PRODUCED after this call (``ts`` is the in-process server's
+        monotonic clock): a drain-with-tiny-timeout returned stale backlog frames under
+        GIL contention (2026-09-07), which read as "the arm never moved"."""
+        t0 = time.monotonic()
+        deadline = t0 + 5.0
         while True:
-            try:
-                msg = json.loads(self.sock.recv(timeout=0.001))
-            except TimeoutError:
+            msg = json.loads(self.sock.recv(timeout=max(0.01, deadline - time.monotonic())))
+            if msg.get("ts", 0.0) >= t0 or time.monotonic() > deadline:
                 return msg
 
     def ee_x(self) -> float:
@@ -181,13 +228,26 @@ def test_joint_panel_jog_goto_and_cancel(server, api, session):
         assert ack["ok"], ack
         time.sleep(0.8)
         assert abs(tele.q_full()[3] - target[3]) < 0.02
-        # jog with max|dq| > 0.15 rad: nacked, must use goto.
+        # A jog of ANY size is accepted since 2026-09-07 (the 0.15 rad `goto_threshold_rad`
+        # nack is gone): `JogState.step` walks from the last commanded q at
+        # `jog.slew_rad_per_tick`, so a big delta is simply a longer constant-speed move and
+        # every intermediate posture still goes through the gate. The per-tick rate is pinned
+        # in test_loop_units.py; here only the ack and the arrival matter (no timing window).
+        # Joint 6, so the goto leg below still has joint 2 to itself.
+        lo5, hi5 = api.get("/api/workcell").json()["arms"][0]["joint_limits"][5]
+        big_jog = list(tele.q_full())
+        big_jog[5] = min(hi5 - 0.05, max(lo5 + 0.05, big_jog[5] + 0.4))
+        assert abs(big_jog[5] - tele.q_full()[5]) > 0.3  # the point: far past the old threshold
+        ack = ctl.action("joint_target",
+                         {"arm_id": "arm0", "positions": big_jog, "mode": "jog"})
+        assert ack["ok"] and ack["detail"] == "jog", ack
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and abs(tele.q_full()[5] - big_jog[5]) > 0.02:
+            time.sleep(0.02)
+        assert abs(tele.q_full()[5] - big_jog[5]) < 0.02  # walked all the way, no nack, no jump
+        # Same-size delta on joint 2 as a goto: accepted; runs via the twin planner.
         big = list(tele.q_full())
         big[1] += 0.4
-        ack = ctl.action("joint_target",
-                         {"arm_id": "arm0", "positions": big, "mode": "jog"})
-        assert not ack["ok"] and "goto" in ack["detail"]
-        # Same target as goto: accepted; runs via the twin planner.
         ack = ctl.action("joint_target",
                          {"arm_id": "arm0", "positions": big, "mode": "goto"})
         assert ack["ok"] and ack["detail"] == "accepted"
@@ -249,6 +309,7 @@ def test_profile_flows_and_start_from(server, api):
         rows = api.get("/api/profiles").json()
         initials = [p for p in rows if p["is_initial_condition"]]
         assert [p["profile_id"] for p in initials] == [initial_id]
+        assert all(p["workcell_kind"] == "sim" for p in rows)  # 2026-09-07: kind on the wire
         assert {p["name"] for p in rows} >= {"wide", "initial"}
         # Deleting the designated initial profile is refused.
         assert api.delete(f"/api/profiles/{initial_id}").status_code == 409
@@ -267,16 +328,24 @@ def test_profile_flows_and_start_from(server, api):
     try:
         deadline = time.monotonic() + 30.0
         blocked = False
+        seen_plan = False  # the plan must have been OBSERVED executing / done before we judge
         while time.monotonic() < deadline:
             msg = tele.latest()
             blocked |= msg["collision"]["severity"] == "blocked"
-            if (msg.get("session") or {}).get("state") == "running" and (
-                (msg.get("session") or {}).get("plan_status")
-                not in ("planning", "executing")
+            session_block = msg.get("session") or {}
+            status = session_block.get("plan_status")
+            progress = session_block.get("start_from_progress")
+            if status in ("executing", "done") or progress is not None:
+                seen_plan = True
+            if (
+                seen_plan
+                and session_block.get("state") == "running"
+                and status not in ("planning", "executing")
             ):
                 break
-            time.sleep(0.05)
-        time.sleep(0.3)
+            time.sleep(0.02)
+        assert seen_plan, "start_from plan never showed up on telemetry"
+        time.sleep(0.5)
         q_now = tele.q_full()
         err = max(abs(a - b) for a, b in zip(q_now, q_saved, strict=False))
         assert err < 0.03, (q_now, q_saved)  # arm reached the profile posture

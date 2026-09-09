@@ -32,8 +32,10 @@ class MLPNet(torch.nn.Module):
         super().__init__()
         self.state_dim, self.action_dim, self.hidden = state_dim, action_dim, hidden
         self.body = torch.nn.Sequential(
-            torch.nn.Linear(state_dim, hidden), torch.nn.Tanh(),
-            torch.nn.Linear(hidden, hidden), torch.nn.Tanh(),
+            torch.nn.Linear(state_dim, hidden),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.Tanh(),
             torch.nn.Linear(hidden, action_dim),
         )
 
@@ -46,8 +48,11 @@ def save_policy_bundle(path: str, net: MLPNet, spec_meta: dict[str, Any]) -> Non
     torch.save(
         {
             "state_dict": net.state_dict(),
-            "arch": {"state_dim": net.state_dim, "action_dim": net.action_dim,
-                     "hidden": net.hidden},
+            "arch": {
+                "state_dim": net.state_dim,
+                "action_dim": net.action_dim,
+                "hidden": net.hidden,
+            },
             "spec": dict(spec_meta),
         },
         path,
@@ -142,7 +147,8 @@ class ScriptedPolicy:
             a = np.full_like(a, np.nan)
         remaining = (self._chunk - 1) if self._chunk > 1 else 0
         return PolicyOutput(
-            actions=a, version=self._version,
+            actions=a,
+            version=self._version,
             t_mono=obs.t_mono if obs is not None else time.monotonic(),
             chunk_remaining=remaining,
         )
@@ -155,5 +161,11 @@ class ScriptedPolicy:
         object.__setattr__(self.spec, "version", int(version))
 
 
-__all__ = ["MLPNet", "MLPPolicy", "ScriptedPolicy", "save_policy_bundle",
-           "load_policy_bundle", "resolve_device"]
+__all__ = [
+    "MLPNet",
+    "MLPPolicy",
+    "ScriptedPolicy",
+    "save_policy_bundle",
+    "load_policy_bundle",
+    "resolve_device",
+]

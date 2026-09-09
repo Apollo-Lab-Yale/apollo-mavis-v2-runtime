@@ -52,8 +52,9 @@ async def endpoint(websocket: WebSocket) -> None:
                     runtime.on_keys(msg.seq, msg.held)  # stale seq dropped inside
                 continue  # observer keys are silently ignored
             assert isinstance(msg, ActionMsg)
-            await websocket.send_text((await _handle_action(runtime, msg, is_controller)
-                                       ).model_dump_json())
+            await websocket.send_text(
+                (await _handle_action(runtime, msg, is_controller)).model_dump_json()
+            )
     except WebSocketDisconnect:
         pass
     finally:

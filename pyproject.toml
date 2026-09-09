@@ -28,6 +28,11 @@ trainer = []
 # Microphone preview (phase-11): PortAudio over the ALSA `pulse` plugin; lazy-imported
 # in devices/microphone.py only. Needs apt libportaudio2 on the host.
 audio = ["sounddevice>=0.5"]
+dora = [
+    "dora-rs>=1.0.1,<1.1",
+    "dora-rs-cli>=1.0.1,<1.1",
+    "pyarrow>=17",
+]
 
 [dependency-groups]
 dev = [
@@ -63,12 +68,17 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "lerobot".msg = "lerobot is imported lazily inside apollo_mavis_v2_runtime.recorder only"
 "pysurvive".msg = "pysurvive is imported lazily inside apollo_mavis_v2_runtime.devices.tracker only"
 "sounddevice".msg = "sounddevice is imported lazily inside apollo_mavis_v2_runtime.devices.microphone only"
+"dora".msg = "dora is imported lazily inside apollo_mavis_v2_runtime.dora_bridge only (14-dora §1)"
+"pyarrow".msg = "pyarrow is imported inside apollo_mavis_v2_runtime.dora_bridge, the dagger spool and the recorder (episode frames.parquet) only"
 
 [tool.ruff.lint.per-file-ignores]
 # The recorder package and its tests are the one sanctioned lerobot import site.
 "src/apollo_mavis_v2_runtime/recorder/*" = ["TID251"]
 "tests/test_recorder*.py" = ["TID251"]
 "tests/test_e2e_collect.py" = ["TID251"]
+"tests/test_export_lerobot.py" = ["TID251"]
+"tests/test_episode_dir_recorder.py" = ["TID251"]  # reads the episode frames.parquet (pyarrow)
+"tests/test_return_to_start.py" = ["TID251"]
 # The tracker device module is the one sanctioned (lazy) pysurvive import site.
 "src/apollo_mavis_v2_runtime/devices/tracker.py" = ["TID251"]
 # The microphone device module is the one sanctioned (lazy) sounddevice import site.
@@ -78,6 +88,12 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "src/apollo_mavis_v2_runtime/dagger/*" = ["TID251"]
 "src/apollo_mavis_v2_runtime/dagger/trainer/*" = ["TID251"]
 "tests/dagger/*" = ["TID251"]
+# phase-12: the dora bridge is the ONE sanctioned dora / pyarrow import site (lazy);
+# its helper nodes are separate processes; tests/dora_bridge exercise the real control plane.
+"src/apollo_mavis_v2_runtime/dora_bridge/*" = ["TID251"]
+"src/apollo_mavis_v2_runtime/dora_bridge/nodes/*" = ["TID251"]
+"tests/dora_bridge/*" = ["TID251"]
+"examples/*" = ["TID251"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -85,4 +101,5 @@ addopts = "-q --strict-markers"
 markers = [
     "egl: requires a GPU/EGL-capable headless renderer",
     "perf: timing assertions; skip on loaded machines",
+    "dora: needs the [dora] extra + CLI; starts a private dora control plane on free ports",
 ]

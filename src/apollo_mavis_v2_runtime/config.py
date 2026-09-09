@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -102,9 +103,12 @@ class TargetRateConfig(BaseModel):
 
 
 class JogConfig(BaseModel):
+    # The joint panel is pure constant-speed approach: a jog of any size is accepted and
+    # walked at these rates (2026-09-07 - `goto_threshold_rad` is gone, see
+    # ControlLoop._on_joint_target). These are also lowered to the driver's servo bounds
+    # by the hardware bring-up, so on hardware the panel runs at the arm's own rate.
     slew_rad_per_tick: float = 0.02
     rail_m_per_tick: float = 0.002
-    goto_threshold_rad: float = 0.15
     # Hardware executor caps (phase-09d; set PROGRAMMATICALLY by the hardware bring-up
     # from the connected driver's ServoLimits, not meant for YAML): the PlanExecutor
     # also bounds sum|dq_j| * plan_lever_arm_m[j] per tick by plan_cart_step_m, the
@@ -123,9 +127,28 @@ class WatchdogConfig(BaseModel):
 class ControlConfig(BaseModel):
     rate_hz: float = 100.0
     teleop: TeleopRates = TeleopRates()
+    # Which physical frame the keyboard TRANSLATE keys (W/S/A/D/E/Q) act in
+    # (control/teleop.py has the geometry). Default "world" — operator decision
+    # 2026-09-08 evening; "camera" had been that morning's default and was
+    # superseded the same day. All three stay selectable.
+    # "world"  — the operator frame, fixed to the table (W away from the
+    #   operator = -Y, A to the operator's left = +X, E up = +Z); never follows
+    #   the tool.
+    # "camera" — the active arm's wrist-camera frame: W along the optical axis,
+    #   A/D image left/right, E/Q image up/down. Follows the tool, so the keys
+    #   keep matching the wrist stream the operator is watching (and E/Q mean
+    #   up/down in the IMAGE, not in the world).
+    # "base"   — the pre-2026-09-08 arm-base axes; fixed, but yawed 180° against
+    #   the operator's view in this cell, which is why the keys read reversed.
+    # Rotations (I/K/J/L/U/O) are about the TCP axes in every setting, and the
+    # canonical policy action frame (arm_base:<id>) is unaffected.
+    translate_frame: Literal["camera", "world", "base"] = "world"
     leash: LeashConfig = LeashConfig()
     target_rate: TargetRateConfig = TargetRateConfig()
-    dq_max_rad: float = 0.04  # per tick
+    # Per-tick joint step cap of the control loop (uniform scaling, 04-runtime §6).
+    # Must be > 0: a non-positive cap would HOLD every arm (the loop's fail-safe for
+    # a mis-derived cap), never pass steps unbounded.
+    dq_max_rad: float = Field(default=0.04, gt=0.0)  # per tick
     jog: JogConfig = JogConfig()
     watchdog: WatchdogConfig = WatchdogConfig()
     residual_max_pos_m: float = 0.01  # IK residual: freeze target back (glide)
@@ -255,8 +278,11 @@ class TwinOverlayConfig(BaseModel):
 class HardwareSessionConfig(BaseModel):
     """Real-cell session defaults and rail conventions (phase-09c/09d; 04-runtime §5).
 
-    ``default_speed_scale`` is what the Hardware tab pre-selects (first live
-    runs at 10 %; the session body still decides). A hardware session always
+    ``default_speed_scale`` is what the Hardware tab pre-selects (1.0 since the
+    evening of 2026-09-08 - the operator's call after a day of live sessions at
+    50 %, which was the 2026-09-07 call; the segments are 10 / 50 / 100 % and
+    10 % was only ever meant for the very first runs; the session body still
+    decides). A hardware session always
     includes EVERY configured arm (phase-09d: ``SessionSpec.arms`` must equal
     the workcell's arms, else 409), so there is no arm pre-selection any more
     (the phase-09c ``default_arms`` key is gone; an old key in a YAML is
@@ -279,11 +305,30 @@ class HardwareSessionConfig(BaseModel):
     # (tests, dev instances, a forgotten render) refuses hardware sessions and
     # home_rail with 409 "hardware not armed". The lab render sets it true.
     armed: bool = False
-    default_speed_scale: float = Field(default=0.1, gt=0.0, le=1.0)  # D2: 10 % first
+    # D2: segments 10 / 50 / 100 %. Default 100 % = operator decision 2026-09-08 evening
+    # (50 % was the 2026-09-07 call; 10 % the very-first-run setting). The UI's
+    # ``DEFAULT_SPEED_SCALE`` mirrors this value - the two must not drift.
+    default_speed_scale: float = Field(default=1.0, gt=0.0, le=1.0)
     rail_flip: bool = False  # q_sim = 0.65 - q_track (overlay + gate + sweep twins)
     home_rail_inflation_m: float = Field(default=0.025, gt=0.0)  # D4 sweep margin (m)
     home_rail_step_m: float = Field(default=0.005, gt=0.0)  # D4 sweep step (m)
     bringup_timeout_s: float = Field(default=60.0, gt=0.0)  # HardwareWorkcell.bring_up budget
+    # Transient controller state 4 right after enabling, measured 2026-09-08: the loop
+    # saw an arm RECOVERING for ONE tick while the pre-planned ``start_from`` motion was
+    # handed to it and refused the plan ("arm 'view' is faulted"), which dropped the plan
+    # for good. The start_from worker now waits up to this long (50 ms polls) for every
+    # session arm to leave FAULT / RECOVERING before it submits the plan, and retries
+    # ONCE when the arms clear after a refusal. A faulted arm is never moved; 0 = no wait.
+    start_from_fault_grace_s: float = Field(default=3.0, ge=0.0)
+    # Gate-held abort for twin-planned motions (2026-09-08 evening, after the first live
+    # ``reset_to_initial``): when the safety gate holds the PLANNER-sourced command of a
+    # running plan for longer than this with no waypoint progress, the loop cancels the
+    # plan at once (``plan_cancel_reason`` "held by the safety gate: <pair> at <mm> mm",
+    # telemetry ``plan_status: cancelled``) so the operator hears WHICH pair blocked it
+    # instead of watching the arms sit still until the 30 s budget. The arms hold where
+    # they are. Honoured on sim loops too (a sim gate only exists under ``safety_debug``).
+    # 0 = the first held tick cancels; the return budget stays the outer bound.
+    plan_gate_hold_s: float = Field(default=3.0, ge=0.0)
 
 
 class ExtrinsicsTolerance(BaseModel):
@@ -291,8 +336,17 @@ class ExtrinsicsTolerance(BaseModel):
     rot_rad: float
 
 
+class ExportConfig(BaseModel):
+    """LeRobot v3 export shard caps (10-frames §11.8; lerobot's defaults): a new
+    ``file-FFF`` starts when the accumulated per-episode size would reach the cap
+    (or, for videos, when the encoder identity changes)."""
+
+    video_file_mb: int = Field(default=200, ge=1)
+    data_file_mb: int = Field(default=100, ge=1)
+
+
 class RecorderConfig(BaseModel):
-    """Episode recorder tuning (04-runtime §10/§14; 10-frames §7.5)."""
+    """Episode recorder tuning (04-runtime §10/§14; 10-frames §7.5, §11)."""
 
     fps: int = Field(default=25, ge=20, le=30)  # dataset fps; 20-30 band (binding)
     # rgb encoder; "auto" -> first hardware encoder that really OPENS with lerobot's
@@ -301,9 +355,108 @@ class RecorderConfig(BaseModel):
     vcodec: str = "auto"
     jpeg_quality: int = 80
     image_writer_threads: int = 4  # PNG fallback path only
+    # Record the Perception Arm microphone as ``episodes/<id>/audio.wav`` (10-frames
+    # §11.4) whenever the reader is live (hardware; sim only with the fake backend).
+    audio: bool = True
+    # The derived LeRobot v3 export (the recorder itself writes one directory per
+    # episode; the 2026-09-07 interim ``video_file_size_mb`` never shipped — 04-runtime §10).
+    export: ExportConfig = ExportConfig()
     # Checkpoint-load extrinsics verification thresholds (10-frames §5.3; phase-08).
     extrinsics_warn: ExtrinsicsTolerance = ExtrinsicsTolerance(pos_m=0.003, rot_rad=0.010)
     extrinsics_max: ExtrinsicsTolerance = ExtrinsicsTolerance(pos_m=0.010, rot_rad=0.035)
+
+
+# -- dataset roots (2026-09-08; 15-online-dagger §7 / D5) ----------------------------------------
+# The ``<ns>`` half of a repo id and a namespace key share the REST path grammar
+# (server/rest.py ``_NAME``): a namespace the REST could not address would be a dead root.
+DATASET_NAMESPACE_RE = r"^[A-Za-z0-9][A-Za-z0-9_\-]*$"
+
+
+class DatasetNamespaceConfig(BaseModel):
+    """Where ONE dataset namespace lives (``RuntimeConfig.datasets.namespaces[ns]``).
+
+    A dataset ``<ns>/<name>`` of a mapped namespace is the directory ``<root>/<name>``,
+    or ``<root>/<name>/<subdir>`` when ``subdir`` is set (the Online DAgger layout: the
+    session directory ``~/data/online_dagger/<session>/`` owns ``rollouts/`` = the
+    dataset, next to ``session.json`` and whatever the trainer keeps there). ``root`` is
+    expanded exactly like ``datasets_root`` (``~``, ``${APOLLO_HOME}``, other
+    ``$VARS``; a still-relative path is anchored at the workspace root).
+    """
+
+    root: Path
+    subdir: str | None = None  # ONE path component below <root>/<name>; None = the dir itself
+
+    @model_validator(mode="after")
+    def _check_subdir(self) -> DatasetNamespaceConfig:
+        sub = self.subdir
+        if sub is not None and (sub in ("", ".", "..") or "/" in sub or "\\" in sub):
+            raise ValueError(
+                f"subdir must be a single directory name below <root>/<name>, got {sub!r}"
+            )
+        return self
+
+    def model_post_init(self, __context) -> None:
+        object.__setattr__(self, "root", _resolve_path(self.root))
+
+    def dataset_dir(self, name: str) -> Path:
+        """``<root>/<name>`` or ``<root>/<name>/<subdir>``."""
+        d = self.root / name
+        return d if self.subdir is None else d / self.subdir
+
+
+def _default_dataset_namespaces() -> dict[str, DatasetNamespaceConfig]:
+    return {
+        "bc_demo": DatasetNamespaceConfig(root=Path("~/data/bc_demo")),
+        "online_dagger": DatasetNamespaceConfig(
+            root=Path("~/data/online_dagger"), subdir="rollouts"
+        ),
+    }
+
+
+class DatasetsConfig(BaseModel):
+    """Per-namespace dataset roots (operator decision 2026-09-08; 15-online-dagger §7 / D5).
+
+    Repo ids keep the ``<ns>/<name>`` grammar, so REST / the store / the export / the
+    UI addressing do not change shape; only WHERE a namespace lives does. A bare
+    ``SessionSpec.dataset: "<name>"`` resolves into ``default_namespace``. A namespace
+    listed in ``namespaces`` lives at its own root — demonstrations ``bc_demo/<name>``
+    -> ``~/data/bc_demo/<name>``, Online DAgger rollouts ``online_dagger/<session>`` ->
+    ``~/data/online_dagger/<session>/rollouts`` — and EVERY other namespace lives at
+    ``<datasets_root>/<ns>/<name>`` (the generic root: the phase-07..13
+    ``var/datasets/apollo/...`` data stays listable, addressable and deletable).
+    ``DatasetStore`` lists / sweeps the generic root AND every mapped root;
+    ``GET /api/datasets/layout`` publishes this block so the UI shows real folders.
+    """
+
+    default_namespace: str = Field(default="bc_demo", pattern=DATASET_NAMESPACE_RE)
+    namespaces: dict[str, DatasetNamespaceConfig] = Field(
+        default_factory=_default_dataset_namespaces
+    )
+
+    @model_validator(mode="after")
+    def _check_namespaces(self) -> DatasetsConfig:
+        bad = [ns for ns in self.namespaces if not re.match(DATASET_NAMESPACE_RE, ns)]
+        if bad:
+            raise ValueError(
+                f"dataset namespace keys must match {DATASET_NAMESPACE_RE} (the REST "
+                f"<ns> grammar), got {bad}"
+            )
+        return self
+
+
+class OnlineDaggerRuntimeConfig(BaseModel):
+    """``RuntimeConfig.online_dagger`` (phase-14; 15-online-dagger §7): the runtime's side
+    of Online DAgger. The runtime is the algorithm-agnostic shell — no algorithm
+    settings live anywhere in it; this block only says where the shipped skill comes
+    from and how often the runtime-owned ``session.json`` may be rewritten OUTSIDE a
+    transition (every transition writes it at once)."""
+
+    skill_dir: Path | None = None  # null = the package's shipped skill; a path overrides it
+    session_file_hz: float = Field(default=1.0, gt=0.0)
+
+    def model_post_init(self, __context) -> None:
+        if self.skill_dir is not None:
+            object.__setattr__(self, "skill_dir", _resolve_path(self.skill_dir))
 
 
 class TrainerSettings(BaseModel):
@@ -422,9 +575,12 @@ class TrackerFilterConfig(BaseModel):
 
     enabled: bool = True
     min_cutoff_hz: float = Field(default=1.0, ge=0.05, le=50.0)  # cutoff at rest
-    beta: float = Field(default=0.05, ge=0.0, le=5.0)  # speed coefficient
+    # beta is Hz per (m/s), NOT the paper's per-pixel figure: below ~1 it cannot
+    # lift a 1 Hz cutoff at hand speeds and the filter becomes a fixed 159 ms lag
+    # (control.pose_filter docstring has the measurements). Ceiling raised 5 -> 200.
+    beta: float = Field(default=5.0, ge=0.0, le=200.0)  # speed coefficient
     d_cutoff_hz: float = Field(default=1.0, gt=0.0)  # velocity-estimate cutoff
-    deadband_m: float = Field(default=0.002, ge=0.0)  # rest deadband, position
+    deadband_m: float = Field(default=0.001, ge=0.0)  # rest deadband, position
     deadband_rad: float = Field(default=0.005, ge=0.0)  # rest deadband, orientation
 
 
@@ -510,6 +666,131 @@ class LoggingConfig(BaseModel):
     access_log: bool = False
 
 
+# -- dora external interface (phase-12; 14-dora §12) -----------------------------------------
+DORA_DEFAULT_PORTS = (6113, 53391, 7447)  # private (never the machine-global 6013 / 53291)
+DORA_MACHINE_ID_RE = r"^[a-zA-Z0-9_]+$"
+
+
+class DoraPublishConfig(BaseModel):
+    """What the runtime publishes on the dora bus and how fast (14-dora §4, §12)."""
+
+    state_hz: float = Field(default=50.0, gt=0.0, le=100.0)  # arm_state / arm_cmd in a session
+    idle_state_hz: float = Field(default=10.0, gt=0.0, le=100.0)  # arm_state between sessions
+    obs_hz: float = Field(default=30.0, ge=10.0, le=100.0)  # obs_state (policy lead input)
+    obs_in_collect: bool = False  # also publish obs_state in collect sessions
+    cameras: Literal["all"] | list[str] = "all"  # camera ids to publish as cam_<id>
+    depth_cameras: list[str] = Field(default_factory=lambda: ["view_wrist_cam"])  # cam_<id>_depth
+    image_pose: bool = True  # q / tcp_pose_world / camera_pose_world / intrinsics on wrist frames
+    audio: bool = True  # mic_<id>
+    telemetry: bool = True  # telemetry (byte-identical to /ws/telemetry)
+    events: bool = True  # events
+    # Where arm_state comes from BETWEEN sessions on the hardware workcell (14-dora §4.2
+    # "Arm states without a session"): ``monitor`` (default) re-publishes the phase-09a
+    # read-only HardwareStateMonitor's samples - zero additional SDK clients on the boxes
+    # (two clients per box are unevidenced); ``driver`` holds its own read-only
+    # ``XArmDriver.connect(readonly=True)`` per arm (the IdleArmReader's own connection,
+    # used when the monitor is disabled). Sim always reads the preview scene.
+    idle_source: Literal["monitor", "driver"] = "monitor"
+
+
+class DoraPolicyConfig(BaseModel):
+    """External policy staleness rules (14-dora §6.3)."""
+
+    spec_stale_s: float = Field(default=3.0, gt=0.0)  # no policy_spec -> policy_attached False
+    max_obs_age_s: float = Field(default=0.5, gt=0.0)  # older observation -> action dropped
+
+
+class DoraLogConfig(BaseModel):
+    quiet_node_diagnostics: bool = True  # RUST_LOG=error before `import dora`; fd-1 fallback
+
+
+class DoraMachineConfig(BaseModel):
+    """One remote consumer machine allowed to join (14-dora §9): its daemon runs
+    ``dora daemon --machine-id <id>`` against the runtime's coordinator and the
+    dataflow renders ``<kind>_<id>`` placeholders for it once it is registered."""
+
+    id: str = Field(pattern=DORA_MACHINE_ID_RE)
+    placeholders: list[Literal["viewer", "observer"]] = Field(
+        default_factory=lambda: ["viewer", "observer"]
+    )
+
+
+class DoraConfig(BaseModel):
+    """``RuntimeConfig.dora`` (phase-12; 14-dora §12): the runtime-owned PRIVATE dora
+    control plane + the process-lifetime publishers. ``enabled: false`` (default) leaves
+    the runtime byte-for-byte the phase-11 runtime; ``true`` without the ``[dora]`` extra
+    (or with mismatching python/CLI versions) is ``disabled`` + a warning.
+
+    ``bind_host`` is the ONE interface the coordinator and the zenoh listener bind: an
+    IPv4 literal (``127.0.0.1`` in the tracked config) OR an interface name (``wlp38s0``
+    = the APOLLO Lab Wi-Fi, DHCP; ``tailscale0``) resolved to its current IPv4 at start
+    and re-resolved before every dataflow restart. ``0.0.0.0`` and any address on a
+    control-box link (the ``workcells.hardware`` arm subnets: 192.168.1.11 / 192.168.2.12)
+    are refused -> ``disabled`` (the xArm SDK path over those NICs is untouched; this
+    rule only says where dora LISTENS). ``auth: null`` = true whenever ``bind_host`` is
+    not loopback; the token lives in ``<var_dir>/.dora-token`` and is never served over
+    REST. ``machines`` are the remote consumer machines whose daemons may join;
+    ``rescan_s`` is how often the registered set is re-read (a change restarts the
+    dataflow). Ports are private: never 6013 / 53291.
+    """
+
+    enabled: bool = False
+    node_id: str = "mavis_runtime"
+    dataflow_name: str = "mavis_v2"
+    bind_host: str = "127.0.0.1"  # IPv4 or interface name (resolved at start)
+    machine_id: str = Field(default="lab", pattern=DORA_MACHINE_ID_RE)
+    machines: list[DoraMachineConfig] = Field(default_factory=list)
+    rescan_s: float = Field(default=5.0, gt=0.0)
+    # 14-dora §16.1 join protocol: after POST /api/dora/machines/{id}/join the dataflow is
+    # restarted with that machine's placeholders and the runtime waits this long for the
+    # remote consumer to attach (dora 1.0.1 blocks EVERY node of a multi-machine dataflow -
+    # spawned or dynamic - until each remote dynamic placeholder is attached); expired ->
+    # the placeholders are dropped again and local publishing resumes.
+    join_attach_timeout_s: float = Field(default=30.0, gt=0.0)
+    auth: bool | None = None  # None = bind_host is not loopback
+    coordinator_port: int = Field(default=DORA_DEFAULT_PORTS[0], ge=1024, le=65535)
+    daemon_port: int = Field(default=DORA_DEFAULT_PORTS[1], ge=1024, le=65535)
+    zenoh_port: int = Field(default=DORA_DEFAULT_PORTS[2], ge=1024, le=65535)
+    var_dir: Path = Path("${APOLLO_HOME}/var/dora")  # rendered YAML, out/, lock, token, logs
+    attach_retry_s: tuple[float, float] = (1.0, 10.0)  # backoff bounds
+    bus_poll_s: float = Field(default=0.002, gt=0.0)
+    publish: DoraPublishConfig = DoraPublishConfig()
+    policy: DoraPolicyConfig = DoraPolicyConfig()
+    log: DoraLogConfig = DoraLogConfig()
+
+    @model_validator(mode="after")
+    def _check(self) -> DoraConfig:
+        if self.coordinator_port in (6013,) or self.daemon_port in (53291,):
+            raise ValueError(
+                "dora ports 6013 / 53291 are the machine-global defaults of `dora up`; the "
+                "runtime's private control plane must use other ports (14-dora §2.2)"
+            )
+        if len({self.coordinator_port, self.daemon_port, self.zenoh_port}) != 3:
+            raise ValueError("dora coordinator_port / daemon_port / zenoh_port must differ")
+        ids = [m.id for m in self.machines]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"dora.machines ids must be unique, got {ids}")
+        if self.machine_id in ids:
+            raise ValueError(
+                f"dora.machines may not contain the local machine_id {self.machine_id!r}"
+            )
+        lo, hi = self.attach_retry_s
+        if not (0.0 < lo <= hi):
+            raise ValueError("dora.attach_retry_s must be (lo, hi) with 0 < lo <= hi")
+        return self
+
+    @property
+    def auth_effective(self) -> bool:
+        """``auth`` as configured, else true iff ``bind_host`` is not loopback."""
+        if self.auth is not None:
+            return self.auth
+        host = self.bind_host
+        return not (host in ("127.0.0.1", "localhost", "lo") or host.startswith("127."))
+
+    def model_post_init(self, __context) -> None:
+        object.__setattr__(self, "var_dir", _resolve_path(self.var_dir))
+
+
 class RuntimeConfig(BaseModel):
     """Top-level runtime config; sane defaults for sim-only dev."""
 
@@ -518,7 +799,10 @@ class RuntimeConfig(BaseModel):
     ui_dist: Path | None = None  # built SPA; None = API-only (Vite dev)
     workcells: dict[str, WorkcellConfig] = Field(default_factory=dict)  # "hardware"|"sim"
     profiles_dir: Path = Path("${APOLLO_HOME}/var/profiles")
-    datasets_root: Path = Path("${APOLLO_HOME}/var/datasets")
+    datasets_root: Path = Path("${APOLLO_HOME}/var/datasets")  # generic <root>/<ns>/<name>
+    # 2026-09-08 (15-online-dagger §7, D5): per-namespace roots; datasets_root stays the
+    # generic root for every namespace not listed here (roots resolved by the sub-model).
+    datasets: DatasetsConfig = DatasetsConfig()
     checkpoints_root: Path = Path("${APOLLO_HOME}/var/checkpoints")
     # Tracker calibration artefacts (phase-10): tracker_calibration.json (persisted
     # yaw / install state), temporary + installed libsurvive config copies.
@@ -536,6 +820,9 @@ class RuntimeConfig(BaseModel):
     video: VideoConfig = VideoConfig()
     egl_device_id: int = 0
     logging: LoggingConfig = LoggingConfig()  # 2026-09-07
+    dora: DoraConfig = DoraConfig()  # phase-12 (14-dora §12); enabled: false by default
+    online_dagger: OnlineDaggerRuntimeConfig = OnlineDaggerRuntimeConfig()  # phase-14
+    #   (15-online-dagger §7)
 
     def model_post_init(self, __context) -> None:
         for name in ("profiles_dir", "datasets_root", "checkpoints_root", "calibration_dir"):
@@ -607,6 +894,10 @@ __all__ = [
     "DaggerConfig",
     "ExtrinsicsTolerance",
     "RecorderConfig",
+    "DATASET_NAMESPACE_RE",
+    "DatasetNamespaceConfig",
+    "DatasetsConfig",
+    "OnlineDaggerRuntimeConfig",
     "ControllerInput",
     "HELD_ONLY_INPUTS",
     "CONTROLLER_HELD_ACTIONS",
@@ -622,6 +913,12 @@ __all__ = [
     "TwinOverlayConfig",
     "HardwareSessionConfig",
     "LoggingConfig",
+    "DoraPublishConfig",
+    "DoraPolicyConfig",
+    "DoraLogConfig",
+    "DoraMachineConfig",
+    "DoraConfig",
+    "DORA_DEFAULT_PORTS",
     "RuntimeConfig",
     "load_runtime_config",
 ]

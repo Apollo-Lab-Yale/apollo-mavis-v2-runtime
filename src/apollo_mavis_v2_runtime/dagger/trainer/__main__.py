@@ -15,8 +15,9 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="apollo_mavis_v2_runtime.dagger.trainer")
     parser.add_argument("--config", required=True, help="TrainerConfig JSON path")
-    parser.add_argument("--resume", action="store_true",
-                        help="reload trainer_state.pt of the newest version")
+    parser.add_argument(
+        "--resume", action="store_true", help="reload trainer_state.pt of the newest version"
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,

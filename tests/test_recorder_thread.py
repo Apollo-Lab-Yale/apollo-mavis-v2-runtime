@@ -1,6 +1,7 @@
 """RecorderThread unit behaviour with a fake recorder/cameras/kinematics:
 pending-frame action alignment, camera-age drops, discard/save semantics,
-save retry + degrade, status transitions (04-runtime §10; 10-frames §3)."""
+save retry + degrade, status transitions, the sidecar payload handed to
+``save(sidecar, audio)`` (04-runtime §10; 10-frames §3, §11.6)."""
 
 from __future__ import annotations
 
@@ -13,41 +14,55 @@ from apollo_mavis_v2_runtime.bus import RuntimeBus
 from apollo_mavis_v2_runtime.control.snapshot import StateSnapshot
 from apollo_mavis_v2_runtime.recorder.features import ArmMeta
 from apollo_mavis_v2_runtime.recorder.frames import RecordingFrameConverter
-from apollo_mavis_v2_runtime.recorder.sidecars import SidecarWriter
 from apollo_mavis_v2_runtime.recorder.thread import RecorderThread
 
 
 class FakeRecorder:
-    """In-memory EpisodeRecorder double; scriptable save failures."""
+    """In-memory ``EpisodeDirRecorder`` double (the 10-frames §11 API: ``start`` mints
+    an id, ``save(sidecar, audio)`` returns ``(ordinal, episode_id)``); scriptable
+    save failures; remembers every sidecar + audio sink it was handed."""
 
     def __init__(self, fail_saves: int = 0) -> None:
         self.episodes: list[list[dict]] = []
+        self.sidecars: list[dict] = []
+        self.audio_sinks: list[object] = []
         self.buffer: list[dict] = []
         self.recording = False
         self.finalized = 0
         self.fail_saves = fail_saves
         self.episodes_saved = 0
+        self.total_frames = 0
+        self.repo_id = "apollo/fake"
+        self.episode_id: str | None = None
+        self._minted = 0
 
     def start(self, meta):
         self.buffer = []
         self.recording = True
+        self._minted += 1
+        self.episode_id = f"20260907T000000.{self._minted:03d}Z-{self._minted:06x}"
 
     def add_frame(self, frame):
         self.buffer.append(frame)
 
-    def save(self):
+    def save(self, sidecar, audio=None):
         if self.fail_saves > 0:
             self.fail_saves -= 1
             raise RuntimeError("scripted save failure")
         self.episodes.append(self.buffer)
+        self.sidecars.append(dict(sidecar))
+        self.audio_sinks.append(audio)
+        self.total_frames += len(self.buffer)
         self.buffer = []
         self.recording = False
         self.episodes_saved += 1
-        return self.episodes_saved - 1
+        eid, self.episode_id = self.episode_id, None
+        return self.episodes_saved - 1, eid
 
     def discard(self):
         self.buffer = []
         self.recording = False
+        self.episode_id = None
 
     def finalize(self):
         self.finalized += 1
@@ -110,7 +125,6 @@ def rig(tmp_path):
         rec, bus, {"cam0": cam}, [ArmMeta("arm0", True)],
         RecordingFrameConverter({"arm0": "arm_base:arm0"}), FakeKin(),
         fps=25,
-        sidecars=SidecarWriter(tmp_path),
         episode_meta_base={"session_id": "s1", "frames": {"arm0": "arm_base:arm0"}},
         extrinsics_fn=lambda states: {"cam0": {"T_W_C": "stub"}},
     )
@@ -203,32 +217,67 @@ def test_discard_semantics(rig):
     thread.run_iteration(1.12)
     assert thread.status().state == "idle"
     assert rec.episodes == [] and rec.buffer == [] and not rec.recording
-    # no sidecar for discarded episodes
-    assert not list((thread.sidecars.base / "episodes").glob("*.json")) if (
-        thread.sidecars.base / "episodes"
-    ).exists() else True
+    assert rec.sidecars == []  # nothing is written for a discarded episode
+    assert thread.open_episode_id is None
 
 
-def test_save_writes_sidecar_and_drops_trailing_pending(rig, tmp_path):
+def test_save_hands_the_sidecar_to_the_recorder_and_drops_trailing_pending(rig):
     rec, bus, cam, thread = rig
     thread.request("new")
+    open_id = thread.open_episode_id
+    assert open_id == rec.episode_id and open_id is not None
     for i, t in enumerate((1.0, 1.04, 1.08, 1.12)):
         feed(thread, bus, cam, i + 1, Q0 + i * 0.001, t)
     assert thread.request("save") == (True, "saving")
     assert thread.status().state == "saving"
+    assert thread.open_episode_id == open_id  # still open while saving (delete -> 409)
     thread.run_iteration(1.16)
-    assert thread.status().state == "idle"
+    st = thread.status()
+    assert st.state == "idle" and st.index == 0 and st.total_episodes == 1
+    assert st.total_frames == 3 and st.repo_id == "apollo/fake"
     assert len(rec.episodes) == 1 and len(rec.episodes[0]) == 3  # trailing pending dropped
-    side = tmp_path / "meta" / "apollo" / "episodes" / "episode_000000.json"
-    assert side.exists()
-    import json
-
-    payload = json.loads(side.read_text())
-    assert payload["episode_index"] == 0
+    assert thread.last_saved_id == open_id and thread.open_episode_id is None
+    # the sidecar payload is assembled BEFORE save (10-frames §11.6 step 3)
+    payload = rec.sidecars[0]
     assert payload["session_id"] == "s1"
     assert payload["frames"] == {"arm0": "arm_base:arm0"}
-    assert payload["frames_dropped"] == 0
+    assert payload["frames_dropped"] == 0 and payload["success"] is None
     assert payload["extrinsics"] == {"cam0": {"T_W_C": "stub"}}
+    assert rec.audio_sinks == [None]
+
+
+def test_on_episode_done_fires_before_the_flip_to_idle(rig):
+    """The manager's return-to-start hook must see ``saving`` (never a spurious
+    ``idle`` frame): ``set_returning(True)`` inside the hook makes the very next
+    status read ``returning``."""
+    rec, bus, cam, thread = rig
+    seen = []
+
+    def hook(outcome, index):
+        seen.append((outcome, index, thread.status().state))
+        thread.set_returning(True, "returning to profile 'ready'")
+
+    thread.on_episode_done = hook
+    thread.request("new")
+    for i, t in enumerate((1.0, 1.04, 1.08)):
+        feed(thread, bus, cam, i + 1, Q0, t)
+    thread.request("save")
+    thread.run_iteration(1.12)
+    assert seen == [("saved", 0, "saving")]
+    st = thread.status()
+    assert st.state == "returning" and st.detail == "returning to profile 'ready'"
+    assert thread.request("new") == (False, "returning to the initial configuration")
+    thread.set_returning(False, "return cancelled: movement key")
+    st = thread.status()
+    assert st.state == "idle" and st.detail == "return cancelled: movement key"
+    assert thread.request("new")[0] is True
+    assert thread.status().detail == ""  # a new episode clears the note
+    # discard fires the hook too (idle -> returning -> idle path)
+    seen.clear()
+    thread.request("discard")
+    thread.run_iteration(1.20)
+    assert seen == [("discarded", None, "saving")]
+    assert thread.status().state == "returning"
 
 
 def test_empty_episode_save_nacked(rig):
@@ -260,16 +309,26 @@ def test_save_retry_once_then_degrade(tmp_path):
         rec2, bus, {"cam0": cam}, [ArmMeta("arm0", True)],
         RecordingFrameConverter({"arm0": "arm_base:arm0"}), FakeKin(), fps=25,
     )
+    discarded, done = [], []
+    thread2._episode_discarded = lambda i, eid, why: discarded.append((i, eid, why))
+    thread2.on_episode_done = lambda outcome, index: done.append(outcome)
     thread2.request("new")
+    eid2 = rec2.episode_id
     for i, t in enumerate((2.0, 2.04, 2.08)):
         feed(thread2, bus, cam, i + 1, Q0, t)
     thread2.request("save")
     thread2.run_iteration(2.12)
     assert thread2.degraded and thread2.status().state == "idle"
-    assert rec2.buffer  # buffer KEPT (04-runtime §15)
+    assert rec2.buffer  # buffer KEPT (04-runtime §15): never recorder.discard() here
+    # ... but the episode is over and says so (an Online DAgger trainer that watched the
+    # rollout live is told to drop it: events.episode_discarded rides this hook); no
+    # return-to-start motion is started on a failure path
+    assert discarded == [(0, eid2, "save failed twice - recording degraded (buffer kept)")]
+    assert done == []
     assert thread2.request("new")[0] is False
     thread2.stop()
     assert rec2.finalized == 1  # guard still finalizes
+    assert len(discarded) == 1  # the shutdown found the recorder idle: no second announcement
 
 
 def test_stop_discards_open_buffer_and_finalizes_once(rig):
@@ -281,4 +340,25 @@ def test_stop_discards_open_buffer_and_finalizes_once(rig):
     assert rec.episodes == [] and not rec.recording
     assert rec.finalized == 1
     thread.stop()  # idempotent
+    assert rec.finalized == 1
+
+
+def test_stop_defers_the_shutdown_while_the_recorder_thread_is_still_busy(rig, monkeypatch):
+    """A save that outlives the 30 s join (a long finish_episode) must not be raced by
+    a concurrent _shutdown: stop() logs and leaves it to the thread's finally."""
+    rec, bus, cam, thread = rig
+
+    class Busy:
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return True
+
+    thread._thread = Busy()
+    thread._running = True
+    thread.stop()
+    assert rec.finalized == 0 and thread._thread is not None  # deferred, not run here
+    thread._thread = None
+    thread.stop()  # the thread is gone: the shutdown runs once
     assert rec.finalized == 1

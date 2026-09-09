@@ -18,6 +18,7 @@ from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
 from apollo_mavis_v2_runtime.bus import RuntimeBus
 from apollo_mavis_v2_runtime.config import (
     ControlConfig,
+    DatasetsConfig,
     HardwareSessionConfig,
     RuntimeConfig,
     TrackerConfig,
@@ -46,9 +47,23 @@ def make_runtime_config(
         workcells={"sim": wc},
         profiles_dir=tmp_path / "profiles",
         datasets_root=tmp_path / "datasets",
+        # Dataset roots (2026-09-08; 15-online-dagger §7 / D5): the runtime default maps
+        # bc_demo / online_dagger to ~/data; tests pin the pre-D5 layout (bare names ->
+        # apollo/<name> under the tmp datasets_root, no mapped roots) so the e2e
+        # expectations hold AND no test ever lists or sweeps the operator's ~/data.
+        datasets=DatasetsConfig(default_namespace="apollo", namespaces={}),
         checkpoints_root=tmp_path / "ckpts",
         calibration_dir=tmp_path / "calibration",  # never read ~/apollo/calibration in tests
         video=VideoConfig(preview_fps=15, session_fps=30),
+        # Keyboard translate frame: the e2e suites here assert displacement along
+        # their test scenes' arm-base axes to test the WS / watchdog / gate plumbing,
+        # not the frame, so they stay pinned to the pre-2026-09-08 "base" frame. The
+        # RUNTIME default is "world" (operator-fixed; decision of 2026-09-08 evening —
+        # that morning's default "camera" pointed W along the tool axis, straight DOWN
+        # at every test scene's folded start posture, where the gate legitimately
+        # stops it). The frame itself is covered by tests/test_teleop_math.py and
+        # tests/test_camera_frame.py.
+        control=ControlConfig(translate_frame="base"),
         tracker=tracker or TrackerConfig(),
         # tests run against fakes only: arm the (fake) hardware paths so home_rail jobs and
         # hardware sessions can be exercised; the real-SDK path stays behind the conftest
@@ -103,12 +118,38 @@ def fake_loop(tmp_path):
     return cell, bus, loop
 
 
+_DISPATCHED: dict[int, dict[str, float]] = {}  # id(loop) -> arm -> put_mono last sent
+
+
+def dispatch_commands(loop: ControlLoop, cell: FakeWorkcell) -> None:
+    """What the ``ArmSender`` threads do in a live loop, synchronously: hand each
+    arm's newest ``q_cmd`` slot value to the fake arm's ``command_joints`` (once per
+    put - a stale value is never re-sent, exactly like ``wait_fresh``; a FAULTED arm's
+    sender is paused and dispatches nothing). Without this the fakes' MEASURED q never
+    follows the command in the hand-built sessions, and since 2026-09-08 the manager's
+    sequential execution waits for measured arrival (``SessionManager._await_arrival``)."""
+    sent = _DISPATCHED.setdefault(id(loop), {})
+    for arm_id in loop.session_arms:
+        got = loop.bus.arm_slot(arm_id).get()
+        if got is None or arm_id in loop.faulted_arms:
+            continue
+        q, put_mono = got
+        if sent.get(arm_id) == put_mono:
+            continue
+        sent[arm_id] = put_mono
+        arm = cell.arms.get(arm_id)
+        if arm is not None:
+            arm.command_joints(np.asarray(q, dtype=np.float64))
+
+
 def run_ticks(loop: ControlLoop, cell: FakeWorkcell, n: int, t0: float = 0.0) -> float:
-    """Advance loop + fake workcell n deterministic ticks; returns end time."""
+    """Advance loop + fake workcell n deterministic ticks (the loop's output dispatched
+    to the fake arms in between, see :func:`dispatch_commands`); returns end time."""
     t = t0
     for _ in range(n):
         t += loop.dt
         loop.run_tick(t)
+        dispatch_commands(loop, cell)
         cell.step(loop.dt)
     return t
 

@@ -7,6 +7,10 @@ happens on the per-arm :class:`ArmSender` threads consuming the ``q_cmd``
 slots. 100 Hz, monotonic absolute-deadline pacing, overruns skipped (no
 catch-up bursts). ``run_tick(now)`` is callable synchronously for
 deterministic tests.
+
+2026-09-08 (not yet in the design docs): ``goto_profile {profile_id}`` walks the
+session arms to a CHOSEN saved profile through the reset-to-initial machinery
+(:meth:`ControlLoop._op_goto_profile` -> ``SessionManager.request_goto_profile``).
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from apollo_mavis_v2_core import (
     Pose,
     ProfileNotFoundError,
     ProfileStore,
+    Twist,
     se3,
 )
 from apollo_mavis_v2_core.protocol import HELD_CODES, JointTargetArgs, TrackerSettingsArgs
@@ -35,7 +40,7 @@ from ..config import ControlConfig
 from ..errors import SafetyConfigError
 from ..profiles.store import save_from_states, save_initial_overwrite
 from ..safety.gate import SafetyGate
-from .joint_panel import JogState, PlanExecutor
+from .joint_panel import RATIO_EPS, JogState, PlanExecutor
 from .snapshot import StateSnapshot
 from .teleop import TargetIntegrator, held_to_twist, twist_to_control_frame
 from .tracker_teleop import TRACKER_CLUTCH_CODE, interp_pose
@@ -52,6 +57,10 @@ logger = logging.getLogger(__name__)
 RAIL_TRAVEL_M = se3.RAIL_TRAVEL_M
 GRIPPER_SEND_EVERY_N_TICKS = 10  # <= 10 Hz (modbus is slow)
 PLAN_STATUS_LINGER_TICKS = 100  # keep "done"/"failed" visible ~1 s
+# ``plan_cancel_reason`` prefix of the gate-held abort (``HardwareSessionConfig.
+# plan_gate_hold_s``, 2026-09-08 evening): the SessionManager matches on it to report
+# "the motion was held by the safety gate (<pair> at <mm> mm)" instead of a plain cancel.
+GATE_HOLD_PREFIX = "held by the safety gate"
 DEVICE_ACTION_LINGER_S = 1.0  # telemetry shows the last device-sourced discrete action this long
 # Driver events (hardware ``events.py``) the loop consumes from ``workcell.drain_events()``
 # every tick (04-runtime §15; phase-09b), dispatched by CLASS NAME so the runtime never
@@ -67,6 +76,10 @@ STUDIO_WARNING_DEFAULT = "close UFACTORY Studio live control"
 # default teleop arm on every workcell, hardware and sim (user decision
 # 2026-09-04); the Perception Arm (``view``) is reached with Tab / switch_arm.
 DEFAULT_ACTIVE_ARM = "grip"
+# Nack details of the gate ops outside a policy session (15-online-dagger D3): Space and
+# the explicit takeover / handback actions share one string; train_now its own.
+TAKEOVER_UNAVAILABLE = "takeover not available in teleop"
+NOT_ONLINE_DAGGER = "not an Online DAgger session"
 
 
 def controller_error_title(code: int) -> str:
@@ -150,6 +163,9 @@ class ControlLoop:
         gripper_arms: Iterable[str] | None = None,  # None = every session arm
         tracker: TrackerTeleop | None = None,  # clutched Vive-tracker target provider
         clock: Callable[[], float] = time.monotonic,
+        plan_gate_hold_s: float = 3.0,  # HardwareSessionConfig.plan_gate_hold_s (sim too)
+        speed_scale: float = 0.1,  # SessionSpec.speed_scale: the joint-panel goto's plans are
+        #   judged at it (PlanRequest.speed_scale; the default is the slowest speed offered)
     ) -> None:
         # 11-safety §4 item 4 (phase-09c): a hardware loop MUST dispatch through a
         # SafetyGate bound to a live digital twin - the chokepoint refuses anything else.
@@ -191,6 +207,11 @@ class ControlLoop:
         self._grip_frac: dict[str, float] = {}
         self._states: dict[str, ArmState] = {}
         self._teleop_seeded: set[str] = set()
+        # This tick's KEYBOARD twist per arm (world frame), set by ``_teleop_step``'s
+        # key branch and consumed after the joint step cap (``_hold_key_target``,
+        # 2026-09-09): a capped keyboard tick pulls the integrated target back along
+        # the driven axes so it never runs ahead of what the arm can follow.
+        self._key_twist: dict[str, Twist] = {}
         # Arm of the current clutch session (clutch PRESS-edge tracking).
         self._clutch_arm: str | None = None
         self._arm_source: dict[str, CommandSource] = {}  # per-arm last resolving source
@@ -200,6 +221,39 @@ class ControlLoop:
         self._plan_state: dict[str, str] = {}  # arm -> planning|executing|failed
         self._plan_clear_at: dict[str, int] = {}
         self._plan_status: str | None = None  # session-level lifecycle string
+        # Why the last running plan was cancelled ("movement key", "jog", "arm switch",
+        # "driver fault", ...); None after a plan finished or a new one was loaded. The
+        # SessionManager's return-to-start worker reads it (04-runtime §10.5).
+        self.plan_cancel_reason: str | None = None
+        # An interruptible plan (the return-to-start motion) is cancelled by a jog or an
+        # arm switch too, not only by a movement key; start_from plans are not.
+        self._plan_interruptible = False
+        # Gripper targets an interruptible plan carries are applied on ARRIVAL (never
+        # at load: a cancelled return must leave the gripper untouched). Since the
+        # 2026-09-08 sequential execution the manager submits the profile's gripper
+        # targets with the LAST arm's plan, so a target may name an arm that is not in
+        # this plan's waypoints: every target is deferred and applied when the plan is
+        # done (``_finish_plan``), whichever arm carried it.
+        self._plan_gripper_on_arrival: dict[str, float] = {}
+        # Arms whose executor returned the GOAL this tick (2026-09-08 review): the plan
+        # is finished only once the gated output equals that goal (``_confirm_plan_
+        # arrivals``, after the gate); a goal step the gate holds puts the arm back into
+        # the executor, so ``plans.active_arms`` never empties one slew step short.
+        self._plan_arriving: dict[str, np.ndarray] = {}
+        # Gate-held abort (2026-09-08 evening; ``HardwareSessionConfig.plan_gate_hold_s``):
+        # the clock reading at which the gate began holding the PLANNER-sourced command
+        # of the running plan with no waypoint progress; None while it progresses. Past
+        # ``plan_gate_hold_s`` the plan is cancelled with the blocking pair in the reason
+        # (``_plan_gate_watch``). On the real cell (23:16:52) a return sat gate-blocked at
+        # 5.2 mm for the whole 30 s budget before anyone learned which pair it was.
+        self.plan_gate_hold_s = max(0.0, float(plan_gate_hold_s))
+        self._plan_gate_hold_since: float | None = None
+        self.speed_scale = min(max(float(speed_scale), 1e-6), 1.0)
+        # The browser's control socket dropped since the last tick (Runtime hook).
+        self._controller_dropped = False
+        # Process-stall detection (04-runtime §6; 2026-09-07): the previous tick's clock.
+        self._last_tick_now: float | None = None
+        self.process_stalls = 0
         self._plan_status_clear_at: int | None = None
         # Driver fault plumbing (phase-09b; 04-runtime §15). ``_faulted``: arms a
         # FaultEvent stopped (sender paused, held, nothing published); ``_recovering``:
@@ -214,6 +268,16 @@ class ControlLoop:
         self._fault_state_reported: str | None = None
         self.on_fault_state: Callable[[str | None], None] | None = None
         #   ^ SessionManager hook: "fault" | "recovering" | None (all arms running)
+        # SessionManager hook for the `reset_to_initial` key (2026-09-08): the loop
+        # validates the request inline (fast), resolves the target profile ONCE and
+        # hands both to the manager, which plans the motion on the session twin off
+        # the loop thread and returns a short ack detail immediately. Takes the
+        # profile so the manager does not re-scan the store from the loop thread.
+        # None = no manager attached (unit-test loops).
+        self.on_reset_to_initial: Callable[[object], tuple[bool, str]] | None = None
+        # Same contract for ``goto_profile`` (2026-09-08): the loop resolves the CHOSEN
+        # profile inline and the manager runs the reset-to-initial motion toward it.
+        self.on_goto_profile: Callable[[object], tuple[bool, str]] | None = None
         self.fault_events = 0  # FaultEvents consumed (tests / diagnostics)
         self.recoveries = 0  # re-seeds performed after Reseed/RecoveredEvents
 
@@ -229,9 +293,27 @@ class ControlLoop:
         # watchdog latch. Counters are cumulative; the line prints window deltas.
         self.ik_slips = 0  # _solve_target residual freezes (target re-anchored)
         self.ik_diverged = 0  # _solve_target divergences (tick held)
+        # Ticks on which the uniform step cap (``cfg.dq_max_rad`` + the streamer's
+        # lever-weighted Cartesian bound, ``_cap_joint_step``) bound some arm's command
+        # (2026-09-09): the axis-purity diagnostic - a saturated tick is one the
+        # operator's requested rate exceeded what the arm can execute. On a hardware
+        # loop a held keyboard key binds it on nearly every tick (the requested
+        # 0.12 m/s exceeds the streamer's lever-weighted capacity in most postures).
+        self.clamp_ticks = 0
+        # ``_cap_joint_step``'s Cartesian bound, derived from ``cfg.jog`` on first use
+        # and whenever the jog config object changes (tests swap ``loop.cfg``).
+        self._cart_bound_src: object | None = None
+        self._cart_bound_val: tuple[float | None, np.ndarray | None] = (None, None)
         self._health_next: float | None = None
         self._health_durations: list[float] = []
-        self._health_prev = {"tick": 0, "overrun": 0, "slip": 0, "diverged": 0, "tslip": 0}
+        self._health_prev = {
+            "tick": 0,
+            "overrun": 0,
+            "slip": 0,
+            "diverged": 0,
+            "tslip": 0,
+            "clamp": 0,
+        }
         self._clutch_logged = False
         self._device_fresh_logged: bool | None = None
         self._watchdog_logged = False
@@ -309,11 +391,29 @@ class ControlLoop:
         self.supervisor.reseed(arm_id, st.q)
 
     # -- the tick (order fixed, 04-runtime §6) -------------------------------------
+    def note_controller_disconnect(self) -> None:
+        """Runtime hook (any thread): the browser's control socket dropped — an
+        interruptible plan (the return-to-start motion) is cancelled on the next tick."""
+        self._controller_dropped = True
+
     def run_tick(self, now: float | None = None) -> StateSnapshot:
         now = self._clock() if now is None else now
         self.tick_count += 1
         if not self._seeded:
             self._seed_from_measured()
+        # Process stall (the encoder open / flush holds the GIL for 150-300 ms): the
+        # whole process froze, not the browser. Hold every arm this tick (no
+        # catch-up step) and credit the silence to the stall so the deadman does not
+        # latch a browser that was fresh when the stall began.
+        stalled = False
+        if self._last_tick_now is not None:
+            gap = now - self._last_tick_now
+            if gap > self.supervisor.watchdog.timeout_s:
+                stalled = True
+                self.process_stalls += 1
+                self.supervisor.watchdog.on_process_stall(now, self._last_tick_now)
+                logger.warning("process stall %.0f ms (tick gap): arms held this tick", gap * 1e3)
+        self._last_tick_now = now
         self.bus.commands.drain(self._handle_command)  # 1
 
         got = self.bus.held_keys.get()  # 2
@@ -323,10 +423,13 @@ class ControlLoop:
         if watchdog_tripped != self._watchdog_logged:
             self._watchdog_logged = watchdog_tripped
             if watchdog_tripped:
+                dropped = self.jog.clear_all()  # see JogState.clear_all
                 logger.warning(
                     "ws input watchdog LATCHED: browser keys ignored until every key is "
-                    "released (held %s); device-held codes keep working",
+                    "released (held %s); device-held codes keep working; jog targets "
+                    "dropped (%s)",
                     sorted(held_ws),
+                    ", ".join(dropped) or "none",
                 )
             else:
                 logger.info("ws input watchdog cleared")
@@ -363,11 +466,25 @@ class ControlLoop:
         q_meas = {a: states[a].q for a in self.session_arms}
 
         # A held movement key (from a live source) cancels running plans (04-runtime §7).
-        if self.plans.active_arms and self.sources.moving(HELD_CODES):
-            self._cancel_plans("movement key")
+        # An INTERRUPTIBLE plan (return-to-start) cancels on the PRESENCE of a movement
+        # code from any source, whatever the deadman scale: a key held under a latched
+        # deadman is still the operator saying "stop" (safety, 2026-09-07).
+        if self.plans.active_arms:
+            if self.sources.moving(HELD_CODES):
+                self._cancel_plans("movement key")
+            elif self._plan_interruptible and (held & HELD_CODES):
+                self._cancel_plans("movement key")
+            elif self._controller_dropped:
+                self._interrupt_plan_for("browser disconnected")
+        self._controller_dropped = False
 
         # 5-7: per-arm action resolution -> commanded q (mode hook, phase-08).
-        resolved, source = self._resolve_arms(states, held, scale, now)
+        self._key_twist.clear()
+        if stalled:
+            resolved = dict.fromkeys(self.session_arms)  # hold: last command, no jump
+            source = CommandSource.TELEOP
+        else:
+            resolved, source = self._resolve_arms(states, held, scale, now)
         if self.tracker is not None:
             self.tracker.end_tick(now)  # not consulted this tick -> anchors cleared
         q_cmd: dict[str, np.ndarray] = {
@@ -375,16 +492,22 @@ class ControlLoop:
             for arm_id, q in resolved.items()
         }
 
-        # Per-tick joint clamp (dq_max) + rail bound, before the gate.
+        # Per-tick joint step cap (dq_max, uniform scaling) + rail bound, before the gate.
+        clamped = False
         for arm_id, q in q_cmd.items():
-            q_last = self._last_cmd[arm_id]
-            q = np.clip(q, q_last - self.cfg.dq_max_rad, q_last + self.cfg.dq_max_rad)
-            if q.shape[0] > 7:
-                q[7] = min(max(q[7], 0.0), RAIL_TRAVEL_M)
+            q, capped = self._cap_joint_step(q, self._last_cmd[arm_id])
+            if capped:
+                clamped = True
+                self._hold_key_target(arm_id, q)
             q_cmd[arm_id] = q
+        if clamped:
+            self.clamp_ticks += 1
 
         dec = self.supervisor.filter(q_cmd, q_meas, source)  # 8
         self._post_filter(dec, now)
+        self._confirm_plan_arrivals(dec)  # a goal the gate held stays in the executor
+        if self.plans.active_arms:
+            self._plan_gate_watch(dec, now)  # gate-held abort of a running plan
 
         for arm_id, q in dec.q_out.items():  # 9
             self._last_cmd[arm_id] = np.array(q)
@@ -433,6 +556,130 @@ class ControlLoop:
         self._health_log(now, held, source, states)
         return snap
 
+    def _cart_bound(self) -> tuple[float | None, np.ndarray | None]:
+        """``(plan_cart_step_m, lever[:7])`` of ``cfg.jog`` - the servo streamer's
+        lever-weighted Cartesian step bound a hardware bring-up sets through
+        ``apply_executor_caps`` - or ``(None, None)`` when no driver published one
+        (sim, fakes). Cached per jog config object."""
+        jog = self.cfg.jog
+        if jog is not self._cart_bound_src:
+            cart = getattr(jog, "plan_cart_step_m", None)
+            lever = getattr(jog, "plan_lever_arm_m", None)
+            if cart is not None and lever is not None and float(cart) > 0.0:
+                self._cart_bound_val = (
+                    float(cart),
+                    np.asarray(list(lever), dtype=np.float64)[:7],
+                )
+            else:
+                self._cart_bound_val = (None, None)
+            self._cart_bound_src = jog
+        return self._cart_bound_val
+
+    def _cap_joint_step(self, q: np.ndarray, q_last: np.ndarray) -> tuple[np.ndarray, bool]:
+        """Bound this tick's joint step ``q[:7] - q_last[:7]`` to what the arm can
+        execute in one tick by UNIFORM scaling (04-runtime §6 "Per-tick joint step
+        cap", 2026-09-09): the step is divided by the larger of
+
+        - ``max|dq_j| / cfg.dq_max_rad`` - the per-joint velocity cap (a hardware loop
+          lowers ``dq_max`` to the streamer's own ``max_joint_vel / rate_hz``,
+          ``apply_teleop_caps``), and
+        - ``sum|dq_j| * lever_j / cfg.jog.plan_cart_step_m`` - the streamer's
+          lever-weighted Cartesian bound (``ServoLimits.max_cart_step_m`` x
+          ``lever_arm_m``, set on a hardware loop by ``apply_executor_caps``; ``None``
+          in sim, where the term is skipped),
+
+        when that ratio exceeds 1. The whole step shrinks by one factor, so the
+        commanded joint-space direction - and with it the Cartesian direction the IK
+        solved for - is preserved and the arm is merely slower. This is the rule
+        ``PlanExecutor.step`` applies to planned segments (both bounds), minus its
+        rounding to whole steps. Returns ``(q, capped)``.
+
+        WHY BOTH BOUNDS. Until 2026-09-09 this was ``np.clip`` per joint: whenever one
+        joint saturated the others kept their full step, the direction bent, and a
+        held ``W`` / ``S`` drove the TCP up or down as well (operator report; 6-39 mm
+        of vertical drift per 2 s hold on the Manipulation Arm, < 1 mm with the clamp
+        inactive). The first fix scaled uniformly against ``dq_max`` alone - correct
+        in the sim, whose servo has no streamer, but the real ``_ServoStreamer``
+        (apollo_mavis_v2_hardware ``driver.py``) clips per joint at ``max_joint_vel *
+        dt``, per joint at the acceleration step, and then scales the step so
+        ``sum|dq_j| * lever_j <= max_cart_step_m``. That lever estimate is 5-10x
+        conservative for a keyboard step (6-12 mm lever-weighted per tick at 100 %
+        against the 4 mm cap), so the streamer executed a third to a half of every
+        host step, the command wound up to the leash, and the streamer's OWN per-joint
+        clip bent the direction every tick - the mechanism this method had removed,
+        one layer down (closed-loop streamer emulation from the initial posture at
+        100 %: ``W`` 28 mm off on 109 mm, ``S`` 60 mm + 3.2 deg, ``Q`` 131 mm + 15
+        deg). With the Cartesian bound folded in here every streamer clip is inactive
+        (it runs at most its acceleration ramp behind the command); the same
+        emulation gives < 0.5 mm and < 0.06 deg on every key at both speeds
+        (``tools/axis_purity_measure.py --streamer``). The executed TCP rate of a
+        held key on the real cell is therefore the streamer's lever-weighted
+        capacity, ~0.04-0.10 m/s at 100 %, not the 0.12 m/s the key requests.
+
+        A non-positive ``dq_max`` (a mis-derived cap) HOLDS the joints and the rail
+        slot at ``q_last`` and reports the tick as capped - the fail-safe direction of
+        the old clip, never an unbounded step. The rail slot is otherwise a separate
+        axis with its own controller-side speed and keeps an independent bound
+        (unchanged), so a carriage step never slows the joints or vice versa."""
+        dq_max = float(self.cfg.dq_max_rad)
+        q = np.array(q, dtype=np.float64)
+        dq = q[:7] - q_last[:7]
+        if dq_max <= 0.0:
+            capped = bool(np.any(dq != 0.0))
+            q[:7] = q_last[:7]
+            if q.shape[0] > 7:
+                capped = capped or q[7] != q_last[7]
+                q[7] = min(max(float(q_last[7]), 0.0), RAIL_TRAVEL_M)
+            return q, capped
+        ratio = float(np.max(np.abs(dq))) / dq_max
+        cart, lever = self._cart_bound()
+        if cart is not None and lever is not None:
+            n = min(lever.shape[0], 7)
+            ratio = max(ratio, float(np.sum(np.abs(dq[:n]) * lever[:n])) / cart)
+        capped = ratio > 1.0 + RATIO_EPS
+        if capped:
+            q[:7] = q_last[:7] + dq / ratio
+        if q.shape[0] > 7:
+            q[7] = min(max(q[7], q_last[7] - dq_max), q_last[7] + dq_max)
+            q[7] = min(max(q[7], 0.0), RAIL_TRAVEL_M)
+        return q, capped
+
+    def _hold_key_target(self, arm_id: str, q: np.ndarray) -> None:
+        """A KEYBOARD tick whose joint step the cap scaled: pull the integrated target
+        back along the DRIVEN axes to the pose ``q`` reaches, so the target advances
+        only as far as the arm can follow this tick (04-runtime §6, 2026-09-09).
+
+        The key is a velocity command with no absolute reference, so a target that
+        runs ahead of a joint-capped arm buys nothing: it would wind up to the leash,
+        the QP would then chase a 25 mm error every tick (into its own per-joint
+        velocity box, which bends the direction again), and the arm would keep going
+        for a leash after the key is released. Only the components the operator is
+        driving are pulled back - the translation along the commanded direction and
+        the rotation about the commanded axis; the off-axis position and the
+        undriven orientation stay pinned to the line the seed defined, so the IK keeps
+        correcting them instead of ratcheting each tick's residue into the anchor.
+        The tracker path is untouched: there the hand pose IS the reference and the
+        target catches up within the leash by design. No-op when the arm's target was
+        not keyboard-driven this tick (tracker, jog, plan, policy)."""
+        tw = self._key_twist.get(arm_id)
+        target = self.integrator.get(arm_id)
+        if tw is None or target is None or self.kin is None:
+            return
+        achieved = self.kin.tcp_world(arm_id, q)
+        pos = target.position
+        quat = target.orientation
+        v_norm = float(np.linalg.norm(tw.v))
+        if v_norm > 0.0:
+            d = tw.v / v_norm
+            pos = pos + d * float((achieved.position - pos) @ d)
+        w_norm = float(np.linalg.norm(tw.w))
+        if w_norm > 0.0:
+            u = tw.w / w_norm
+            # space-frame rotation carrying the target orientation onto the achieved one
+            rel = se3.quat_to_rotvec(se3.quat_mul(achieved.orientation, se3.quat_conj(quat)))
+            quat = se3.quat_mul(se3.rotvec_to_quat(u * float(rel @ u)), quat)
+        self.integrator.reanchor(arm_id, Pose(pos, quat))
+
     # -- health line (2026-09-07; 04-runtime §14 "Logging") -----------------------------
     def _health_log(
         self, now: float, held: frozenset[str], source: CommandSource, states: dict[str, ArmState]
@@ -463,7 +710,7 @@ class ControlLoop:
             logger.info(
                 "loop: %d ticks/%.1fs (%.0f Hz, tick p50 %.1f ms p99 %.1f ms, +%d overruns) "
                 "active=%s src=%s held=%s%s%s gate=%s%s ik_slips=+%d ik_diverged=+%d "
-                "cmd-meas=%s%s%s",
+                "dq_capped=+%d cmd-meas=%s%s%s",
                 ticks,
                 window,
                 ticks / window if window > 0 else 0.0,
@@ -479,6 +726,7 @@ class ControlLoop:
                 f" faulted={sorted(self._faulted)}" if self._faulted else "",
                 self.ik_slips - prev["slip"],
                 self.ik_diverged - prev["diverged"],
+                self.clamp_ticks - prev["clamp"],
                 lag,
                 f" recovering={sorted(self._recovering)}" if self._recovering else "",
                 self._servo_health(),
@@ -495,6 +743,7 @@ class ControlLoop:
             "slip": self.ik_slips,
             "diverged": self.ik_diverged,
             "tslip": self.tracker.slip_count if self.tracker is not None else 0,
+            "clamp": self.clamp_ticks,
         }
         self._health_durations.clear()
 
@@ -579,11 +828,8 @@ class ControlLoop:
             if self.arm_stopped(arm_id, states[arm_id]):
                 q_next = None  # FAULT / RECOVERING: hold; recovery re-seeds (§15)
             elif self.plans.active(arm_id):
-                q_next = self.plans.step(arm_id, q_last)
+                q_next = self._plan_step(arm_id, q_last)
                 source = CommandSource.PLANNER
-                self._note_source(arm_id, CommandSource.PLANNER)
-                if not self.plans.active(arm_id):  # final waypoint reached
-                    self._finish_plan(arm_id, ok=True)
             elif self.jog.active(arm_id):
                 q_next = self._jog_step(arm_id, q_last, scale)
                 source = CommandSource.JOINT_JOG
@@ -685,10 +931,13 @@ class ControlLoop:
         sender = self._senders.get(arm_id)
         if sender is not None:
             sender.pause()
-        if self.plans.active(arm_id) or self._plan_state.get(arm_id) is not None:
+        if self._plan_interruptible and self.plans.active_arms:
+            self._cancel_plans("driver fault")  # a return-to-start stops on EVERY arm
+        elif self.plans.active(arm_id) or self._plan_state.get(arm_id) is not None:
             self.plans.cancel(arm_id)
             self._plan_state.pop(arm_id, None)
             self._plan_clear_at.pop(arm_id, None)
+            self.plan_cancel_reason = "driver fault"
             if not self.plans.active_arms:
                 self._set_plan_status("cancelled", linger=True)
         self.jog.clear(arm_id)
@@ -775,6 +1024,73 @@ class ControlLoop:
     def _post_filter(self, dec, now: float) -> None:
         """After the safety gate; dagger uses this for block-streak anomaly."""
 
+    def _plan_gate_watch(self, dec, now: float) -> None:
+        """Gate-held abort (2026-09-08 evening; ``plan_gate_hold_s``). Runs on the
+        control thread while a plan executes, O(active arms) per tick, no allocation
+        beyond the cancel itself: the plan is HELD this tick when the gate blocked and
+        every executing arm's gated output equals its last command (no waypoint
+        progress - ``_last_cmd`` is still the previous tick's output here). The first
+        held tick starts the clock, any progressing tick resets it, and once the hold
+        has lasted ``plan_gate_hold_s`` the plan is cancelled with the blocking pair
+        and distance in ``plan_cancel_reason`` (``GATE_HOLD_PREFIX``) so the manager
+        reports it immediately instead of after the return budget. The arms hold where
+        they are, exactly as after any other cancel."""
+        if not dec.blocked:
+            self._plan_gate_hold_since = None
+            return
+        for arm_id in self.plans.active_arms:
+            q_out = dec.q_out.get(arm_id)
+            q_last = self._last_cmd.get(arm_id)
+            if q_out is None or q_last is None or not np.array_equal(q_out, q_last):
+                self._plan_gate_hold_since = None  # this arm still moved: not held
+                return
+        if self._plan_gate_hold_since is None:
+            self._plan_gate_hold_since = now
+        held_for = now - self._plan_gate_hold_since
+        if held_for < self.plan_gate_hold_s:
+            return
+        reason = f"{GATE_HOLD_PREFIX}: {self._gate_hold_pairs(dec)}"
+        logger.warning(
+            "plan held by the safety gate for %.1f s (limit %.1f s): cancelling - %s",
+            held_for,
+            self.plan_gate_hold_s,
+            reason,
+        )
+        self._cancel_plans(reason)
+
+    def _gate_hold_pairs(self, dec) -> str:
+        """``"<body a> / <body b>[, <pair 2>] at <mm> mm"`` for the gate-held abort, from
+        this tick's gate report (the merged supervisor report, then the gate's own
+        block pairs as fallbacks: the twin's report may say nothing while the gate holds
+        inside its hysteresis band or on a stale twin)."""
+        report = dec.report
+        if not report.pairs:
+            merged = self.supervisor.merged_report()
+            if merged.pairs:
+                report = merged
+        pairs = list(report.pairs[:2])
+        if pairs:
+            names = ", ".join(" / ".join(p) for p in pairs)
+            return f"{names} at {report.min_clearance_m * 1e3:.1f} mm"
+        fallback = getattr(self.supervisor.gate, "_block_pairs", None)
+        if fallback:
+            # A hold inside the gate's hysteresis band: the reports carry no pair and
+            # their ``min_clearance_m`` is the 1.0 m default (2026-09-08 review: the
+            # reason once read "... at 1000.0 mm"). Ask the twin for the real distance
+            # at the measured posture; without one, name the pair alone.
+            pairs = sorted(fallback)[:2]
+            names = ", ".join(" / ".join(p) for p in pairs)
+            twin = getattr(self.supervisor.gate, "twin", None)
+            if twin is not None and hasattr(twin, "pair_distance"):
+                try:
+                    dist = min(float(twin.pair_distance(p, None, 0.5)) for p in pairs)
+                except Exception:  # noqa: BLE001 - the reason is best-effort text
+                    return names
+                return f"{names} at {dist * 1e3:.1f} mm"
+            return names
+        kinds = {ev.kind for ev in report.violations}
+        return "stale digital twin" if "stale_twin" in kinds else "no pair reported"
+
     def _session_extra(self, now: float) -> dict:
         """Extra session_extra entries (dagger/inference telemetry + frames)."""
         return {}
@@ -790,6 +1106,11 @@ class ControlLoop:
         now: float | None = None,
     ) -> np.ndarray | None:
         """Held keys -> twist -> integrate -> IK -> q (04-runtime §6).
+
+        Translate keys act in ``cfg.translate_frame`` (default the operator-fixed
+        WORLD frame since 2026-09-08 evening; ``control/teleop.py`` has the
+        geometry and the two alternatives, ``camera`` and ``base``) and rotate
+        keys about the TCP axes.
 
         ``held`` is the merged set (WS ∪ device); ``scale`` is the WS watchdog
         scale, which governs the keyboard translate/rotate keys (only WS codes
@@ -877,11 +1198,14 @@ class ControlLoop:
             if np.any(v) or np.any(w):
                 self._seed_teleop(arm_id, measured_tcp)
                 self._ride_rail(arm_id, d_rail)
-                from apollo_mavis_v2_core import Twist
-
                 tw_world = twist_to_control_frame(
-                    Twist(v=v, w=w), self.kin.base_quat_world(arm_id), measured_tcp.orientation
+                    Twist(v=v, w=w),
+                    self.kin.base_quat_world(arm_id),
+                    measured_tcp.orientation,
+                    self.cfg.translate_frame,
+                    self._wrist_cam_quat(arm_id, measured_tcp.orientation),
                 )
+                self._key_twist[arm_id] = tw_world
                 target = self.integrator.step(arm_id, tw_world, self.dt, measured_tcp)
             elif rail_moving:
                 target = None  # rail-only: joints hold, the rail slot integrates below
@@ -903,6 +1227,13 @@ class ControlLoop:
         if rail_new is not None:
             q[7] = rail_new  # rail codes own the rail slot (ignored w/o rail)
         return q
+
+    def _wrist_cam_quat(self, arm_id: str, tcp_quat: np.ndarray) -> np.ndarray | None:
+        """The arm's wrist-camera world orientation for the camera translate frame,
+        or None (no camera on this arm / a test fake without the method — the
+        ``kin`` seam only ever promised ``tcp_world`` + ``base_quat_world``)."""
+        getter = getattr(self.kin, "wrist_cam_quat_world", None)
+        return None if getter is None else getter(arm_id, tcp_quat)
 
     def _ride_rail(self, arm_id: str, d_rail: np.ndarray) -> None:
         """A rail step under a driven tick: slide the world-frame integrator
@@ -1120,23 +1451,139 @@ class ControlLoop:
         self._plan_status = status
         self._plan_status_clear_at = self.tick_count + PLAN_STATUS_LINGER_TICKS if linger else None
 
+    def _plan_step(self, arm_id: str, q_last: np.ndarray) -> np.ndarray | None:
+        """One executor step for a plan arm (shared by every mode loop's
+        ``_resolve_arms``). When the executor hands back the goal itself (its final
+        waypoint) the arm is NOT finished yet: the goal still has to pass the gate this
+        tick, so it is parked in ``_plan_arriving`` for :meth:`_confirm_plan_arrivals`.
+        Before 2026-09-08 the plan was reported ``done`` here, BEFORE the gate, so a
+        final step the gate held left ``_last_cmd`` one slew step short of the goal with
+        ``plan_status done`` and ``plan_cancel_reason None``, the deferred gripper was
+        applied on an arm that had not arrived and the gate-held watch never ran."""
+        q_next = self.plans.step(arm_id, q_last)
+        self._note_source(arm_id, CommandSource.PLANNER)
+        if q_next is not None and not self.plans.active(arm_id):  # the executor's goal
+            self._plan_arriving[arm_id] = np.array(q_next, dtype=np.float64)
+        return q_next
+
+    def _confirm_plan_arrivals(self, dec) -> None:
+        """After the gate: an arm whose executor returned the goal this tick is done
+        only if the gated output IS that goal; otherwise (the gate or the per-tick clamp
+        held the last step) the goal goes back into the executor as a one-waypoint plan,
+        so the arm stays ``executing``, ``plans.active_arms`` stays non-empty for the
+        manager's wait and ``_plan_gate_watch`` sees the hold from the next tick on.
+
+        Exception (2026-09-09): a goal the COMMAND PATH can never reach exactly. The
+        per-tick clamp (``_cap_joint_step``) pins the rail slot to ``[0, RAIL_TRAVEL]``,
+        so a rail goal a hair outside it - copied verbatim from a measured posture that
+        settled a few tenths of a mm past the end stop - is clamped away every tick while
+        the gate stays clear. Re-loading it then never finishes: the executor keeps
+        returning the goal, the clamp keeps holding the command short, ``q_out != goal``
+        forever, and because nothing is BLOCKED ``_plan_gate_watch`` never aborts it - the
+        plan hangs ``executing`` and blocks every later reset / Go-to-profile / R. So when
+        the gate is not blocking AND the command made no progress toward the goal this
+        tick AND the only difference left is the rail slot pinned at the travel end the
+        goal lies beyond (:meth:`_clamped_rail_goal`), the arm is at the reachable limit:
+        finish it. A genuine gate hold (``dec.blocked``) still re-loads and is aborted by
+        the watch if it never clears; a clamp that is merely SPLITTING a long final step
+        still progresses and re-loads; a joint goal the command path cannot reach (a
+        non-positive ``dq_max`` fail-safe hold) stays ``executing`` for the manager's
+        budget to report - it is not an arrival (2026-09-09 review). Pinned by
+        ``tests/test_loop_units.py::test_a_rail_goal_a_hair_outside_the_travel_...`` and
+        mirrored by the fuzz's headless replay (``tests/test_return_fuzz_mavis_v2.py``)."""
+        if not self._plan_arriving:
+            return
+        for arm_id, goal in list(self._plan_arriving.items()):
+            self._plan_arriving.pop(arm_id, None)
+            if self._plan_state.get(arm_id) != "executing":
+                continue  # cancelled between the step and the gate (a movement key etc.)
+            q_out = dec.q_out.get(arm_id)
+            if q_out is None:
+                self.plans.load(arm_id, [goal])
+                continue
+            if np.allclose(q_out, goal, atol=1e-9):
+                self._finish_plan(arm_id, ok=True)
+                continue
+            q_last = self._last_cmd.get(arm_id)  # not yet updated for this tick
+            progressed = q_last is None or not np.allclose(q_out, q_last, atol=1e-9)
+            if not dec.blocked and not progressed and self._clamped_rail_goal(q_out, goal):
+                self._finish_plan(arm_id, ok=True)  # at the reachable limit (clamped goal)
+            else:
+                self.plans.load(arm_id, [goal])
+
+    @staticmethod
+    def _clamped_rail_goal(q_out: np.ndarray, goal: np.ndarray) -> bool:
+        """True when ``q_out`` differs from ``goal`` ONLY in the rail slot, which sits at
+        the travel end (``0`` / ``RAIL_TRAVEL_M``) the goal lies beyond - the one goal the
+        per-tick clamp makes unreachable by construction (:meth:`_confirm_plan_arrivals`).
+        Shared with the fuzz's headless replay so both judge arrival by the same rule."""
+        q_out = np.asarray(q_out, dtype=np.float64)
+        goal = np.asarray(goal, dtype=np.float64)
+        if q_out.shape[0] <= 7 or goal.shape[0] <= 7:
+            return False
+        if not np.allclose(q_out[:7], goal[:7], atol=1e-9):
+            return False
+        rail, want = float(q_out[7]), float(goal[7])
+        return (abs(rail) <= 1e-9 and want < 0.0) or (
+            abs(rail - RAIL_TRAVEL_M) <= 1e-9 and want > RAIL_TRAVEL_M
+        )
+
     def _finish_plan(self, arm_id: str, ok: bool) -> None:
         if ok:
             self._plan_state.pop(arm_id, None)
             self._plan_clear_at.pop(arm_id, None)
+            frac = self._plan_gripper_on_arrival.pop(arm_id, None)
+            if frac is not None:  # deferred gripper target of the arriving arm
+                self._apply_gripper_target(arm_id, frac)
             if not self.plans.active_arms:
+                # the plan is done: deferred targets for arms this plan did not move
+                # (the manager rides them on the LAST arm of a sequence) apply now
+                for other, frac in list(self._plan_gripper_on_arrival.items()):
+                    self._apply_gripper_target(other, frac)
+                self._plan_gripper_on_arrival.clear()
                 self._set_plan_status("done", linger=True)
+                self._plan_interruptible = False
+                self._plan_gate_hold_since = None
         else:
             self._plan_state[arm_id] = "failed"
             self._plan_clear_at[arm_id] = self.tick_count + PLAN_STATUS_LINGER_TICKS
             self._set_plan_status("failed", linger=True)
+
+    def _apply_gripper_target(self, arm_id: str, frac: float) -> None:
+        """Set + send one gripper target (ignored for a gripperless arm)."""
+        if arm_id not in self.gripper_arms:
+            return
+        self._grip_frac[arm_id] = min(max(float(frac), 0.0), 1.0)
+        sender = self._senders.get(arm_id)
+        if sender is not None:
+            sender.put_gripper(self._grip_frac[arm_id])
 
     def _cancel_plans(self, reason: str) -> None:
         for arm_id in self.plans.active_arms:
             self._plan_state.pop(arm_id, None)
         self.plans.cancel()
         self._set_plan_status("cancelled", linger=True)
+        self.plan_cancel_reason = reason
+        self._plan_interruptible = False
+        self._plan_gripper_on_arrival.clear()  # a cancelled return leaves the gripper alone
+        self._plan_arriving.clear()
+        self._plan_gate_hold_since = None
         logger.info("plan cancelled: %s", reason)
+
+    def _op_cancel_plan(self, cmd: Command) -> CommandResult:
+        """Internal (SessionManager): cancel every running plan with ``args.reason``
+        (return-to-start deadline / teardown) — the arms hold where they are."""
+        reason = str(cmd.args.get("reason") or "cancelled")
+        if self.plans.active_arms:
+            self._cancel_plans(reason)
+            return CommandResult(cmd.corr_id, True, "cancelled")
+        return CommandResult(cmd.corr_id, True, "no plan")
+
+    def _interrupt_plan_for(self, reason: str) -> None:
+        """Operator input during an INTERRUPTIBLE plan (the return-to-start motion,
+        04-runtime §10.5) cancels it: the arm holds where it is and the input wins."""
+        if self._plan_interruptible and self.plans.active_arms:
+            self._cancel_plans(reason)
 
     def _expire_plan_status(self) -> None:
         if self._plan_status_clear_at is not None and self.tick_count >= self._plan_status_clear_at:
@@ -1155,19 +1602,38 @@ class ControlLoop:
             return CommandResult(cmd.corr_id, False, f"unknown op {cmd.op!r}")
         return handler(cmd)
 
-    def _switch_arm(self, cmd: Command, step: int) -> CommandResult:
-        if not self.session_arms:
-            return CommandResult(cmd.corr_id, False, "no session arms")
-        i = self.session_arms.index(self.active_arm) if self.active_arm else -step
-        self.active_arm = self.session_arms[(i + step) % len(self.session_arms)]
+    def _activate_arm(self, cmd: Command, arm_id: str) -> CommandResult:
+        self._interrupt_plan_for("arm switch")
+        self.active_arm = arm_id
         self._teleop_seeded.discard(self.active_arm)  # reseed target from measured
         if self.tracker is not None:
             self.tracker.release()  # arm switch clears the tracker anchors
         return CommandResult(cmd.corr_id, True, self.active_arm)
 
+    def _switch_arm(self, cmd: Command, step: int) -> CommandResult:
+        if not self.session_arms:
+            return CommandResult(cmd.corr_id, False, "no session arms")
+        i = self.session_arms.index(self.active_arm) if self.active_arm else -step
+        return self._activate_arm(cmd, self.session_arms[(i + step) % len(self.session_arms)])
+
     def _op_switch_arm(self, cmd: Command) -> CommandResult:
-        """Server-authoritative Tab / RB cycling; previous arm's target freezes."""
-        return self._switch_arm(cmd, +1)
+        """Server-authoritative Tab / RB cycling; previous arm's target freezes.
+
+        With ``args.arm_id`` (the Cockpit's clickable arm rows, 2026-09-07) the
+        switch is EXPLICIT instead: the named arm becomes active whatever the
+        session order is, an unknown id is refused, and re-selecting the arm
+        that is already active is a no-op — it must NOT release the tracker
+        anchors, or a click on the active row would drop a live clutch.
+        """
+        arm_id = cmd.args.get("arm_id")
+        if arm_id is None:
+            return self._switch_arm(cmd, +1)
+        arm_id = str(arm_id)
+        if arm_id not in self.session_arms:
+            return CommandResult(cmd.corr_id, False, f"arm {arm_id!r} not in this session")
+        if arm_id == self.active_arm:
+            return CommandResult(cmd.corr_id, True, arm_id)
+        return self._activate_arm(cmd, arm_id)
 
     def _op_switch_arm_prev(self, cmd: Command) -> CommandResult:
         """KeyZ / LB: previous arm, ``(i - 1) mod n`` (13-tracker §4)."""
@@ -1202,7 +1668,24 @@ class ControlLoop:
     def _op_takeover_toggle(self, cmd: Command) -> CommandResult:
         if self.plans.active_arms:
             self._cancel_plans("takeover_toggle")
-        return CommandResult(cmd.corr_id, False, "takeover not available in teleop")
+        return CommandResult(cmd.corr_id, False, TAKEOVER_UNAVAILABLE)
+
+    def _op_takeover(self, cmd: Command) -> CommandResult:
+        """Explicit take-over (phase-14; 15-online-dagger D3): a gate op, served by the
+        GatedPolicyExecutor of a dagger / inference session; here it nacks exactly like
+        Space does (and, like Space, still cancels a running plan — it is an escape)."""
+        if self.plans.active_arms:
+            self._cancel_plans("takeover")
+        return CommandResult(cmd.corr_id, False, TAKEOVER_UNAVAILABLE)
+
+    def _op_handback(self, cmd: Command) -> CommandResult:
+        """Explicit hand-back (phase-14; 15-online-dagger D3): no gate here, nack."""
+        return CommandResult(cmd.corr_id, False, TAKEOVER_UNAVAILABLE)
+
+    def _op_train_now(self, cmd: Command) -> CommandResult:
+        """``train_now`` (phase-14; 15-online-dagger §3) is served by the
+        GatedPolicyExecutor of an Online DAgger session only; every other session nacks."""
+        return CommandResult(cmd.corr_id, False, NOT_ONLINE_DAGGER)
 
     def _episode_op(self, cmd: Command, op: str) -> CommandResult:
         """Episode ops validate/transition inline (fast); writer work runs on
@@ -1236,18 +1719,26 @@ class ControlLoop:
             return CommandResult(
                 cmd.corr_id, False, f"positions must have length {dof} (full q incl. rail)"
             )
+        self._interrupt_plan_for("jog")  # a return-to-start motion yields to the panel
         if self.plans.active(arm_id) or self._plan_state.get(arm_id) == "planning":
             return CommandResult(cmd.corr_id, False, "plan executing")
         target = np.asarray(args.positions, dtype=np.float64)
+        if args.mode != "jog" and self._any_plan_in_flight():
+            # One plan at a time on the whole loop (2026-09-08 review): a goto for THIS arm
+            # while a non-interruptible plan (start_from) walks ANOTHER arm would load two
+            # arms into the executor and move them simultaneously through combinations no
+            # planner validated - the 23:16:52 incident class - and its own plan would be
+            # made with the other arm frozen at a mid-path posture it is about to leave.
+            return CommandResult(cmd.corr_id, False, "plan executing")
         if args.mode == "jog":
-            delta = float(np.max(np.abs(target - self._last_cmd[arm_id])))
-            if delta > self.cfg.jog.goto_threshold_rad:
-                return CommandResult(
-                    cmd.corr_id,
-                    False,
-                    f"delta {delta:.3f} > goto threshold "
-                    f"{self.cfg.jog.goto_threshold_rad}; use goto",
-                )
+            # ANY size is accepted (the 0.15 rad `goto_threshold_rad` nack was dropped
+            # 2026-09-07). A jog never teleports: `JogState.step` walks from the last
+            # COMMANDED q toward the target at `slew_rad_per_tick`, latest-wins, and
+            # every intermediate posture goes through the gate like any other command,
+            # so a big delta is simply a longer constant-speed move. The threshold only
+            # bought the planner's obstacle routing, which the operator does not want on
+            # this panel; the price is that a straight joint-space line into an obstacle
+            # is HELD by the gate instead of routed around it (`goto` still plans).
             self.jog.set_target(arm_id, target)
             return CommandResult(cmd.corr_id, True, "jog")
         # goto: plan on a worker thread; result returns via the bus.
@@ -1266,7 +1757,7 @@ class ControlLoop:
             # measured context fresh; sync here on the loop thread.
             self.planner.sync(self._states)
         q_start = {a: [float(x) for x in self._states[a].q] for a in q_goal}
-        req = PlanRequest(q_start=q_start, q_goal=q_goal)
+        req = PlanRequest(q_start=q_start, q_goal=q_goal, speed_scale=self.speed_scale)
         planner = self.planner
 
         def work() -> None:
@@ -1288,6 +1779,12 @@ class ControlLoop:
 
         threading.Thread(target=work, name="plan-worker", daemon=True).start()
 
+    def _any_plan_in_flight(self) -> bool:
+        """A plan is executing or being planned for ANY arm of this loop."""
+        return bool(self.plans.active_arms) or any(
+            s in ("planning", "executing") for s in self._plan_state.values()
+        )
+
     def _op__plan_ready(self, cmd: Command) -> CommandResult:
         result = cmd.args.get("result")
         arms = cmd.args.get("arms", [])
@@ -1295,6 +1792,18 @@ class ControlLoop:
             for arm_id in arms:
                 self._finish_plan(arm_id, ok=False)
             return CommandResult(cmd.corr_id, True, "plan failed")
+        if self.plans.active_arms:
+            # Defence in depth (2026-09-08 review): the goto is refused while a plan runs,
+            # so a result can only land here if a plan was loaded AFTER the worker
+            # started. Loading it would put two arms into the executor at once; drop it
+            # (per-arm ``failed``, the running plan's session status untouched).
+            for arm_id in arms:
+                self._plan_state[arm_id] = "failed"
+                self._plan_clear_at[arm_id] = self.tick_count + PLAN_STATUS_LINGER_TICKS
+            logger.warning(
+                "plan result for %s dropped: %s already executing", arms, self.plans.active_arms
+            )
+            return CommandResult(cmd.corr_id, False, "plan executing")
         for arm_id in arms:
             self.plans.load(arm_id, result.waypoints[arm_id])
             self._plan_state[arm_id] = "executing"
@@ -1302,21 +1811,141 @@ class ControlLoop:
         return CommandResult(cmd.corr_id, True, "executing")
 
     def _op_execute_plan(self, cmd: Command) -> CommandResult:
-        """Internal: SessionManager hands pre-planned waypoints (start_from §5.2)."""
+        """Internal: SessionManager hands pre-planned waypoints (start_from §5.2; the
+        return-to-start motion passes ``interruptible: True`` so a jog or an arm
+        switch cancels it too — a movement key cancels every plan anyway).
+
+        Since 2026-09-08 evening the manager submits a multi-arm plan ONE ARM AT A
+        TIME in the planner's ``arm_order`` (that day a two-arm ``reset_to_initial``
+        was submitted as one plan and both arms moved simultaneously through
+        combinations the sequential planner never validated; the gate held them at
+        5.2 mm). The loop is the last line: a command carrying MORE THAN ONE arm's
+        waypoints is refused (``one arm per plan``) - the manager bug of that day can
+        not recur through this op. An interruptible plan's gripper targets are ALL
+        deferred to the plan's arrival - including a target for an arm this command
+        does not move, which the manager rides on the last arm of the sequence. A
+        command with NO waypoints (a profile that moves no arm but sets a gripper)
+        applies its gripper targets at once, interruptible or not: there is no motion
+        to arrive, and nothing an operator input could cancel."""
         waypoints: dict[str, list[list[float]]] = cmd.args["waypoints"]
-        for arm_id, wps in waypoints.items():
+        if len(waypoints) > 1:
+            return CommandResult(
+                cmd.corr_id,
+                False,
+                f"one arm per plan (sequential execution), got {sorted(waypoints)}",
+            )
+        for arm_id in waypoints:
             if arm_id not in self.session_arms:
                 return CommandResult(cmd.corr_id, False, f"unknown arm {arm_id!r}")
+            if arm_id in self._faulted or arm_id in self._recovering:
+                return CommandResult(cmd.corr_id, False, f"arm {arm_id!r} is faulted")
+        # One plan at a time (2026-09-08): ``PlanExecutor.load`` would silently replace
+        # the running waypoints (and the bookkeeping below would reset the running
+        # plan's interruptibility / deferred gripper), and the manager-side "plan
+        # executing" blockers run BEFORE a worker plans - so the loop is the last line.
+        if self.plans.active_arms or "planning" in self._plan_state.values():
+            return CommandResult(cmd.corr_id, False, "plan executing")
+        self.plan_cancel_reason = None
+        self._plan_gate_hold_since = None
+        interruptible = bool(cmd.args.get("interruptible", False))
+        self._plan_interruptible = interruptible
+        self._plan_gripper_on_arrival.clear()
+        for arm_id, wps in waypoints.items():
             self.plans.load(arm_id, wps)
             self._plan_state[arm_id] = "executing"
+        moving = bool(self.plans.active_arms)
         for arm_id, frac in cmd.args.get("gripper", {}).items():
-            if arm_id in self.gripper_arms:
-                self._grip_frac[arm_id] = min(max(float(frac), 0.0), 1.0)
-                sender = self._senders.get(arm_id)
-                if sender is not None:
-                    sender.put_gripper(self._grip_frac[arm_id])
+            if arm_id not in self.gripper_arms:
+                continue
+            if interruptible and moving:
+                # return-to-start: the profile's gripper is applied on ARRIVAL, so a
+                # cancelled return leaves it where the episode ended (also for an arm
+                # this command does not move - see the docstring)
+                self._plan_gripper_on_arrival[arm_id] = float(frac)
+                continue
+            self._apply_gripper_target(arm_id, frac)
+        if not moving:  # gripper-only: done in this tick
+            self._plan_interruptible = False
+            self._set_plan_status("done", linger=True)
+            return CommandResult(cmd.corr_id, True, "done")
         self._set_plan_status("executing")
         return CommandResult(cmd.corr_id, True, "executing")
+
+    def _op_reset_to_initial(self, cmd: Command) -> CommandResult:
+        """``R`` (2026-09-08 operator request): walk the workcell back to the
+        designated initial-condition profile for this workcell kind.
+
+        Deliberately a NO-OP with a reason when there is nothing to return to —
+        no profile store, or no profile designated as this kind's initial
+        condition (``ack.ok == false``, so the UI shows the reason as a toast and
+        nothing moves). Refused while an episode records (the motion would
+        pollute it) and while another plan runs. The motion itself is planned by
+        the SessionManager on the session twin — off the loop thread, gated like
+        every other command, and INTERRUPTIBLE: any movement key, a clutch, a jog
+        or an arm switch cancels it and the arms hold where they are."""
+        if self.episode_state == "recording":
+            return CommandResult(cmd.corr_id, False, "recording - save or discard first")
+        if self.profile_store is None:
+            return CommandResult(cmd.corr_id, False, "no profile store")
+        try:
+            profile = self.profile_store.initial_for(self.workcell_kind)  # type: ignore[arg-type]
+        except Exception as e:  # noqa: BLE001 - an unreadable store must not kill the loop
+            return CommandResult(cmd.corr_id, False, f"profile store unreadable: {e}")
+        if profile is None:
+            return CommandResult(
+                cmd.corr_id,
+                False,
+                f"no initial condition designated for the {self.workcell_kind} workcell - "
+                "save a profile with 'use as initial condition' first",
+            )
+        if self.plans.active_arms or "planning" in self._plan_state.values():
+            return CommandResult(cmd.corr_id, False, "plan executing")
+        if self.on_reset_to_initial is None:
+            return CommandResult(cmd.corr_id, False, "no session manager attached")
+        ok, detail = self.on_reset_to_initial(profile)
+        return CommandResult(cmd.corr_id, ok, detail)
+
+    def _op_goto_profile(self, cmd: Command) -> CommandResult:
+        """``goto_profile {profile_id}`` (2026-09-08, no key binding): walk the session
+        arms to the CHOSEN saved profile — the ``reset_to_initial`` motion with a
+        profile the operator picked instead of the designated initial condition.
+
+        Inline validation only (the 100 Hz thread never plans): refused while an
+        episode records, for an unknown id, for a profile of another workcell kind,
+        for one that covers no arm of this session, and while another plan runs; then
+        the SessionManager hook plans it on the session twin off the loop thread and
+        runs it through the gated, INTERRUPTIBLE ``execute_plan`` path — operator
+        input cancels it and the arms hold where they are. Operator-requested
+        motion only; never implicit."""
+        if self.episode_state == "recording":
+            return CommandResult(cmd.corr_id, False, "recording - save or discard first")
+        if self.profile_store is None:
+            return CommandResult(cmd.corr_id, False, "no profile store")
+        profile_id = str(cmd.args.get("profile_id") or "").strip()
+        if not profile_id:
+            return CommandResult(cmd.corr_id, False, "profile_id required")
+        try:
+            profile = self.profile_store.get(profile_id)
+        except ProfileNotFoundError:
+            return CommandResult(cmd.corr_id, False, f"unknown profile {profile_id!r}")
+        except Exception as e:  # noqa: BLE001 - an unreadable store must not kill the loop
+            return CommandResult(cmd.corr_id, False, f"profile store unreadable: {e}")
+        if profile.workcell_kind != self.workcell_kind:
+            return CommandResult(
+                cmd.corr_id,
+                False,
+                f"profile '{profile.name}' is for the {profile.workcell_kind} workcell",
+            )
+        if not any(a in profile.arms for a in self.session_arms):
+            return CommandResult(
+                cmd.corr_id, False, f"profile '{profile.name}' covers no arm of this session"
+            )
+        if self.plans.active_arms or "planning" in self._plan_state.values():
+            return CommandResult(cmd.corr_id, False, "plan executing")
+        if self.on_goto_profile is None:
+            return CommandResult(cmd.corr_id, False, "no session manager attached")
+        ok, detail = self.on_goto_profile(profile)
+        return CommandResult(cmd.corr_id, ok, detail)
 
     def _op_save_profile(self, cmd: Command) -> CommandResult:
         if self.profile_store is None:
@@ -1332,6 +1961,11 @@ class ControlLoop:
             name,
             str(cmd.args.get("notes", "")),
         )
+        # One Cockpit button since 2026-09-07 (05-ui §8.3): "save current state
+        # as profile" carries the initial-condition designation as a switch, so
+        # the two paths cannot drift apart into two differently-named snapshots.
+        if bool(cmd.args.get("set_initial", False)):
+            self.profile_store.set_initial(profile.profile_id)
         return CommandResult(cmd.corr_id, True, profile.profile_id)
 
     def _op_set_initial_condition(self, cmd: Command) -> CommandResult:
@@ -1355,11 +1989,14 @@ __all__ = [
     "DEFAULT_ACTIVE_ARM",
     "DEVICE_ACTION_LINGER_S",
     "FAULT_EVENT_NAMES",
+    "GATE_HOLD_PREFIX",
     "GRIPPER_SEND_EVERY_N_TICKS",
     "HeldSources",
+    "NOT_ONLINE_DAGGER",
     "PLAN_STATUS_LINGER_TICKS",
     "STUDIO_WARNING_DEFAULT",
     "STUDIO_WARNING_LINGER_S",
+    "TAKEOVER_UNAVAILABLE",
     "controller_error_title",
     "default_active_arm",
 ]

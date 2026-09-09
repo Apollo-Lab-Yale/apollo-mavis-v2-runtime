@@ -27,7 +27,7 @@ def test_control_tick_budget_and_rate():
 
     from apollo_mavis_v2_core.protocol import SessionSpec
 
-    from apollo_mavis_v2_runtime.config import RuntimeConfig, VideoConfig
+    from apollo_mavis_v2_runtime.config import DatasetsConfig, RuntimeConfig, VideoConfig
     from apollo_mavis_v2_runtime.runtime import Runtime
 
     wc = {
@@ -40,6 +40,8 @@ def test_control_tick_budget_and_rate():
     cfg = RuntimeConfig(
         workcells={"sim": wc},
         profiles_dir=Path(tempfile.mkdtemp()),
+        # no mapped dataset roots: the startup sweep must never touch the operator's ~/data
+        datasets=DatasetsConfig(default_namespace="apollo", namespaces={}),
         video=VideoConfig(preview_fps=15, session_fps=30),
     )
     from apollo_mavis_v2_core import HeldState

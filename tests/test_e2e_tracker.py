@@ -81,7 +81,7 @@ class Tele:
         self.sock.close()
 
 
-FILTER_DEFAULTS = {"filter_enabled": True, "filter_min_cutoff_hz": 1.0, "filter_beta": 0.05}
+FILTER_DEFAULTS = {"filter_enabled": True, "filter_min_cutoff_hz": 1.0, "filter_beta": 5.0}
 
 
 def _dist(a, b) -> float:
@@ -144,9 +144,7 @@ def test_clutch_keyc_moves_ee_then_release_holds(server, api, session, caplog):
                 assert trk["anchor_tcp"] is not None and trk["target_tcp"] is not None
                 assert trk["status"] == "tracking"
         assert engaged_frames > 20, engaged_frames
-        msg = tele.latest()
-        p1 = msg["arms"][1]["ee_pose"]["position"]
-        assert _dist(p0, p1) > 0.03, (p0, p1)  # fake circle ~0.047 m/s for 2 s
+        msg = _wait_ee_moved(tele, p0, 1, tick=lambda: ctl.keys(["KeyC"]))
         trk = msg["tracker"]
         # The target never leads the anchored hand by more than the hand moved.
         assert _dist(trk["target_tcp"]["position"], trk["anchor_tcp"]["position"]) > 0.01
@@ -215,6 +213,46 @@ def _pad(x: float = 0.0, y: float = 0.0, trigger: bool = False, click: bool = Tr
     )
 
 
+def _wait_ee_moved(tele, p0, i: int, min_m: float = 0.03, timeout_s: float = 8.0, tick=None):
+    """Latest frame once arm ``i``'s EE has moved ``min_m`` away from ``p0``.
+
+    The fake hand circles at ~0.047 m/s, but the sim arm follows it through IK
+    at a rate that depends on the posture and on which way the circle happens
+    to be going when the clutch engages — over the same 2 s window the EE
+    covered 24 mm on one run and 35 mm on the next, so a fixed sleep is a flaky
+    way to ask "did the clutch move the arm". Wait for the distance instead: the
+    hand keeps circling, so it only grows. ``tick`` is called between frames for
+    the keyboard path, whose WS deadman needs a KeysMsg every < 0.2 s.
+    """
+    deadline = time.monotonic() + timeout_s
+    msg = tele.latest()
+    while _dist(p0, msg["arms"][i]["ee_pose"]["position"]) <= min_m:
+        assert time.monotonic() < deadline, (
+            f"EE moved {_dist(p0, msg['arms'][i]['ee_pose']['position']):.4f} m "
+            f"in {timeout_s} s, wanted > {min_m}"
+        )
+        if tick is not None:
+            tick()
+        msg = tele.latest()
+    return msg
+
+
+def _wait_gripper(tele, i: int, pred, timeout_s: float = 4.0) -> float:
+    """Arm ``i``'s ``gripper_open_frac`` once it satisfies ``pred`` (asserts).
+
+    A held gripper code commands a RATE (1.2/s in sim), so how far the jaw has
+    travelled after a fixed sleep depends on how many ticks the loop got — on a
+    loaded machine 0.6 s bought 0.37 of travel where the test wanted 0.48. Wait
+    for the value, not for the clock.
+    """
+    deadline = time.monotonic() + timeout_s
+    g = tele.latest()["arms"][i]["gripper_open_frac"]
+    while not pred(g):
+        assert time.monotonic() < deadline, f"gripper_open_frac stuck at {g:.3f}"
+        g = tele.latest()["arms"][i]["gripper_open_frac"]
+    return g
+
+
 def _wait_tracker(tele, pred, timeout_s=3.0):
     deadline = time.monotonic() + timeout_s
     trk = tele.latest()["tracker"]
@@ -248,10 +286,8 @@ def test_controller_trigger_moves_ee_without_any_keysmsg(server, api, session, c
         c = trk["controller"]
         assert c["trigger"] == 1.0 and c["trigger_pressed"] is True
         assert c["trackpad_click"] is False and c["grip"] is False
-        time.sleep(2.0)
-        msg = tele.latest()
-        p1 = msg["arms"][1]["ee_pose"]["position"]
-        assert _dist(p0, p1) > 0.03, (p0, p1)  # no /ws/control client ever connected
+        # No /ws/control client ever connected: the device-held KeyC alone drives it.
+        msg = _wait_ee_moved(tele, p0, 1)
         assert msg["controller_connected"] is False
         assert msg["tracker"]["anchor_tcp"] is not None and msg["tracker"]["target_tcp"]
         script["state"] = ControllerState(trigger=0.0)  # trigger released: hold-last
@@ -318,11 +354,10 @@ def test_controller_codes_survive_ws_deadman_latch(server, api, session):
         script["state"] = _pad(y=-1.0, trigger=True)  # trigger click + trackpad down
         trk = _wait_tracker(tele, lambda t: t["engaged_arm"] == "grip")
         assert sorted(trk["device_held"]) == ["KeyC", "KeyF"]
-        time.sleep(1.5)
-        msg = tele.latest()
+        time.sleep(1.5)  # long enough for the gripper, which closes at 1.2/s while held
+        msg = _wait_ee_moved(tele, p0, 1, min_m=0.02)  # the EE rate depends on the posture
         assert watchdog.state.value == "await_empty"  # WS still latched throughout
-        assert _dist(p0, msg["arms"][1]["ee_pose"]["position"]) > 0.02
-        assert msg["arms"][1]["gripper_open_frac"] < g0 - 0.5  # 1.2/s while held
+        assert msg["arms"][1]["gripper_open_frac"] < g0 - 0.5
         script["state"] = None
         _wait_tracker(tele, lambda t: t["controller"] is None and t["device_held"] == [])
     finally:
@@ -367,17 +402,14 @@ def test_trackpad_click_gripper_only_on_grip_arm_and_menu_switches_arm(server, a
         g0 = tele.latest()["arms"][1]["gripper_open_frac"]
         script["state"] = _pad(y=-0.9)
         _wait_tracker(tele, lambda t: t["device_held"] == ["KeyF"])
-        time.sleep(0.6)
-        g1 = tele.latest()["arms"][1]["gripper_open_frac"]
-        assert g1 < g0 - 0.4  # 1.2/s while held
+        g1 = _wait_gripper(tele, 1, lambda g: g < g0 - 0.4)  # 1.2/s while held
         script["state"] = _pad(y=-0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
         # ... and up (y dominant even with some x) opens again.
         script["state"] = _pad(x=0.4, y=0.9)
         _wait_tracker(tele, lambda t: t["device_held"] == ["KeyH"])
-        time.sleep(0.6)
-        g2 = tele.latest()["arms"][1]["gripper_open_frac"]
-        assert g2 > g1 + 0.1  # sim gripper opens slower than it closes; direction is the point
+        # The sim gripper opens slower than it closes; the direction is the point.
+        _wait_gripper(tele, 1, lambda g: g > g1 + 0.1)
         script["state"] = _pad(y=0.9, click=False)
         _wait_tracker(tele, lambda t: t["device_held"] == [])
         # Menu again -> switch_arm wraps back to view (arm_prev has no controller binding).
@@ -418,7 +450,7 @@ def test_filter_settings_echoed_and_pose_filtered_in_session(server, api, sessio
         assert not ack["ok"] and "invalid args" in ack["detail"]
         ack = ctl.action(
             "tracker_settings",
-            {"filter_min_cutoff_hz": 1.0, "filter_beta": 0.05, "filter_enabled": True},
+            {"filter_min_cutoff_hz": 1.0, "filter_beta": 5.0, "filter_enabled": True},
         )
         assert ack["ok"]
         _wait_tracker(tele, lambda t: t["settings"] == FILTER_DEFAULTS | {

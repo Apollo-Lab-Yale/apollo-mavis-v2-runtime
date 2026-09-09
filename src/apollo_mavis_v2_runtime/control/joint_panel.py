@@ -1,18 +1,31 @@
 """Direct joint-control path: jog / goto (04-runtime §7).
 
-``jog`` = per-tick slew toward a latest-wins target, joint-space (no IK);
-``jog`` with ``max|Δq| > goto_threshold`` is nacked. ``goto`` = twin plan ->
-waypoint stream through the same slew-limited gated path. Both pass the
-gate; both are nacked while recording (phase-07 wires the recorder flag).
+``jog`` = per-tick slew toward a latest-wins target, joint-space (no IK), at ANY
+delta: the target is a destination, never a step, so the arm always approaches at
+``slew_rad_per_tick`` and a fast slider drag just trails and catches up (the UI
+joint panel is exactly this and has no other mode). ``goto`` = twin plan ->
+waypoint stream through the same slew-limited gated path, kept for the profile /
+rail-homing paths that need obstacle routing. Both pass the gate; both are nacked
+while recording (phase-07 wires the recorder flag).
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
 from ..config import JogConfig
 
 N_JOINTS = 7  # arm joints; rail is slot 7 when present
+# ``PlanExecutor`` walks a segment in ``ceil(ratio)`` EQUAL ticks (``ratio`` = the segment
+# measured in caps), so no tick is shorter than half a full tick and, for a segment of many
+# ticks, every tick is practically a full one (2026-09-09; 11-safety §9). The twin
+# planner's escape phase (sim ``planner._tick_count``, pinned by
+# tests/test_plan_passes_gate.py) requires the gate's strict opening per tick of the
+# slowest session; the previous "full ticks, then the remainder" rule emitted an arbitrarily
+# small last tick that opened an arbitrarily small amount.
+RATIO_EPS = 1e-9  # a ratio this close to an integer counts as that integer (float drift)
 
 
 class JogState:
@@ -27,6 +40,21 @@ class JogState:
 
     def clear(self, arm_id: str) -> None:
         self._target.pop(arm_id, None)
+
+    def clear_all(self) -> list[str]:
+        """Drop every pending target; returns the arms that had one.
+
+        Used on the WS input watchdog's latch edge (11-safety §10.1): a jog is a
+        DESTINATION, so leaving it pending would (a) wedge the arm in
+        ``CommandSource.JOINT_JOG`` forever, because the loop's deadman check
+        returns before ``step()`` can ever retire the target - which also blocks
+        that arm's tracker teleop - and (b) resume motion toward a stale
+        destination the moment the browser reconnects, which is exactly what the
+        all-keys-up latch exists to prevent (T4/T5).
+        """
+        had = sorted(self._target)
+        self._target.clear()
+        return had
 
     def active(self, arm_id: str) -> bool:
         return arm_id in self._target
@@ -70,6 +98,18 @@ class PlanExecutor:
     bend the physical path off the validated segment while the gate only sees
     the commanded (on-line) posture. ``cancel()`` freezes at the current
     commanded q (decelerating stop is a single slew-limited hold at 100 Hz).
+
+    Equal ticks (2026-09-09): a segment of ``ratio`` caps is walked in
+    ``ceil(ratio)`` equal steps - the same number of ticks as "full ticks, then
+    the remainder", still on the straight segment and under the caps, but no
+    step is ever shorter than half a tick (a segment of many ticks: practically
+    full ticks). The gate's T8 escape rule demands a strict opening on EVERY
+    tick of an arm inside the shell, so a tiny remainder tick (measured 3-13 %
+    of a tick at 10 % speed, opening 4-8 um < the gate's 10 um) was held;
+    because the executor had already advanced its index, the next tick then
+    headed for the following waypoint from the held point - an unvalidated
+    bend. The twin planner's escape phase judges its segments with exactly this
+    tick model (sim ``planner._tick_count``).
     """
 
     def __init__(self, cfg: JogConfig) -> None:
@@ -128,8 +168,8 @@ class PlanExecutor:
             n = min(N_JOINTS, delta.shape[0], self._lever.shape[0])
             cart = float(np.sum(np.abs(delta[:n]) * self._lever[:n]))
             ratio = max(ratio, cart / self._cart_step_m)
-        if ratio > 1.0:  # straight segment: the fastest slot at its cap, the rest in proportion
-            delta = delta / ratio
+        if ratio > 1.0 + RATIO_EPS:  # straight segment, ceil(ratio) equal steps (docstring)
+            delta = delta / math.ceil(ratio - RATIO_EPS)
         q_next = q_last + delta
         if np.max(np.abs(q_next - target)) < 1e-9:
             if i + 1 < len(wps):
@@ -140,4 +180,4 @@ class PlanExecutor:
         return q_next
 
 
-__all__ = ["N_JOINTS", "JogState", "PlanExecutor"]
+__all__ = ["N_JOINTS", "RATIO_EPS", "JogState", "PlanExecutor"]

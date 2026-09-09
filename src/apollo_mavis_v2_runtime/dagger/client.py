@@ -96,8 +96,13 @@ class AsyncTrainerClientImpl:
 
     # -- process ---------------------------------------------------------------
     def _spawn(self, resume: bool) -> None:
-        cmd = [sys.executable, "-m", "apollo_mavis_v2_runtime.dagger.trainer",
-               "--config", str(self._cfg_path)]
+        cmd = [
+            sys.executable,
+            "-m",
+            "apollo_mavis_v2_runtime.dagger.trainer",
+            "--config",
+            str(self._cfg_path),
+        ]
         if resume:
             cmd.append("--resume")
         env = dict(os.environ)
@@ -174,8 +179,7 @@ class AsyncTrainerClientImpl:
     # -- AsyncTrainerClient Protocol --------------------------------------------------
     def submit_episode(self, episode_path: str, summary: EpisodeSummary) -> None:
         self._queue.put(
-            {"cmd": "submit_episode", "episode_path": episode_path,
-             "summary": asdict(summary)}
+            {"cmd": "submit_episode", "episode_path": episode_path, "summary": asdict(summary)}
         )
 
     def poll_checkpoint(self) -> CheckpointInfo | None:
@@ -227,6 +231,7 @@ def summary_from_dict(data: dict) -> EpisodeSummary:
         takeover_segments=int(data["takeover_segments"]),
         segment_doubts=[float(x) for x in data.get("segment_doubts", [])],
         success=data.get("success"),
+        episode_id=str(data.get("episode_id", "")),
     )
 
 

@@ -98,11 +98,19 @@ class SafetyGate:
         if stale:  # §7.1 step 1: fail closed for ALL arms
             q_out = {a: self._last_safe.get(a, q_meas[a]) for a in q_cmd}
             event = CollisionEvent(
-                ts=ts, kind="stale_twin", pairs=[], dists_m=[],
-                min_clearance_m=0.0, source=source, arm_ids=sorted(q_cmd),
+                ts=ts,
+                kind="stale_twin",
+                pairs=[],
+                dists_m=[],
+                min_clearance_m=0.0,
+                source=source,
+                arm_ids=sorted(q_cmd),
             )
             report = CollisionReport(
-                blocked=True, severity="blocked", ts=ts, violations=[event],
+                blocked=True,
+                severity="blocked",
+                ts=ts,
+                violations=[event],
             )
             events = [event] if not self._blocked else []
             self._blocked = True
@@ -125,8 +133,12 @@ class SafetyGate:
                 self._block_pairs = set()
                 events.append(
                     CollisionEvent(
-                        ts=ts, kind="cleared", pairs=[], dists_m=[],
-                        min_clearance_m=self._unblock_threshold(), source=source,
+                        ts=ts,
+                        kind="cleared",
+                        pairs=[],
+                        dists_m=[],
+                        min_clearance_m=self._unblock_threshold(),
+                        source=source,
                     )
                 )
             self._last_safe = {a: np.array(q) for a, q in q_cmd.items()}
@@ -136,11 +148,17 @@ class SafetyGate:
         offending = {a for pair in viols for a in self.twin._arms_of_pair(pair)}
         d_cmd = {p: self.twin.pair_distance(p, q_cmd, 0.5) for p in viols}
         d_meas = {p: self.twin.pair_distance(p, None, 0.5) for p in viols}
-        meas_viols = {
-            p
-            for p, d in d_meas.items()
-            if d < self.twin.inflation_m + self.cfg.min_clearance_m
-        }
+        # "Violating at q_meas" uses the same step-3 window as the command: while blocked
+        # the hysteresis band counts, else a pair the escape has already opened past δ
+        # (measured 8.03 mm, commanded 8.16 mm) would read as NEW and step 7 would hold
+        # the arm inside the band for good - a plan executed at 10 / 50 % speed cannot
+        # jump the 2 mm band in one tick (2026-09-09, tests/test_plan_passes_gate.py).
+        meas_thr = (
+            self._unblock_threshold()
+            if self._blocked
+            else self.twin.inflation_m + self.cfg.min_clearance_m
+        )
+        meas_viols = {p for p, d in d_meas.items() if d < meas_thr}
         q_out: dict[str, np.ndarray] = {}
         for arm_id, q in q_cmd.items():
             if arm_id not in offending:

@@ -165,8 +165,10 @@ def build_repo_id(
     action_space: ActionSpace = "delta_ee",
 ) -> str:
     """``apollo/xarm7_{task}_{n}arm_{conv}`` (10-frames §8.1 grammar)."""
-    conv = _SPACE_TOKEN[action_space] + "-" + "+".join(
-        _frame_token(a.arm_id, frames[a.arm_id]) for a in arms
+    conv = (
+        _SPACE_TOKEN[action_space]
+        + "-"
+        + "+".join(_frame_token(a.arm_id, frames[a.arm_id]) for a in arms)
     )
     return f"apollo/xarm7_{slug(task)}_{len(arms)}arm_{conv}"
 

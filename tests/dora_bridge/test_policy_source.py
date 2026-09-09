@@ -1,0 +1,403 @@
+"""ExternalPolicyHub / ExternalPolicySource rules (14-dora §5, §6.2, §6.3; §10 tier 2)."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from apollo_mavis_v2_core.interfaces.policy import PolicySpec
+from apollo_mavis_v2_core.protocol import external as ext
+from apollo_mavis_v2_core.protocol.external import (
+    PolicySpecAnnounce,
+    PolicySpecModel,
+    TrainerStatusAnnounce,
+)
+
+from apollo_mavis_v2_runtime.config import DoraConfig, DoraPolicyConfig
+from apollo_mavis_v2_runtime.dagger.policy_source import PolicySource
+from apollo_mavis_v2_runtime.dora_bridge import codec
+from apollo_mavis_v2_runtime.dora_bridge.bridge import DoraBridge
+from apollo_mavis_v2_runtime.dora_bridge.policy_source import (
+    ExternalPolicyHub,
+    ExternalPolicySource,
+    spec_from_announce,
+)
+from dora_bridge.fake_node import FakeControlPlane, FakeNode
+
+pa = pytest.importorskip("pyarrow")
+
+NAMES = [
+    "grip_ee.dx",
+    "grip_ee.dy",
+    "grip_ee.dz",
+    "grip_ee.drx",
+    "grip_ee.dry",
+    "grip_ee.drz",
+    "grip_gripper.pos",
+    "grip_rail.dpos",
+]
+STATE_NAMES = [f"grip_joint{i}.pos" for i in range(1, 8)] + ["grip_gripper.pos", "grip_rail.pos"]
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.t = 100.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class FakePublisher:
+    def __init__(self) -> None:
+        self.observation_id = 0
+        self.observation_times: dict[int, float] = {}
+        self.events: list[tuple[str, dict]] = []
+
+    def observation_t_mono(self, oid: int):
+        return self.observation_times.get(oid)
+
+    def publish_event(self, kind, payload, session_id=None):
+        self.events.append((kind, payload))
+
+
+def announce(version=1, frame="arm_base:grip", names=NAMES, rate=15.0, chunk_dt=None):
+    return PolicySpecAnnounce(
+        policy_id="fake",
+        policy_version=version,
+        node_version="t",
+        rate_hz=rate,
+        chunk_dt_s=chunk_dt,
+        spec=PolicySpecModel(
+            action_space="delta_ee",
+            action_frame=frame,
+            action_names=list(names),
+            state_names=STATE_NAMES[:3],
+        ),
+    )
+
+
+@pytest.fixture
+def rig(tmp_path):
+    clock = Clock()
+    cfg = DoraConfig(enabled=True, var_dir=tmp_path / "d")
+    node = FakeNode()
+    bridge = DoraBridge(
+        cfg,
+        epoch="e",
+        control_plane_factory=lambda c, d, ips: FakeControlPlane(c, d, ips),
+        node_factory=lambda *a: node,
+        versions_ok=lambda: None,
+        clock=clock,
+    )
+    bridge.state = "attached"  # no thread: we call the handlers directly
+    bridge.node = node
+    hub = ExternalPolicyHub(bridge, DoraPolicyConfig(), clock=clock)
+    pub = FakePublisher()
+    return clock, bridge, hub, pub, node
+
+
+def spec_event(ann):
+    return {
+        "type": "INPUT",
+        "id": ext.IN_POLICY_SPEC,
+        "value": codec.encode_json(ann),
+        "metadata": {},
+    }
+
+
+def action_event(rows, oid, *, session_id="s1", version=1, chunk_dt=1 / 15, **extra):
+    arr, meta = codec.encode_action(np.asarray(rows, dtype=np.float32))
+    meta.update(
+        {
+            "observation_id": oid,
+            "chunk_dt_s": chunk_dt,
+            "policy_id": "fake",
+            "policy_version": version,
+            "compute_ms": 1.0,
+            ext.META_SESSION_ID: session_id,
+            ext.META_SCHEMA: 1,
+            ext.META_SEQ: oid,
+            ext.META_CLIENT: "t",
+        }
+    )
+    meta.update(extra)
+    return {"type": "INPUT", "id": ext.IN_POLICY_ACTION, "value": arr, "metadata": meta}
+
+
+def make_source(hub, pub, clock, ann=None, rate=15.0, chunk_dt=None):
+    ann = ann or announce(rate=rate, chunk_dt=chunk_dt)
+    src = ExternalPolicySource(
+        hub,
+        pub,
+        session_id="s1",
+        spec=spec_from_announce(ann),
+        policy_id=ann.policy_id,
+        arms_meta=[("grip", True)],
+        rate_hz=rate,
+        chunk_dt_s=chunk_dt,
+        cfg=DoraPolicyConfig(),
+        clock=clock,
+    )
+    return src
+
+
+def test_hub_caches_spec_with_staleness_and_drops_bad_payloads(rig):
+    clock, bridge, hub, pub, node = rig
+    assert hub.spec() is None and hub.policy_attached is False
+    hub._on_spec(spec_event(announce()))
+    assert hub.spec() is not None and hub.policy_attached is True and hub.spec_age_s() == 0.0
+    clock.t += 2.9
+    assert hub.spec() is not None
+    clock.t += 0.2  # > spec_stale_s (3 s)
+    assert hub.spec() is None and hub.policy_attached is False
+    dropped = bridge.dropped_inputs
+    hub._on_spec(
+        {"type": "INPUT", "id": ext.IN_POLICY_SPEC, "value": pa.array(["not json"]), "metadata": {}}
+    )
+    assert bridge.dropped_inputs == dropped + 1
+    hub._on_action(action_event([[0.0] * 8], 1))  # no session source -> dropped
+    assert bridge.dropped_inputs == dropped + 2
+    bridge._set_state("detached", "x")  # a detach forgets the spec: it must be re-heard
+    hub._on_spec(spec_event(announce()))
+    bridge._set_state("attached", "")
+    assert hub.policy_attached is True
+
+
+def test_source_is_a_policy_source_and_validates_actions(rig):
+    clock, bridge, hub, pub, node = rig
+    src = make_source(hub, pub, clock)
+    assert isinstance(src, PolicySource)
+    assert src.period == pytest.approx(1 / 15) and src.version_label() == "fake/v000001"
+    src.start()
+    assert hub.source is src
+    # session_start reset published + watermark 0
+    assert node.sent_ids() == [] or True  # bridge has no thread: FIFO holds it
+    assert src.watermark == 0
+    pub.observation_id = 3
+    pub.observation_times = {1: 99.5, 2: 99.8, 3: 99.95}
+    dropped = bridge.dropped_inputs
+    src.on_action(action_event([[0.0] * 8], 3, session_id="other"), clock())
+    assert bridge.dropped_inputs == dropped + 1 and src.latest()[0] is None
+    src.on_action(action_event([[0.0] * 7], 3), clock())  # action_dim 7 != 8
+    assert bridge.dropped_inputs == dropped + 2
+    bad = action_event([[0.0] * 8], 3)
+    del bad["metadata"]["chunk_len"]
+    src.on_action(bad, clock())
+    assert bridge.dropped_inputs == dropped + 3
+    src.on_action(action_event([[0.0] * 8], 99), clock())  # unknown observation -> late
+    assert src.actions_late == 1
+    clock.t = 100.5  # observation 1 is now 1.0 s old (> 0.5)
+    src.on_action(action_event([[0.0] * 8], 1), clock())
+    assert src.actions_late == 2 and src.latest()[0] is None
+    src.on_action(
+        action_event([[0.01] * 6 + [1.0, 0.0]], 3), clock()
+    )  # fresh (0.55 s? no: 99.95 -> 0.55)
+    assert src.latest()[0] is None and src.actions_late == 3
+    pub.observation_times[3] = 100.4
+    src.on_action(action_event([[0.01] * 6 + [1.0, 0.0]], 3), clock())
+    out, t = src.latest()
+    assert out is not None and t == clock() and out.version == 1
+    assert np.allclose(out.actions[:6], 0.01) and out.actions[6] == 1.0
+    nan_row = [[np.nan] * 8]
+    src.on_action(action_event(nan_row, 3), clock())
+    assert not np.all(np.isfinite(src.latest()[0].actions))  # NaN passes through (3-strike guard)
+    src.stop()
+    assert hub.source is None
+
+
+def test_staleness_timeline_holds_at_0_45_s_for_15_hz(rig):
+    clock, bridge, hub, pub, node = rig
+    src = make_source(hub, pub, clock)
+    pub.observation_times = {1: clock()}
+    src.on_action(action_event([[0.0] * 8], 1), clock())
+    t0 = clock()
+    assert src.staleness_scale(t0) == 1.0
+    period = 1 / 15
+    assert src.staleness_scale(t0 + period + 0.05) == 1.0  # timeout edge
+    mid = t0 + period + 0.05 + 2.5 * period
+    assert 0.45 < src.staleness_scale(mid) < 0.55
+    assert src.staleness_scale(t0 + 0.4499) > 0.0
+    assert src.staleness_scale(t0 + 0.4501) == 0.0  # period + 0.05 + 5 * period = 0.45 s
+    assert src.policy_stale(t0) is False or not hub.policy_attached
+    assert src.policy_stale(t0 + 0.5) is True
+
+
+def test_chunks_advance_one_row_per_chunk_dt_and_rescale_deltas(rig):
+    clock, bridge, hub, pub, node = rig
+    chunk_dt = 0.04  # 25 Hz rows; policy rate 15 Hz
+    src = make_source(hub, pub, clock, chunk_dt=chunk_dt)
+    pub.observation_times = {1: clock()}
+    rows = np.zeros((4, 8), dtype=np.float32)
+    rows[:, 0] = [0.004, 0.008, 0.012, 0.016]  # per-chunk_dt deltas
+    rows[:, 6] = 1.0
+    src.on_action(action_event(rows, 1, chunk_dt=chunk_dt), clock())
+    out0, t0 = src.latest()
+    factor = src.period / chunk_dt  # per-period units for the executor's dt/period scaling
+    assert (
+        out0.actions[0] == pytest.approx(0.004 * factor) and out0.actions[6] == 1.0
+    )  # gripper absolute
+    assert out0.chunk_remaining == 3 and t0 == clock()
+    clock.t += 0.045
+    out1, t1 = src.latest()
+    assert out1.actions[0] == pytest.approx(0.008 * factor) and t1 == pytest.approx(t0 + chunk_dt)
+    clock.t += 0.2  # past the last row: hold on row 3
+    out3, t3 = src.latest()
+    assert out3.actions[0] == pytest.approx(0.016 * factor) and out3.chunk_remaining == 0
+    assert t3 == pytest.approx(t0 + 3 * chunk_dt)
+    src.pause()
+    assert src.latest()[0] is None and src.paused
+    src.resume()
+    assert src.latest()[0] is None  # pause dropped the chunk
+
+
+def test_reset_watermark_publishes_policy_reset_and_drops_older_observations(rig):
+    clock, bridge, hub, pub, node = rig
+    src = make_source(hub, pub, clock)
+    src.start()
+    pub.observation_id = 10
+    pub.observation_times = {9: clock(), 10: clock(), 11: clock(), 12: clock()}
+    src.on_action(action_event([[0.0] * 8], 9), clock())
+    assert src.latest()[0] is not None
+    src.drop_and_requery()  # handback: watermark = newest observation (10)
+    assert src.latest()[0] is None and src.watermark == 10
+    src.on_action(action_event([[0.0] * 8], 10), clock())
+    assert src.latest()[0] is None and src.actions_late == 1
+    pub.observation_id = 12
+    src.on_action(action_event([[0.0] * 8], 11), clock())
+    assert src.latest()[0] is not None
+    reasons = [t()[1].get("reason") for oid, t, _ in bridge._fifo if oid == "policy_reset"]
+    assert reasons[:2] == ["session_start", "handback"]
+    assert [k for k, _ in pub.events] == ["reset_watermark", "reset_watermark"]
+    # a version change mid-stream is recorded, never rejected
+    src.on_action(action_event([[0.0] * 8], 12, version=2), clock())
+    assert src.current_version() == 2 and src.version_changes == 1
+    assert src.version_label() == "fake/v000002"
+    src.stop()
+    resets = [t()[1].get("reason") for oid, t, _ in bridge._fifo if oid == "policy_reset"]
+    assert resets[-1] == "session_stop"
+
+
+def test_spec_frame_mismatch_is_visible_to_the_manager_check(rig):
+    clock, bridge, hub, pub, node = rig
+    ann = announce(frame="world")
+    spec = spec_from_announce(ann)
+    assert isinstance(spec, PolicySpec) and spec.action_frame == "world"
+    assert spec.action_names == NAMES and spec.version == 1
+
+
+# -- phase-14 (15-online-dagger §6): the trainer role's status on policy/trainer_status ------------
+def trainer_event(msg, **meta):
+    return {
+        "type": "INPUT",
+        "id": ext.IN_POLICY_TRAINER_STATUS,
+        "value": codec.encode_json(msg),
+        "metadata": dict(meta),
+    }
+
+
+def trainer_status(state="preparing", **kw):
+    return TrainerStatusAnnounce(
+        trainer_id="repo/online_dagger",
+        node_version="0.1",
+        state=state,
+        progress=0.5,
+        **kw,
+    )
+
+
+class SinkSpy:
+    """The coordinator surface the hub drives (bus thread)."""
+
+    def __init__(self) -> None:
+        self.statuses: list[tuple] = []
+        self.versions: list[int] = []
+
+    def on_trainer_status(self, msg, t_recv):
+        self.statuses.append((msg, t_recv))
+
+    def on_spec_version(self, version):
+        self.versions.append(version)
+
+
+def test_hub_caches_trainer_status_with_staleness_and_drops_bad_payloads(rig):
+    import json
+
+    clock, bridge, hub, pub, node = rig
+    assert hub.trainer_status() is None and hub.trainer_age_s() is None
+    assert hub.trainer_capable() is False
+    hub._on_spec(spec_event(announce()))
+    assert hub.trainer_capable() is False  # a fresh spec WITHOUT the capability
+    hub._on_spec(spec_event(announce().model_copy(update={"capabilities": ["online_dagger"]})))
+    assert hub.trainer_capable() is True
+    msg = trainer_status()
+    hub._on_trainer_status(trainer_event(msg, client="node", seq=1))
+    assert hub.trainer_status() == msg and hub.trainer_age_s() == 0.0
+    assert hub.trainer_statuses_seen == 1
+    clock.t += 2.9
+    assert hub.trainer_status() == msg
+    clock.t += 0.2  # > spec_stale_s (3 s): the same freshness rule as the spec
+    assert hub.trainer_status() is None and hub.trainer_age_s() == pytest.approx(3.1)
+    assert hub.trainer_capable() is False  # the spec went stale with it
+    dropped = bridge.dropped_inputs
+    bad = {"type": "INPUT", "id": ext.IN_POLICY_TRAINER_STATUS, "metadata": {}}
+    hub._on_trainer_status({**bad, "value": pa.array(["not json"])})
+    hub._on_trainer_status(trainer_event(msg.model_copy(update={"mavis_schema": 99})))
+    hub._on_trainer_status({**bad, "value": pa.array([json.dumps({"state": "idle"})])})
+    assert bridge.dropped_inputs == dropped + 3  # counted + logged, never raised
+    assert hub.trainer_statuses_seen == 1 and hub.trainer_status() is None
+    hub._on_trainer_status({"type": "STOP"})  # non-INPUT events are ignored
+    assert hub.trainer_statuses_seen == 1
+    hub._on_trainer_status(trainer_event(msg))
+    assert hub.trainer_status() == msg and hub.trainer_statuses_seen == 2
+    bridge._set_state("detached", "x")  # a detach forgets it like the spec
+    assert hub.trainer_status() is None
+    bridge._set_state("attached", "")
+    assert hub.trainer_status() is None  # must be re-heard
+    hub._on_trainer_status(trainer_event(msg))
+    assert hub.trainer_status() == msg
+
+
+def test_hub_feeds_the_trainer_sink_and_replays_the_cached_status_on_attach(rig):
+    clock, bridge, hub, pub, node = rig
+    hub._on_spec(spec_event(announce(version=3)))
+    msg = trainer_status()
+    hub._on_trainer_status(trainer_event(msg))
+    t_recv = clock()
+    clock.t += 0.5
+    sink = SinkSpy()
+    hub.attach_trainer_sink(sink)
+    assert hub.trainer_sink is sink
+    assert sink.versions == [3]  # the announced policy version first ...
+    assert sink.statuses == [(msg, t_recv)]  # ... then the cached status with ITS receive time
+    msg2 = trainer_status("training", metrics={"loss": 0.1})
+    hub._on_trainer_status(trainer_event(msg2))
+    assert sink.statuses[-1] == (msg2, clock())
+    hub._on_spec(spec_event(announce(version=4)))
+    assert sink.versions == [3, 4]
+    # an action's policy_version is the acting version too (15-online-dagger §3)
+    src = make_source(hub, pub, clock, ann=announce(version=4))
+    src.start()
+    pub.observation_id = 1
+    pub.observation_times = {1: clock()}
+    src.on_action(action_event([[0.0] * 8], 1, version=5), clock())
+    assert sink.versions == [3, 4, 5]
+    src.on_action(action_event([[0.0] * 8], 1, version=5), clock())  # same version: quiet
+    assert sink.versions == [3, 4, 5]
+    # a sink that raises never breaks the bus thread
+    sink.on_trainer_status = lambda m, t: 1 / 0
+    hub._on_trainer_status(trainer_event(msg2))
+    assert hub.trainer_status() == msg2
+    hub.detach_trainer_sink(SinkSpy())  # someone else's sink: no-op
+    assert hub.trainer_sink is sink
+    hub.detach_trainer_sink(sink)
+    assert hub.trainer_sink is None
+    hub._on_spec(spec_event(announce(version=6)))
+    assert sink.versions == [3, 4, 5]  # detached: nothing more
+    # attaching while the cached status is STALE replays only the version
+    clock.t += 5.0
+    hub._on_spec(spec_event(announce(version=7)))
+    sink2 = SinkSpy()
+    hub.attach_trainer_sink(sink2)
+    assert sink2.versions == [7] and sink2.statuses == []
+    hub.attach_trainer_sink(None)
+    assert hub.trainer_sink is None
+    src.stop()

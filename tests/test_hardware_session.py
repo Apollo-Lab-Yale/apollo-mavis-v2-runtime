@@ -14,14 +14,16 @@ the bring-up telemetry rows, the failure path (fps restored, monitor resumed, no
 half-connected session), the §3 refusal matrix with its detail strings - incl.
 phase-09d's "hardware sessions include every configured arm" (D1 freezing is
 now the rail-homing job's alone) - the phase-09d ``start_from=profile`` path
-(planned on the gate twin inside bring-up, executed through ``_op_execute_plan``,
-409 on a plan failure) and - optional, skipped without the hardware package's
+(planned on the gate twin inside bring-up, executed through ``_op_execute_plan`` one
+arm at a time in the planner's ``arm_order`` - 2026-09-08 evening - 409 on a plan
+failure) and - optional, skipped without the hardware package's
 test fakes - the REAL ``HardwareWorkcell`` + ``XArmDriver`` over ``FakeXArmAPI``."""
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import math
 import sys
 import threading
@@ -31,7 +33,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from apollo_mavis_v2_core import WorkcellConfig
+from apollo_mavis_v2_core import HeldState, WorkcellConfig
+from apollo_mavis_v2_core.schemas.config import CameraIntrinsics
 from apollo_mavis_v2_core.testing import FakeArm, FakeCamera
 from conftest import FakeMonitorFactory, FakeMonitorSample, make_runtime_config
 from fakes import FakeServoLimits, HardwareFakeWorkcell
@@ -106,6 +109,8 @@ HW_WORKCELL = {
             "fourcc": "YUYV",
             "resolution": [64, 48],
             "fps": 30,
+            # the lab's D435 colour intrinsics scaled to the 64x48 test frames (x 0.1)
+            "intrinsics": {"fx": 60.819, "fy": 60.823, "cx": 32.739, "cy": 24.790},
         },
         {
             "id": "view_wrist",
@@ -114,6 +119,7 @@ HW_WORKCELL = {
             "fourcc": "YUYV",
             "resolution": [64, 48],
             "fps": 30,
+            "intrinsics": {"fx": 60.636, "fy": 60.638, "cx": 31.190, "cy": 24.945},
         },
     ],
     "safety": {"enabled": True},
@@ -197,9 +203,25 @@ def _wait(pred, timeout_s: float = 10.0) -> bool:
     return pred()
 
 
+class LiveClockCamera(FakeCamera):
+    """FakeCamera whose frames carry the LIVE monotonic clock: the recorder drops a
+    frame older than 2/fps, so the deterministic internal clock would starve it."""
+
+    def latest(self):
+        frame = super().latest()
+        if frame is None:
+            return None
+        from apollo_mavis_v2_core import CameraFrame
+
+        return CameraFrame(
+            camera_id=frame.camera_id, rgb=frame.rgb, t_mono=time.monotonic(),
+            wallclock_ns=time.time_ns(), seq=frame.seq,
+        )
+
+
 @pytest.fixture(scope="module")
 def cams():
-    return {cid: FakeCamera(cid, (64, 48), 30.0) for cid in ("grip_wrist", "view_wrist")}
+    return {cid: LiveClockCamera(cid, (64, 48), 30.0) for cid in ("grip_wrist", "view_wrist")}
 
 
 @pytest.fixture(scope="module")
@@ -283,7 +305,6 @@ def test_speed_scale_on_the_host_side_config():
     # not speeds: untouched
     assert scaled.teleop.gripper_frac_ps == cfg.teleop.gripper_frac_ps
     assert scaled.leash == cfg.leash and scaled.watchdog == cfg.watchdog
-    assert scaled.jog.goto_threshold_rad == cfg.jog.goto_threshold_rad
     assert scale_control_config(cfg, 1.0) == cfg
     with pytest.raises(ValueError):
         scale_control_config(cfg, 0.0)
@@ -353,6 +374,42 @@ def test_teleop_chain_is_capped_at_what_the_servo_stream_executes():
     assert servo_caps.joint_step_rad == pytest.approx(0.0003)
     assert servo_caps.slew_rad_per_tick == pytest.approx(0.0003)
     assert teleop_rate_caps(cfg, servo_caps) == (pytest.approx(0.02), pytest.approx(0.03))
+
+
+def test_executor_rail_slew_is_capped_at_the_tracks_positioning_speed():
+    """2026-09-08 review: the executor slewed the rail slot at ``jog.rail_m_per_tick`` x
+    scale = 0.2 m/s at 100 % while the track positions at ``rail_speed_mm_s`` (50 x scale)
+    toward latest-wins targets, so an arm was declared arrived up to ~10 s before its
+    carriage physically got there. The connected driver's (already speed-scaled)
+    ``rail_speed_mm_s`` now bounds the rail slew per loop tick; a driver without one
+    (fakes, sim) leaves the host value alone."""
+    from types import SimpleNamespace
+
+    from apollo_mavis_v2_runtime.session.hardware import apply_executor_caps, executor_caps_for
+
+    cfg = ControlConfig()  # 100 Hz, host rail 0.002 m/tick
+    railed = SimpleNamespace(cfg=SimpleNamespace(servo=FakeServoLimits(), rail_speed_mm_s=50))
+    caps = executor_caps_for([railed], cfg)
+    assert caps.source == "servo" and caps.rail_m_per_tick == pytest.approx(0.0005)
+    out = apply_executor_caps(cfg, caps)
+    assert out.jog.rail_m_per_tick == pytest.approx(0.0005)  # 0.002 -> 50 mm/s / 100 Hz
+    assert out.jog.slew_rad_per_tick == pytest.approx(0.0003)  # the joint cap as before
+    # two drivers: the slower track wins; a scaled driver config (5 mm/s at 10 %) follows
+    slow = SimpleNamespace(cfg=SimpleNamespace(servo=FakeServoLimits(), rail_speed_mm_s=5))
+    assert executor_caps_for([railed, slow], cfg).rail_m_per_tick == pytest.approx(0.00005)
+    # a host value already below the cap stands (min, never raised)
+    scaled = scale_control_config(cfg, 0.1)  # host rail 0.0002
+    assert apply_executor_caps(scaled, caps).jog.rail_m_per_tick == pytest.approx(0.0002)
+    # no driver publishes a rail speed: None, and the host value is untouched
+    plain = SimpleNamespace(cfg=SimpleNamespace(servo=FakeServoLimits()))
+    none_caps = executor_caps_for([plain], cfg)
+    assert none_caps.rail_m_per_tick is None
+    assert apply_executor_caps(cfg, none_caps).jog.rail_m_per_tick == cfg.jog.rail_m_per_tick
+    host_only = executor_caps_for([SimpleNamespace()], cfg)
+    assert host_only.source == "host" and host_only.rail_m_per_tick is None
+    # a rail speed without servo limits (host joint caps) still caps the rail
+    rail_only = executor_caps_for([SimpleNamespace(cfg=SimpleNamespace(rail_speed_mm_s=50))], cfg)
+    assert rail_only.source == "host" and rail_only.rail_m_per_tick == pytest.approx(0.0005)
 
 
 def test_speed_scale_on_the_driver_side_config():
@@ -618,6 +675,26 @@ def test_driver_factory_seam_receives_the_speed_scaled_caps(client, rt, cells):
         assert client.delete("/api/session").status_code == 204
 
 
+def test_workcell_status_kind_sim_survives_a_hardware_session(client, rt, cells):
+    """`GET /api/workcell?kind=sim` 500ed while a hardware session ran: the sim arm
+    rows reused `session.workcell.scene` and `HardwareWorkcell` has none (seen live
+    2026-09-07, the Welcome page polls this endpoint). Sim rows now come from the
+    preview scene, with connected=False - no sim session owns those arms."""
+    r = client.post("/api/session", json=spec())
+    assert r.status_code == 200, r.text
+    try:
+        for params in (None, {"kind": "sim"}, {"kind": "hardware"}):
+            resp = client.get("/api/workcell", params=params)
+            assert resp.status_code == 200, (params, resp.text)
+        sim = client.get("/api/workcell", params={"kind": "sim"}).json()
+        assert sim["kind"] == "sim" and all(a["connected"] is False for a in sim["arms"])
+        hw = client.get("/api/workcell", params={"kind": "hardware"}).json()
+        assert all(a["connected"] is True for a in hw["arms"])  # the session owns these
+        assert client.get("/api/workcell").json()["kind"] == "hardware"  # no kind: the session's
+    finally:
+        assert client.delete("/api/session").status_code == 204
+
+
 def test_subset_of_the_configured_arms_is_refused(client, rt, factory, cells):
     """Phase-09d user decision 1: both arms are always part of a hardware session."""
     grip = factory.monitors["grip"]
@@ -634,6 +711,31 @@ def test_subset_of_the_configured_arms_is_refused(client, rt, factory, cells):
     assert "missing ['view']" in client.post("/api/session", json=body).json()["detail"]
     assert grip.calls[n0:] == [] and cells.built == [] and rt.manager.session is None
     assert not rt.hardware_monitor.paused
+
+
+_KEY_SEQ = [0]
+
+
+def drive_keys(rt, code: str, seconds: float) -> None:
+    """Hold one keyboard code on the running session the way the Cockpit does: an
+    EMPTY set first (clears a deadman latch left by the silence since the last hold),
+    the code at 50 Hz, an EMPTY set last; one monotonic seq across calls."""
+    session = rt.manager.session
+    wd = session.supervisor.watchdog
+
+    def send(held: set[str]) -> None:
+        _KEY_SEQ[0] += 1
+        hs = HeldState(held=frozenset(held), seq=_KEY_SEQ[0], rx_mono=time.monotonic())
+        if wd.on_keys(hs):
+            rt.bus.held_keys.put(hs)
+
+    send(set())
+    time.sleep(0.03)
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        send({code})
+        time.sleep(0.02)
+    send(set())
 
 
 def _profile(rt, name: str, q7, *, rail: dict | None = None):
@@ -699,8 +801,11 @@ def test_start_from_profile_plans_on_the_gate_twin_and_executes_the_waypoints(
             session.start_from_progress,
             session.supervisor.merged_report(),
         )
-        assert executed and executed[0]["waypoints"] == waypoints  # the same waypoints
-        assert executed[0]["gripper"] == grippers
+        # the same pre-planned waypoints, ONE ARM PER execute_plan in the planner's
+        # arm_order (2026-09-08 evening), the gripper targets on the last arm
+        assert [list(c["waypoints"]) for c in executed] == [[a] for a in waypoints]
+        assert {a: w for c in executed for a, w in c["waypoints"].items()} == waypoints
+        assert [c["gripper"] for c in executed] == [{}] * (len(executed) - 1) + [grippers]
         assert len(plans) == 1  # the worker did NOT plan again
         # the loop drove the commanded posture to the profile target
         loop = session.loop
@@ -709,6 +814,80 @@ def test_start_from_profile_plans_on_the_gate_twin_and_executes_the_waypoints(
     finally:
         assert client.delete("/api/session").status_code == 204
     assert _wait(lambda: not rt.hardware_monitor.paused)
+
+
+def test_start_from_refused_by_a_latched_fault_reaches_the_wire_and_survives_recovery(
+    client, rt, cells, monkeypatch
+):
+    """Operator problem #2 (2026-09-08): after a refused profile start the Cockpit showed
+    a running session, held arms and no message - the refusal lived on the manager only.
+    Over the real ``/ws/telemetry`` (and ``GET /api/session``): the exact text rides
+    ``session.fault_detail`` while the arm is faulted, is STILL there after "Clear errors
+    & resume" (the fault callback wipes its own text, not the notice), and is gone once
+    "Go to profile" - the retry the text asks for - arrives."""
+    monkeypatch.setattr(
+        rt.manager,
+        "cfg",
+        rt.manager.cfg.model_copy(
+            update={
+                "hardware_session": HardwareSessionConfig(
+                    armed=True, bringup_timeout_s=20.0, start_from_fault_grace_s=0.3
+                )
+            }
+        ),
+    )
+    target = (PI, -0.3, 0.0, 0.4, 0.0, 0.7, 0.0)  # a lifted, still folded posture
+    profile = _profile(rt, "lifted-refused", target)
+    real_exec = ControlLoop._op_execute_plan
+    latched: list[str] = []
+
+    def latch_c24_as_the_plan_arrives(self, cmd):
+        if not latched:  # the driver latches C24 on the Manipulation Arm exactly then
+            latched.append("grip")
+            cells.cell.fault("grip", 24)  # error_code 24 in the driver's view + the event
+            self._faulted.add("grip")  # what the event's drain leaves behind, a tick early
+        return real_exec(self, cmd)
+
+    monkeypatch.setattr(ControlLoop, "_op_execute_plan", latch_c24_as_the_plan_arrives)
+    r = client.post("/api/session", json=spec(start_from=f"profile:{profile.profile_id}"))
+    assert r.status_code == 200, r.text
+    session = rt.manager.session
+    ctrl_state = cells.cell.states()["grip"].state
+    expected = (
+        f"start_from refused: Manipulation Arm faulted (controller state {ctrl_state}, code "
+        "C24) - use Clear errors & resume, then Go to profile"
+    )
+    msg = _telemetry(client, lambda m: m["session"]["fault_detail"] != "", frames=250)
+    assert msg["session"]["fault_detail"] == expected
+    assert session.motion_detail == expected and latched == ["grip"]
+    assert _wait(lambda: rt.manager.state is SessionState.FAULT)  # the event was drained
+    assert client.get("/api/session").json()["fault_detail"] == expected
+    assert session.start_from_progress is None and rt.manager.bringup_telemetry() is None
+    assert not session.loop.plans.active_arms  # nothing moved
+    # the arm row carries the C24; the session row is the refusal, never a duplicate
+    msg = _telemetry(client, lambda m: m["session"]["state"] == "fault")
+    grip = next(a for a in msg["arms"] if a["arm_id"] == "grip")
+    assert grip["error_code"] == 24 and grip["fault_detail"].startswith("controller error 24")
+    assert msg["session"]["fault_detail"] == expected
+    # "Clear errors & resume": RUNNING again, the hint is STILL on the wire
+    r = client.post(URL.format("grip"), json={"op": "recover"})
+    assert r.status_code == 200 and r.json()["ok"] is True, r.text
+    assert _wait(lambda: rt.manager.state is SessionState.RUNNING)
+    assert session.fault_detail == "" and session.motion_detail == expected
+    msg = _telemetry(client, lambda m: m["session"]["state"] == "running")
+    assert msg["session"]["fault_detail"] == expected
+    grip = next(a for a in msg["arms"] if a["arm_id"] == "grip")
+    assert grip["fault_detail"] == "" and grip["error_code"] == 0
+    # "Go to profile" is the retry: on arrival the notice is gone
+    assert rt.manager.request_goto_profile(profile) == (
+        True, "going to profile 'lifted-refused'"
+    )
+    assert _wait(lambda: rt.manager.profile_motion_in_flight is None, 60.0)
+    assert session.motion_detail == "", session.motion_detail
+    assert session.loop._last_cmd["grip"][:7] == pytest.approx(list(target), abs=1e-6)
+    assert session.loop._last_cmd["view"][:7] == pytest.approx(list(target), abs=1e-6)
+    msg = _telemetry(client, lambda m: m["session"]["fault_detail"] == "")
+    assert client.get("/api/session").json()["fault_detail"] == ""
 
 
 def test_start_from_profile_plan_failure_is_409_and_tears_down(client, rt, factory, cells):
@@ -882,7 +1061,12 @@ def test_refusal_matrix_details(client, rt, factory):
         assert r.status_code == 409, r.text
         assert needle in r.json()["detail"], (needle, r.json()["detail"])
 
-    refused(spec(mode="collect", task="t"), "hardware sessions support teleop only (phase-09c)")
+    refused(spec(mode="dagger", task="t"), "hardware sessions support teleop and data collection")
+    refused(spec(mode="inference"), "hardware sessions support teleop and data collection")
+    # collect is admitted (2026-09-07); its own contract still refuses before any box is touched
+    refused(spec(mode="collect", task="t", dataset="x"), "return_to_start needs a start_from")
+    refused(spec(mode="collect", task="t", dataset="x", return_to_start=False, dataset_resume=True),
+            "unknown dataset")
     refused(spec(arms=[], frames={}), "session needs at least one arm")
     refused(spec(arms=["arm9"], frames={}), "arms ['arm9'] not in the hardware workcell")
     refused(spec(arms=["view"], frames={}), "hardware sessions include every configured arm")
@@ -927,6 +1111,266 @@ def test_refusal_matrix_details(client, rt, factory):
     # nothing was touched by any refusal: no pause, no session, previews untouched
     assert grip.calls[n0:] == [] and rt.manager.session is None
     assert not rt.hardware_monitor.paused and rt.hub._workers["grip_wrist"].fps == 15.0
+
+
+def test_collect_session_records_episode_directories_from_the_adopted_cameras(
+    client, rt, cams, cells
+):
+    """Data collection on the real cell (2026-09-07; 04-runtime §10.5): the recorder is
+    built inside bring-up from the ADOPTED preview cameras and the gate twin's
+    kinematics; both wrist cameras land in ``episodes/<id>/video/``; the dataset is
+    ``in_use`` and a previous episode can be deleted mid-session; the export is
+    refused while the session records."""
+    from apollo_mavis_v2_core import Command
+
+    r = client.post(
+        "/api/session",
+        json=spec(mode="collect", task="hw pick", dataset="hw_pick", return_to_start=False),
+    )
+    assert r.status_code == 200, r.text
+    session = rt.manager.session
+    rt_thread = session.recorder_thread
+    root = rt.cfg.datasets_root / "apollo" / "hw_pick"
+    try:
+        assert rt_thread is not None and rt_thread.repo_id == "apollo/hw_pick"
+        assert _wait(lambda: rt.manager.state is SessionState.RUNNING, 20.0)
+        assert (root / "manifest.json").exists() and (root / "sessions").is_dir()
+        rows = {d["repo_id"]: d for d in client.get("/api/datasets").json()}
+        row = rows["apollo/hw_pick"]
+        assert row["in_use"] is True and row["kind"] == "hardware"
+        assert row["cameras"] == ["grip_wrist", "view_wrist"]
+        assert client.post("/api/datasets/apollo/hw_pick/export", json={}).status_code == 409
+
+        def episode(op: str):
+            return rt.bus.commands.submit(Command(op=op, source="ws")).result(timeout=5.0)
+
+        saved = []
+        for code in ("KeyE", "KeyQ"):
+            ack = episode("episode_new")
+            assert ack.ok, ack
+            time.sleep(0.6)  # prepare (encoder open) before the first key
+            drive_keys(rt, code, 2.0)  # a still arm records nothing: the idle filter is ON
+            #   (speed scale 0.1: ~0.5 mm per capture -> one kept frame per ~2 captures)
+            assert _wait(lambda: rt_thread.status().frames >= 12, 15.0), (
+                rt_thread.status(), rt_thread.filter.summary(),
+            )
+            ack = episode("episode_save")
+            assert ack.ok, ack
+            assert _wait(lambda: rt_thread.status().state == "idle", 15.0)
+            saved.append(rt_thread.last_saved_id)
+        assert rt_thread.status().total_episodes == 2
+        eps = client.get("/api/datasets/apollo/hw_pick/episodes").json()
+        assert [e["episode_id"] for e in eps] == saved and all(e["export_ok"] for e in eps)
+        d = root / "episodes" / saved[0]
+        videos = sorted(p.name for p in (d / "video").iterdir())
+        assert videos == ["grip_wrist.mp4", "view_wrist.mp4"]
+        ep = json.loads((d / "episode.json").read_text())
+        assert ep["length"] >= 12 and set(ep["video"]) == {"grip_wrist", "view_wrist"}
+        assert set(ep["extrinsics"]) == {"grip_wrist", "view_wrist"}
+        assert ep["extrinsics"]["grip_wrist"]["twin_camera"] == "grip_wrist_cam"
+        # the configured D435 intrinsics travel into the sidecar verbatim
+        cams_cfg = {c["id"]: c["intrinsics"] for c in HW_WORKCELL["cameras"]}
+        for cam_id in ("grip_wrist", "view_wrist"):
+            assert ep["extrinsics"][cam_id]["intrinsics"] == (
+                CameraIntrinsics(**cams_cfg[cam_id]).model_dump()
+            )
+        assert ep["filter"]["enabled"] is True
+        assert ep["frames"] == ALL_FRAMES and ep["arm_bases"]["grip"]["has_rail"] is True
+        # a previous episode can go while the session records the next one
+        assert episode("episode_new").ok
+        r = client.delete(f"/api/datasets/apollo/hw_pick/episodes/{saved[0]}")
+        assert r.status_code == 204 and not d.exists()
+        assert episode("episode_discard").ok
+        assert _wait(lambda: rt_thread.status().state == "idle", 15.0)
+    finally:
+        assert client.delete("/api/session").status_code == 204
+    assert _wait(lambda: not rt.hardware_monitor.paused)
+    assert sorted(p.name for p in (root / "episodes").iterdir()) == [saved[1]]
+    assert client.get("/api/datasets/apollo/hw_pick").json()["in_use"] is False
+    assert client.post("/api/datasets/apollo/hw_pick/export", json={}).status_code == 202
+    assert rt.manager.dataset_store.wait_export(120.0)
+    assert client.get("/api/datasets/apollo/hw_pick").json()["export"]["state"] == "fresh"
+
+
+def test_collect_without_a_live_camera_is_refused_before_any_box_is_touched(
+    client, rt, cells, monkeypatch
+):
+    """Review item 14: the camera check moved into the refusal matrix — no workcell is
+    built, no monitor paused, when no preview is live."""
+    monkeypatch.setattr(rt.manager, "hardware_camera", lambda cid: None)
+    r = client.post(
+        "/api/session",
+        json=spec(mode="collect", task="t", dataset="no_cam", return_to_start=False),
+    )
+    assert r.status_code == 409, r.text
+    assert "needs at least one live hardware camera" in r.json()["detail"]
+    assert cells.built == [] and not rt.hardware_monitor.paused and rt.manager.session is None
+
+
+def test_collect_session_records_audio_from_a_fake_microphone(client, rt, cams, cells):
+    """D8: the Runtime-owned MicrophoneReader feeds the per-episode audio sink. With a
+    fake-backend reader assigned (the lab wiring is Runtime.__init__), every saved
+    episode carries audio.wav + the alignment block."""
+    from apollo_mavis_v2_core import Command, LatestSlot
+
+    from apollo_mavis_v2_runtime.devices.microphone import MicrophoneReader
+
+    mic_cfg = MicrophoneConfig(enabled=True, backend="fake")
+    mic = MicrophoneReader(mic_cfg, LatestSlot(), frame_hz=25)
+    mic.start()
+    previous = rt.manager.microphone
+    rt.manager.microphone = mic
+    root = rt.cfg.datasets_root / "apollo" / "hw_audio"
+    try:
+        r = client.post(
+            "/api/session",
+            json=spec(
+                mode="collect", task="hw audio", dataset="hw_audio", return_to_start=False,
+                action_filter={"enabled": False},  # a still arm: nothing would be recorded
+            ),
+        )
+        assert r.status_code == 200, r.text
+        session = rt.manager.session
+        rt_thread = session.recorder_thread
+        assert rt_thread.audio is not None
+        assert _wait(lambda: rt.manager.state is SessionState.RUNNING, 20.0)
+
+        def episode(op: str):
+            return rt.bus.commands.submit(Command(op=op, source="ws")).result(timeout=5.0)
+
+        assert episode("episode_new").ok
+        assert _wait(lambda: rt_thread.status().frames >= 12, 15.0), (
+            rt_thread.status(), rt_thread.filter.summary(),
+        )
+        assert episode("episode_save").ok
+        assert _wait(lambda: rt_thread.status().state == "idle", 15.0)
+        eid = rt_thread.last_saved_id
+        d = root / "episodes" / eid
+        ep = json.loads((d / "episode.json").read_text())
+        assert ep["audio"] is not None and (d / "audio.wav").exists()
+        assert ep["audio"]["sample_rate"] == 48000 and ep["audio"]["samples"] > 48000 // 4
+        assert abs(ep["audio"]["duration_s"] - ep["duration_s"]) < 1.5  # the look-ahead drift
+        assert client.get("/api/datasets/apollo/hw_audio/episodes").json()[0]["audio"] is True
+    finally:
+        client.delete("/api/session")
+        rt.manager.microphone = previous
+        mic.stop()
+    assert _wait(lambda: not rt.hardware_monitor.paused)
+
+
+def test_collect_start_from_profile_returns_after_save_and_a_fault_cancels_it(
+    client, rt, cams, cells
+):
+    """Return-to-start on the fake cell at speed scale 0.5: start_from profile, drive
+    with keyboard codes during the episode, save -> saving -> returning -> idle and the
+    arm is back; a driver fault mid-return cancels the return on EVERY arm ("return
+    cancelled: driver fault"); the loop keeps its tick rate throughout."""
+    from apollo_mavis_v2_core import Command, HeldState
+
+    target = (PI, -0.3, 0.0, 0.4, 0.0, 0.7, 0.0)
+    profile = _profile(rt, "lifted-collect", target)
+    r = client.post(
+        "/api/session",
+        json=spec(
+            mode="collect", task="hw return", dataset="hw_return",
+            start_from=f"profile:{profile.profile_id}", speed_scale=0.5,
+        ),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["speed_scale"] == 0.5
+    session = rt.manager.session
+    loop, rt_thread, cell = session.loop, session.recorder_thread, cells.cell
+    try:
+        assert _wait(lambda: rt.manager.state is SessionState.RUNNING, 20.0)
+        assert _wait(lambda: not loop.plans.active_arms, 20.0)
+        assert loop._last_cmd["grip"][:7] == pytest.approx(list(target), abs=1e-6)
+
+        def episode(op: str):
+            return rt.bus.commands.submit(Command(op=op, source="ws")).result(timeout=5.0)
+
+        def drive(code: str, seconds: float) -> None:
+            drive_keys(rt, code, seconds)
+
+        states: list[str] = []
+
+        def watch(until: str, timeout: float = 30.0) -> None:
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout:
+                st = rt_thread.status().state
+                if not states or states[-1] != st:
+                    states.append(st)
+                if st == until and len(states) > 1:
+                    return
+                time.sleep(0.005)
+            raise AssertionError(f"never reached {until}: {states}")
+
+        # -- episode 1: drive up, save, return to the profile ---------------------------
+        ack = episode("episode_new")
+        assert ack.ok, (ack.detail, rt_thread.status())
+        time.sleep(0.6)  # prepare (encoder open) before the first key
+        ticks0, t0 = loop.tick_count, time.monotonic()
+        drive("KeyE", 1.5)
+        rate = (loop.tick_count - ticks0) / (time.monotonic() - t0)
+        assert 95.0 <= rate <= 103.0, f"control loop {rate:.1f} Hz during hardware collect"
+        print(f"REPORT hardware fake collect: control loop {rate:.1f} Hz at speed 0.5")
+        moved = float(np.max(np.abs(loop._last_cmd["grip"][:7] - np.asarray(target))))
+        assert moved > 0.02, moved
+        states.clear()
+        beat = threading.Event()
+
+        def heartbeat() -> None:  # the Cockpit's 25 Hz empty heartbeat: no deadman latch
+            while not beat.is_set():
+                _KEY_SEQ[0] += 1
+                hs = HeldState(held=frozenset(), seq=_KEY_SEQ[0], rx_mono=time.monotonic())
+                if session.supervisor.watchdog.on_keys(hs):
+                    rt.bus.held_keys.put(hs)
+                beat.wait(0.04)
+
+        hb = threading.Thread(target=heartbeat, daemon=True)
+        hb.start()
+        try:
+            assert episode("episode_save").ok
+            watch("idle")
+        finally:
+            beat.set()
+            hb.join(1.0)
+        assert states[states.index("saving"):] == ["saving", "returning", "idle"], states
+        assert loop._last_cmd["grip"][:7] == pytest.approx(list(target), abs=0.02)
+        assert rt_thread.status().detail == ""
+
+        # -- episode 2: a driver fault on the Perception Arm mid-return -----------------
+        assert episode("episode_new").ok
+        time.sleep(0.6)
+        drive("KeyE", 1.5)
+        states.clear()
+        beat = threading.Event()
+        hb = threading.Thread(target=heartbeat, daemon=True)
+        hb.start()
+        try:
+            assert episode("episode_save").ok
+            # Sequential execution (2026-09-08 evening): the return walks ONE arm at a
+            # time in the planner's order. The fake cell's MEASURED postures follow the
+            # command (``HardwareFakeWorkcell._follow``; the manager hands over on
+            # measured arrival), so the Perception Arm - never moved by the keys - is
+            # already at the profile and is not submitted at all: the Manipulation Arm
+            # is the only moving arm. Wait for its plan, then fault the sibling.
+            t0 = time.monotonic()
+            while rt_thread.status().state != "returning" or "grip" not in loop.plans.active_arms:
+                assert time.monotonic() - t0 < 30.0, (rt_thread.status(), loop.plans.active_arms)
+                time.sleep(0.002)
+            assert loop.plans.active_arms == ["grip"]  # never two arms in the executor
+            cell.fault("view", 31, source="monitor")  # FaultScript: the sibling faults
+            watch("idle")
+        finally:
+            beat.set()
+            hb.join(1.0)
+        assert loop.plans.active_arms == []  # an interruptible plan stops on ANY arm's fault
+        # a single moving arm: the detail reads exactly as before the sequential change
+        assert rt_thread.status().detail == "return cancelled: driver fault"
+        assert rt.manager.state in (SessionState.FAULT, SessionState.RECOVERING)
+    finally:
+        assert client.delete("/api/session").status_code == 204
+    assert _wait(lambda: not rt.hardware_monitor.paused)
 
 
 def test_no_hardware_workcell_configured_is_409(tmp_path):

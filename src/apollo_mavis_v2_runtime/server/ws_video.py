@@ -65,8 +65,7 @@ async def mjpeg(request: Request) -> Response:
             yield (
                 b"--" + _BOUNDARY + b"\r\n"
                 b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-                + jpeg + b"\r\n"
+                b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n"
             )
 
     return StreamingResponse(

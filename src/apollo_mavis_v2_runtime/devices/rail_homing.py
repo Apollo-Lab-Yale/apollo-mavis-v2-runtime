@@ -247,7 +247,13 @@ class PrePositionPlanner:
                 tried.append(f"{source}: posture not sweep-clear (blocked at {at} m, {pair})")
                 continue
             plan = self.checker.plan_path(
-                arm_id, q_now, cand, samples, self.rail_fallback_m, timeout_s=self.plan_timeout_s
+                arm_id,
+                q_now,
+                cand,
+                samples,
+                self.rail_fallback_m,
+                timeout_s=self.plan_timeout_s,
+                speed_scale=JOB_SPEED_SCALE,
             )
             if not plan.ok or arm_id not in plan.waypoints:
                 pair = f" ({' / '.join(plan.failing_pair)})" if plan.failing_pair else ""

@@ -18,6 +18,7 @@ from .devices.rail_homing import RailHomingService
 from .devices.rail_sweep import RailSweepChecker
 from .devices.tracker import TrackerReader, TrackerSettings
 from .devices.tracker_calibration import TrackerCalibration, apply_persisted_yaw
+from .dora_bridge.wiring import DoraWiring
 from .errors import MaintenanceUnavailableError
 from .session.manager import SessionManager
 from .streams.hub import VideoHub
@@ -76,18 +77,26 @@ class Runtime:
                 rail_flip=cfg.hardware_session.rail_flip,
             )
         self.hardware_monitor = HardwareStateMonitor(
-            cfg.hardware_monitor, hw,
+            cfg.hardware_monitor,
+            hw,
             paused=lambda: self._hardware_session_active(),  # late-bound (tests patch it)
             monitor_factory=monitor_factory,
             rail_sweep=self.rail_sweep,
             rail_fallback_m=cfg.twin_overlay.rail_fallback_m,
         )
         self.manager = SessionManager(
-            cfg, self.bus, self.hub, self.profile_store, self.epoch,
+            cfg,
+            self.bus,
+            self.hub,
+            self.profile_store,
+            self.epoch,
             tracker_settings=self.tracker_settings,
             hardware_probe=self.hardware_probe,
             hardware_monitor=self.hardware_monitor,
         )
+        # Data collection (04-runtime §10.5, D8): the recorder builds its per-episode
+        # audio sink from THIS reader; without this line no episode ever gets audio.
+        self.manager.microphone = self.microphone
         # phase-09d: home_rail with a planned pre-positioning motion. The service decides
         # dry-run / synchronous 09c homing / asynchronous RailHomingJob (202) / refused,
         # registers itself as the monitor's ``jobs`` (maintenance_busy + progress) and
@@ -100,44 +109,59 @@ class Runtime:
         self.twin_overlay: TwinOverlayRenderer | None = None
         if hw is not None:
             self.twin_overlay = TwinOverlayRenderer(
-                cfg.twin_overlay, hw, hw.digital_twin_scene, self.hardware_monitor,
-                self.manager.hardware_camera_frame, self.hub,
+                cfg.twin_overlay,
+                hw,
+                hw.digital_twin_scene,
+                self.hardware_monitor,
+                self.manager.hardware_camera_frame,
+                self.hub,
                 paused=lambda: self._hardware_session_active(),
             )
             self.manager.twin_overlay = self.twin_overlay
             self.rail_homing.twin_overlay = self.twin_overlay
         self.hardware_probe.start()  # no-op without a hardware workcell
+        # External interface over dora (phase-12; 14-dora §2): process-lifetime bridge +
+        # publishers + idle arm reader. Inert (state "disabled") unless cfg.dora.enabled.
+        self.dora = DoraWiring(self)
+        self.manager.dora = self.dora
         # Calibration wizard back end (13-tracker §4 "Calibration modes"): Runtime-
         # owned, session-less; REST /api/tracker/calibration + telemetry.
         self.tracker_calibration = TrackerCalibration(
-            self.tracker, self.tracker_settings, cfg, self.bus.tracker,
+            self.tracker,
+            self.tracker_settings,
+            cfg,
+            self.bus.tracker,
             lambda: self.manager.session_active,  # True during bringup too (rest.py re-checks)
         )
         self.controller_connected = False  # maintained by server/ws_control
 
     # -- lifecycle (server lifespan) ------------------------------------------
     def start(self) -> None:
-        # Unclean prior shutdown: resume() + finalize() unfinalized datasets
-        # before serving (04-runtime §15). Filesystem scan only unless a
-        # repair is actually needed (lerobot stays unimported).
+        # Unclean prior shutdown: an episode that was being recorded when the process
+        # died is one ``episodes/.tmp-*`` directory; sweep it before serving
+        # (10-frames §11.6 step 5) - under the generic datasets_root AND every mapped
+        # namespace root (15-online-dagger §7, D5), the same layout the store lists.
+        # Filesystem only, lerobot stays unimported.
         try:
-            from .recorder.episode_recorder import repair_unfinalized_datasets
-
-            repair_unfinalized_datasets(self.cfg.datasets_root)
-        except Exception:  # never block serving on repair problems
+            self.manager.dataset_store.sweep()
+        except Exception:  # never block serving on sweep problems
             import logging
 
-            logging.getLogger(__name__).exception("dataset startup repair failed")
+            logging.getLogger(__name__).exception("dataset startup sweep failed")
         self.manager.start_previews()
         # Phase-09a: monitor -> overlay, after the hardware camera previews exist
         # (the overlay composites onto their frames). Both no-ops when inert.
         self.hardware_monitor.start()
         if self.twin_overlay is not None:
             self.twin_overlay.start()
+        # phase-12: after the previews exist (camera taps attach to their encoders) and
+        # the monitor is up (the hardware idle reader re-publishes its samples).
+        self.dora.start()
 
     def stop(self) -> None:
-        # Reverse of start(): overlay (renderers closed on its thread) -> monitor
-        # (boxes released) -> the rest.
+        # Reverse of start(): dora (idle reader -> dora stop -> dora down -> reap) ->
+        # overlay (renderers closed on its thread) -> monitor (boxes released) -> the rest.
+        self.dora.stop()
         if self.twin_overlay is not None:
             self.twin_overlay.stop()
         self.rail_homing.stop()  # a homing in flight is never interrupted; wait for it
@@ -228,6 +252,16 @@ class Runtime:
             raise KeyError(arm_id)
         return self.rail_homing.last(arm_id)
 
+    # -- external interface over dora (REST; 14-dora §2.6) ---------------------------------
+    def dora_info(self):
+        """``GET /api/dora``: connection facts for foreign clients (never the token)."""
+        return self.dora.info()
+
+    def dora_join(self, machine_id: str) -> bool:
+        """``POST /api/dora/machines/{id}/join``: rescan the registered daemons now
+        (False = the machine is not in ``dora.machines`` -> 404)."""
+        return self.dora.request_join(machine_id)
+
     # -- session-less device discovery (REST; 04-runtime §13.1) -----------------------
     def microphone_infos(self) -> list[MicrophoneInfo]:
         """``GET /api/microphones``: the configured microphone is always listed
@@ -252,6 +286,7 @@ class Runtime:
         session = self.manager.session
         if session is not None:
             session.supervisor.watchdog.on_disconnect()
+            session.loop.note_controller_disconnect()  # cancels an interruptible plan
 
     def submit_action(self, name: str, args: dict) -> Future[CommandResult]:
         return self.bus.commands.submit(Command(op=name, args=dict(args), source="ws"))

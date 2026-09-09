@@ -1,8 +1,11 @@
-"""Episode recording over LeRobot dataset v3 (04-runtime §10; 10-frames §6-§9).
+"""Episode recording into per-episode directories (04-runtime §10; 10-frames §6-§11);
+LeRobot v3 is a derived export (:mod:`.export_lerobot`).
 
 Import discipline: ``lerobot`` (and through it torch) is imported lazily
-inside :mod:`.episode_recorder` only — importing this package must stay
-cheap so non-collect code paths and tests never pay the cost.
+inside :mod:`.episode_recorder` (the streaming encoder) and in the export
+job's final validation only — importing this package, :mod:`.datasets`,
+:mod:`.manifest` and :mod:`.stats` must stay cheap so the REST paths and tests
+never pay the cost.
 """
 
 from .features import (

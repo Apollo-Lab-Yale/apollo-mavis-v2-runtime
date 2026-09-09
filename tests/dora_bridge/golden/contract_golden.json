@@ -1,0 +1,213 @@
+{
+  "arm_state_layout": [
+    "q1",
+    "q2",
+    "q3",
+    "q4",
+    "q5",
+    "q6",
+    "q7",
+    "rail_pos",
+    "dq1",
+    "dq2",
+    "dq3",
+    "dq4",
+    "dq5",
+    "dq6",
+    "dq7",
+    "drail",
+    "ee_base.x",
+    "ee_base.y",
+    "ee_base.z",
+    "ee_base.qw",
+    "ee_base.qx",
+    "ee_base.qy",
+    "ee_base.qz",
+    "ee_world.x",
+    "ee_world.y",
+    "ee_world.z",
+    "ee_world.qw",
+    "ee_world.qx",
+    "ee_world.qy",
+    "ee_world.qz",
+    "gripper_open_frac",
+    "rail_pos_m"
+  ],
+  "camera_output_prefix": "cam_",
+  "common_output_metadata": [
+    "mavis_schema",
+    "epoch",
+    "session_id",
+    "seq",
+    "t_mono",
+    "wallclock_ns"
+  ],
+  "dataflow_name": "mavis_v2",
+  "depth_output_suffix": "_depth",
+  "event_envelope_fields": [
+    "mavis_schema",
+    "kind",
+    "t_mono",
+    "wallclock_ns",
+    "session_id",
+    "epoch",
+    "payload"
+  ],
+  "TrainerStatusAnnounce": [
+    "mavis_schema",
+    "trainer_id",
+    "node_version",
+    "state",
+    "session_id",
+    "policy_version",
+    "progress",
+    "metrics",
+    "detail",
+    "uptime_s"
+  ],
+  "OnlineDaggerAnnounce": [
+    "session_name",
+    "session_dir",
+    "rollouts_dir"
+  ],
+  "event_kinds": [
+    "collision",
+    "gate",
+    "episode_saved",
+    "episode_discarded",
+    "policy_anomaly",
+    "policy_swap",
+    "policy_version_changed",
+    "reset_watermark",
+    "session_error",
+    "train_now"
+  ],
+  "external_states": [
+    "disabled",
+    "unavailable",
+    "attached",
+    "detached",
+    "closed"
+  ],
+  "mavis_schema": 1,
+  "mic_output_prefix": "mic_",
+  "node_id": "mavis_runtime",
+  "placeholders": [
+    "policy",
+    "viewer",
+    "observer"
+  ],
+  "policy_action_required_metadata": [
+    "observation_id",
+    "chunk_len",
+    "action_dim",
+    "chunk_dt_s",
+    "policy_id",
+    "policy_version"
+  ],
+  "policy_outputs": [
+    "action",
+    "spec",
+    "status",
+    "trainer_status"
+  ],
+  "policy_reset_fields": [
+    "mavis_schema",
+    "reason",
+    "after_observation_id",
+    "session_id",
+    "t_mono"
+  ],
+  "policy_reset_reasons": [
+    "handback",
+    "episode_boundary",
+    "session_start",
+    "anomaly",
+    "session_stop"
+  ],
+  "policy_spec_announce_fields": [
+    "mavis_schema",
+    "policy_id",
+    "policy_version",
+    "node_version",
+    "spec",
+    "rate_hz",
+    "chunk_len",
+    "chunk_dt_s",
+    "loader",
+    "device",
+    "supports_reload",
+    "health",
+    "detail",
+    "uptime_s",
+    "acts_total",
+    "last_compute_ms",
+    "extrinsics_sha",
+    "capabilities"
+  ],
+  "policy_spec_model_fields": [
+    "action_space",
+    "action_frame",
+    "action_names",
+    "state_names",
+    "camera_keys",
+    "version"
+  ],
+  "pose_sources": [
+    "loop",
+    "idle"
+  ],
+  "probe_node_id": "probe",
+  "probe_out_heartbeat": "heartbeat",
+  "probe_timer": "dora/timer/hz/1",
+  "remote_placeholder_kinds": [
+    "viewer",
+    "observer"
+  ],
+  "reserved_ids": [
+    "weights_reload",
+    "weights_ack",
+    "cmd_request",
+    "cmd_response"
+  ],
+  "runtime_fixed_outputs": [
+    "heartbeat",
+    "session",
+    "telemetry",
+    "events",
+    "arm_state",
+    "arm_cmd",
+    "obs_state",
+    "policy_reset"
+  ],
+  "runtime_inputs": [
+    "tick",
+    "probe_heartbeat",
+    "policy_action",
+    "policy_spec",
+    "policy_status",
+    "policy_trainer_status"
+  ],
+  "session_announce_fields": [
+    "mavis_schema",
+    "epoch",
+    "session_id",
+    "state",
+    "spec",
+    "kind",
+    "arm_ids",
+    "has_rail",
+    "frames",
+    "action_space",
+    "action_names",
+    "state_names",
+    "camera_ids",
+    "cameras",
+    "policy_source",
+    "dataset_root",
+    "run_id",
+    "deprecated_keys",
+    "online_dagger"
+  ],
+  "tick_timer": "dora/timer/hz/10"
+}

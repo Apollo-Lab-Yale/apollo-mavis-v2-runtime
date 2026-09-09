@@ -14,14 +14,30 @@ workcells:
     safety:
       safety_debug: false   # true = full hardware safety stack vs the sim cell
 profiles_dir: ${APOLLO_HOME}/var/profiles
-datasets_root: ${APOLLO_HOME}/var/datasets
+datasets_root: ${APOLLO_HOME}/var/datasets   # generic <root>/<ns>/<name> for namespaces not mapped below
+# Per-namespace dataset roots (operator decision 2026-09-08; 15-online-dagger §7 / D5):
+# demonstrations in ~/data/bc_demo/<name>, Online DAgger sessions in
+# ~/data/online_dagger/<session>/{session.json,rollouts}; a bare `dataset: "<name>"`
+# resolves into default_namespace. Same values as the model defaults.
+datasets:
+  default_namespace: bc_demo
+  namespaces:
+    bc_demo:       {root: ~/data/bc_demo}
+    online_dagger: {root: ~/data/online_dagger, subdir: rollouts}
 checkpoints_root: ${APOLLO_HOME}/var/checkpoints
+# Online DAgger (phase-14; 15-online-dagger §7): the runtime's side only - it is the
+# algorithm-agnostic shell, the trainer node configures itself. skill_dir null = the skill
+# shipped inside the package (GET /api/online_dagger/skill[.tgz]); session_file_hz caps
+# session.json rewrites outside transitions. Same values as the model defaults.
+online_dagger:
+  skill_dir: null
+  session_file_hz: 1.0
 control:
   rate_hz: 100
   teleop: {linear_mps: 0.12, angular_rps: 0.6, rail_mps: 0.10, gripper_frac_ps: 1.2}
   leash: {pos_m: 0.025, rot_rad: 0.2}
   dq_max_rad: 0.04
-  jog: {slew_rad_per_tick: 0.02, rail_m_per_tick: 0.002, goto_threshold_rad: 0.15}
+  jog: {slew_rad_per_tick: 0.02, rail_m_per_tick: 0.002}   # joint panel: constant-speed approach, any delta
   watchdog: {stale_s: 0.2, ramp_s: 0.1}
 telemetry_hz: 25
 video: {preview_fps: 15, session_fps: 30, jpeg_quality: 80}

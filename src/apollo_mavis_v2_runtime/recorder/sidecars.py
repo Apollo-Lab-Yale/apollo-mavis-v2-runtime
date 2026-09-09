@@ -1,8 +1,10 @@
-"""Apollo sidecar metadata under ``<root>/meta/apollo/`` (10-frames §9).
+"""Apollo sidecar metadata at the dataset root (10-frames §9, §11.2).
 
-LeRobot drops unknown top-level ``info.json`` keys, so per-session /
-per-episode metadata and the composed scene XML live in JSON/XML sidecars
-inside the dataset root (they travel with the repo). Writes are atomic
+Since 2026-09-07 the sidecars live NEXT TO the data they describe in the
+episode-directory store: ``<root>/sessions/session_<id>.json`` and
+``<root>/scenes/<sha256[:16]>.xml`` (the per-episode ``episode.json`` is written
+by the recorder inside the episode directory). The LeRobot v3 export carries
+them into ``meta/apollo/`` exactly as phase-07 laid them out. Writes are atomic
 (``.tmp`` + ``os.replace``, same discipline as ``ProfileStore``).
 """
 
@@ -54,10 +56,10 @@ def software_versions() -> dict[str, str | None]:
 
 
 class SidecarWriter:
-    """Owns ``<root>/meta/apollo/`` for one dataset root."""
+    """Owns ``<root>/sessions/`` and ``<root>/scenes/`` for one dataset root."""
 
     def __init__(self, dataset_root: Path) -> None:
-        self.base = Path(dataset_root) / "meta" / "apollo"
+        self.base = Path(dataset_root)
 
     # -- scenes -------------------------------------------------------------------
     def archive_scene_xml(self, xml: str) -> str:
@@ -88,14 +90,8 @@ class SidecarWriter:
         }
         if extra:
             payload.update(extra)
-        path = self.base / f"session_{session_id}.json"
+        path = self.base / "sessions" / f"session_{session_id}.json"
         _write_json_atomic(path, payload)
-        return path
-
-    # -- episodes -----------------------------------------------------------------
-    def write_episode(self, episode_index: int, payload: dict[str, Any]) -> Path:
-        path = self.base / "episodes" / f"episode_{episode_index:06d}.json"
-        _write_json_atomic(path, {"episode_index": episode_index, **payload})
         return path
 
 

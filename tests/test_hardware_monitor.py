@@ -61,7 +61,8 @@ def test_config_defaults_match_contract():
     assert TwinOverlayConfig.model_validate({"tint_rgb": [1, 2, 3]}).tint_rgb == (1, 2, 3)
     # phase-09c: hardware_session block defaults (D2 / D4) and the rail_flip alias.
     hs = rt.hardware_session
-    assert hs.default_speed_scale == 0.1 and not hasattr(hs, "default_arms")  # 09d: gone
+    assert hs.default_speed_scale == 1.0  # 100 % since 2026-09-08 evening (50 % was 09-07)
+    assert not hasattr(hs, "default_arms")  # 09d: gone
     assert RuntimeConfig.model_validate({"hardware_session": {"default_arms": ["grip"]}})
     assert (hs.rail_flip, hs.home_rail_inflation_m, hs.home_rail_step_m) == (False, 0.025, 0.005)
     assert hs.bringup_timeout_s == 60.0

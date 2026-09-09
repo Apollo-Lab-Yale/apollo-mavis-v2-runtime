@@ -23,6 +23,9 @@ class TakeoverGateImpl:
         TAKEOVER_TRANSITION --toggle--> AUTONOMOUS   # abort
         HUMAN --toggle--> AUTONOMOUS                 # handback
         any --reset()--> AUTONOMOUS                  # episode boundary
+
+    ``source`` on the event: ``keyboard`` (Space), ``action`` (the explicit
+    ``takeover`` / ``handback`` actions), ``auto_advance``, ``episode_reset``.
     """
 
     def __init__(self, arm_ids: list[str], t_blend_s: float = 0.3) -> None:
@@ -54,7 +57,11 @@ class TakeoverGateImpl:
             return []
         return [a for a in self.arm_ids if a != engaged]
 
-    def on_toggle(self, arm_id: str, t_mono: float) -> GateEvent | None:
+    def on_toggle(
+        self, arm_id: str, t_mono: float, source: str = "keyboard"
+    ) -> GateEvent | None:
+        """Space (``source="keyboard"``) or the explicit ``takeover`` / ``handback``
+        actions (``source="action"``; 15-online-dagger D3) — the same transitions."""
         if arm_id not in self._mode:
             return None
         engaged = self.engaged_arm()
@@ -63,10 +70,10 @@ class TakeoverGateImpl:
         mode = self._mode[arm_id]
         if mode is ControlMode.POLICY:
             self._transition_t0[arm_id] = t_mono
-            return self._emit(arm_id, ControlMode.TAKEOVER_TRANSITION, t_mono, "keyboard")
+            return self._emit(arm_id, ControlMode.TAKEOVER_TRANSITION, t_mono, source)
         # TRANSITION (abort) or HUMAN (handback) -> AUTONOMOUS
         self._transition_t0.pop(arm_id, None)
-        return self._emit(arm_id, ControlMode.POLICY, t_mono, "keyboard")
+        return self._emit(arm_id, ControlMode.POLICY, t_mono, source)
 
     def tick(self, t_mono: float) -> list[GateEvent]:
         events: list[GateEvent] = []
@@ -79,12 +86,16 @@ class TakeoverGateImpl:
                 events.append(self._emit(arm_id, ControlMode.HUMAN, t_mono, "auto_advance"))
         return events
 
-    def reset(self) -> None:
-        """Episode boundary: everything back to AUTONOMOUS (no wall clock)."""
+    def reset(self) -> list[GateEvent]:
+        """Episode boundary: everything back to AUTONOMOUS (no wall clock). Returns the
+        ``episode_reset`` events it emitted (the executor publishes them as
+        ``events.gate``; 15-online-dagger §3)."""
+        events: list[GateEvent] = []
         for arm_id, mode in self._mode.items():
             if mode is not ControlMode.POLICY:
-                self._emit(arm_id, ControlMode.POLICY, 0.0, "episode_reset")
+                events.append(self._emit(arm_id, ControlMode.POLICY, 0.0, "episode_reset"))
         self._transition_t0.clear()
+        return events
 
     # -- internals ---------------------------------------------------------------
     def _emit(self, arm_id: str, mode: ControlMode, t_mono: float, source: str) -> GateEvent:

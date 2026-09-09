@@ -59,9 +59,7 @@ class RecorderKinematics:
         """True iff the camera is worldbody-attached (constant ``T_W_C``)."""
         return int(self.model.cam_bodyid[self._cam_id(camera_id)]) == 0
 
-    def camera_world(
-        self, camera_id: str, q_by_arm: dict[str, np.ndarray] | None = None
-    ) -> Pose:
+    def camera_world(self, camera_id: str, q_by_arm: dict[str, np.ndarray] | None = None) -> Pose:
         """``T_W_C`` (OpenCV convention) at the given arm configs."""
         for arm_id, q in (q_by_arm or {}).items():
             a = self.addr[arm_id]
@@ -72,6 +70,41 @@ class RecorderKinematics:
         pos = np.array(self.data.cam_xpos[cid])
         q_mj = se3.mat_to_quat(np.array(self.data.cam_xmat[cid]).reshape(3, 3))
         return Pose(pos, se3.quat_normalize(se3.quat_mul(q_mj, _R_X_PI)))
+
+    def world_poses(
+        self, q_by_arm: dict[str, np.ndarray], camera_ids: list[str]
+    ) -> tuple[dict[str, Pose], dict[str, Pose]]:
+        """ONE forward pass for every arm -> ``({arm: T_W_tcp}, {camera: T_W_C})`` (OpenCV
+        convention for cameras). Used by the dora pose stamper, which stamps several camera
+        frames per snapshot (phase-12); unknown arms / cameras are skipped."""
+        for arm_id, q in q_by_arm.items():
+            a = self.addr.get(arm_id) if hasattr(self.addr, "get") else None
+            if a is None:
+                try:
+                    a = self.addr[arm_id]
+                except KeyError:
+                    continue
+            self.data.qpos[a.qpos_adr] = np.asarray(q, dtype=np.float64)[: len(a.qpos_adr)]
+        mujoco.mj_kinematics(self.model, self.data)
+        mujoco.mj_camlight(self.model, self.data)
+        tcps: dict[str, Pose] = {}
+        for arm_id in q_by_arm:
+            try:
+                a = self.addr[arm_id]
+            except KeyError:
+                continue
+            p_site = np.array(self.data.site_xpos[a.tcp_site_id])
+            r_site = np.array(self.data.site_xmat[a.tcp_site_id]).reshape(3, 3)
+            tcps[arm_id] = Pose(p_site, se3.mat_to_quat(r_site))
+        cams: dict[str, Pose] = {}
+        for cam in camera_ids:
+            cid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, cam)
+            if cid < 0:
+                continue
+            pos = np.array(self.data.cam_xpos[cid])
+            q_mj = se3.mat_to_quat(np.array(self.data.cam_xmat[cid]).reshape(3, 3))
+            cams[cam] = Pose(pos, se3.quat_normalize(se3.quat_mul(q_mj, _R_X_PI)))
+        return tcps, cams
 
 
 __all__ = ["RecorderKinematics"]

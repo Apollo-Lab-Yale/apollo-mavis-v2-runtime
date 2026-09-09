@@ -372,9 +372,11 @@ def test_home_rail_dry_run_with_a_plannable_posture_offers_the_pre_position_plan
         assert plan is not None and plan.needed and plan.clear and plan.source == "keyframe"
         assert plan.target_q == pytest.approx([PI, 0, 0, 0, 0, 0, 0])
         assert plan.waypoints >= 2 and plan.checked_rail_positions == 131
-        # at the DRIVER's caps x 0.1 (the servo stream's 0.2 mm/tick Cartesian bound over the
-        # lever arms binds: sum|dq| lever = 1.425 m -> ~71 s), not the host slew's 4 s
-        assert 60.0 < plan.duration_s < 90.0
+        # at the DRIVER's caps x 0.1 (the servo stream's Cartesian bound over the lever arms
+        # binds, not the host slew's 4 s). Halved from ~71 s on 2026-09-07 when
+        # `max_cart_step_m` went 0.002 -> 0.004 m/tick: 0.4 mm/tick at scale 0.1 over
+        # sum|dq| lever = 1.425 m -> ~36 s.
+        assert 30.0 < plan.duration_s < 45.0
         assert plan.detail.startswith("the arm first moves along a planned path (")
         assert res.detail.endswith("(dry run, nothing written)")
         assert "then the rail homes and the arm holds that posture" in res.detail

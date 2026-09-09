@@ -68,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()  # tracker/reader warnings must reach stderr (13-tracker §4)
 
     # MUST precede any mujoco import / GL init (04-runtime §13.5).
+    # 2026-09-09: numpy/scipy ship OpenBLAS built with MAX_THREADS=64; on this 64-core host the
+    # runtime idled at 4390 % CPU (63 pool threads spin-waiting between the 100 Hz loop's tiny
+    # matrix ops) and the live loop paid 50-78 ms tick p99. One BLAS thread is the right size for
+    # 7-DoF kinematics; the launcher exports the same (env wins - setdefault, not overwrite).
+    for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(_var, "1")
     os.environ.setdefault("MUJOCO_GL", "egl")
 
     from .config import load_runtime_config

@@ -5,7 +5,8 @@ from __future__ import annotations
 import time
 
 import numpy as np
-from apollo_mavis_v2_core import Command, HeldState, PlanResult
+import pytest
+from apollo_mavis_v2_core import Command, CommandSource, HeldState, PlanResult
 from conftest import run_ticks
 
 
@@ -27,12 +28,22 @@ def test_jog_slew_limited(fake_loop):
     assert abs(loop._last_cmd["arm0"][7] - 0.05) < 1e-12
 
 
-def test_jog_above_goto_threshold_nacked(fake_loop):
+def test_large_jog_is_accepted_and_walked_at_the_slew_rate(fake_loop):
+    """No `goto_threshold_rad` any more (2026-09-07): a jog is a DESTINATION, so a
+    delta of any size is accepted and approached at `slew_rad_per_tick` — the UI
+    joint panel relies on this for slider drags and typed values alike."""
     cell, bus, loop = fake_loop
-    fut = submit(bus, "joint_target", arm_id="arm0", positions=[0.2] * 7 + [0.0], mode="jog")
+    target = 1.5  # 10x the old 0.15 rad threshold
+    fut = submit(bus, "joint_target", arm_id="arm0", positions=[target] * 7 + [0.0], mode="jog")
     run_ticks(loop, cell, 1)
     res = fut.result(0)
-    assert not res.ok and "goto" in res.detail
+    assert res.ok and res.detail == "jog"
+    slew = loop.cfg.jog.slew_rad_per_tick
+    # One tick of motion, not a jump: still slew-many radians from the start.
+    assert loop._last_cmd["arm0"][0] == pytest.approx(slew, abs=1e-9)
+    run_ticks(loop, cell, 9, 0.01)
+    assert loop._last_cmd["arm0"][0] == pytest.approx(10 * slew, abs=1e-9)
+    assert loop._last_cmd["arm0"][0] < target  # still on its way
 
 
 def test_jog_nacked_while_recording(fake_loop):
@@ -60,6 +71,26 @@ def test_switch_arm_cycles_server_side(fake_loop):
     submit(bus, "switch_arm")
     run_ticks(loop, cell, 1)
     assert loop.active_arm == "arm0"  # wraps around
+
+
+def test_switch_arm_with_an_arm_id_selects_explicitly(fake_loop):
+    """The Cockpit's clickable arm rows (05-ui §8.2): pick, do not cycle."""
+    cell, bus, loop = fake_loop
+    f1 = submit(bus, "switch_arm", arm_id="arm1")
+    run_ticks(loop, cell, 1)
+    assert f1.result(0).ok and loop.active_arm == "arm1"
+    # Re-selecting the active arm is an accepted no-op (a click on the active
+    # row must not release a live tracker clutch).
+    f2 = submit(bus, "switch_arm", arm_id="arm1")
+    run_ticks(loop, cell, 1)
+    assert f2.result(0).ok and loop.active_arm == "arm1"
+    f3 = submit(bus, "switch_arm", arm_id="arm0")
+    run_ticks(loop, cell, 1)
+    assert f3.result(0).ok and loop.active_arm == "arm0"
+    # An arm outside the session is refused; the active arm does not change.
+    f4 = submit(bus, "switch_arm", arm_id="nope")
+    run_ticks(loop, cell, 1)
+    assert not f4.result(0).ok and loop.active_arm == "arm0"
 
 
 def test_unknown_op_and_episode_ops_nacked(fake_loop):
@@ -312,3 +343,192 @@ def test_watchdog_latch_and_clear_are_logged_once_per_edge(fake_loop, caplog):
     run_ticks(loop, cell, 5, t)
     cleared = [r for r in caplog.records if "watchdog cleared" in r.getMessage()]
     assert len(cleared) == 1
+
+
+def test_a_latched_ws_deadman_drops_the_jog_instead_of_wedging_the_arm(fake_loop):
+    """Regression, 2026-09-07 first live hardware session (11-safety §10.1).
+
+    The Joint panel's jog is scaled by the WS input watchdog. When the browser's
+    KeysMsg heartbeat stopped (it used to run only while keyboard capture was
+    armed, so clicking the panel itself killed it), the deadman latched and
+    ``_jog_step`` returned None BEFORE ``JogState.step`` could ever retire the
+    target: the arm stayed in ``JOINT_JOG`` for good, ignoring the panel AND —
+    since jog outranks teleop in ``_resolve_arms`` — the tracker. The latch edge
+    now drops pending targets, so the arm falls back to teleop and no stale
+    destination resumes when the browser returns.
+    """
+    cell, bus, loop = fake_loop
+    t = run_ticks(loop, cell, 2)
+    bus.held_keys.put(HeldState(held=frozenset({"KeyW"}), seq=1, rx_mono=t))
+    loop.supervisor.watchdog.on_keys(HeldState(frozenset({"KeyW"}), 1, t))
+    fut = submit(bus, "joint_target", arm_id="arm0", positions=[1.0] * 7 + [0.0], mode="jog")
+    t = run_ticks(loop, cell, 2, t)
+    assert fut.result(0).ok
+    assert loop.jog.active("arm0")
+    assert loop._last_cmd["arm0"][0] > 0.0  # walking toward the destination
+
+    # Browser goes silent: 0.2 s of timeout at full scale, then the 0.1 s ramp,
+    # then AWAIT_EMPTY.
+    t = run_ticks(loop, cell, 40, t)
+    assert loop.supervisor.watchdog.tripped
+    assert not loop.jog.active("arm0")  # target dropped, arm not wedged
+    assert loop._arm_source["arm0"] is not CommandSource.JOINT_JOG  # fell back to teleop
+    q_latched = loop._last_cmd["arm0"].copy()
+    assert q_latched[0] < 1.0  # stopped short of the destination
+
+    # The browser comes back with everything released: no stale jog resumes.
+    bus.held_keys.put(HeldState(held=frozenset(), seq=2, rx_mono=t))
+    loop.supervisor.watchdog.on_keys(HeldState(frozenset(), 2, t))
+    run_ticks(loop, cell, 5, t)  # < timeout_s, or it simply latches again
+    assert not loop.supervisor.watchdog.tripped
+    assert np.allclose(loop._last_cmd["arm0"], q_latched)
+
+
+# -- a plan goal the command path cannot reach exactly (2026-09-09) -------------------
+def _railed_loop(tmp_path, rail0: float, gate=None, hold_s: float = 3.0):
+    """ControlLoop over a railed ``arm0`` PARKED at ``rail0`` (+ a rail-less ``arm1``),
+    NullGate unless ``gate`` is given - the ``fake_loop`` wiring with a chosen start."""
+    from apollo_mavis_v2_core import ProfileStore
+    from apollo_mavis_v2_core.testing import FakeArm, FakeWorkcell
+
+    from apollo_mavis_v2_runtime.bus import RuntimeBus
+    from apollo_mavis_v2_runtime.config import ControlConfig
+    from apollo_mavis_v2_runtime.control.loop import ControlLoop
+    from apollo_mavis_v2_runtime.safety.gate import NullGate
+    from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
+    from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
+
+    q0 = np.array([0.0] * 7 + [rail0])
+    cell = FakeWorkcell({"arm0": FakeArm("arm0", has_rail=True, q0=q0), "arm1": FakeArm("arm1")})
+    cell.start()
+    bus = RuntimeBus()
+    loop = ControlLoop(
+        cell,
+        ControlConfig(),
+        bus,
+        SafetySupervisor(gate or NullGate(), InputWatchdog()),
+        ["arm0", "arm1"],
+        profile_store=ProfileStore(tmp_path / "profiles"),
+        workcell_kind="sim",
+        plan_gate_hold_s=hold_s,
+    )
+    return cell, bus, loop
+
+
+class _UnrelatedPairGate:
+    """Scripted gate: BLOCKED on a pair the planned arm's rail cannot change, holding
+    every PLANNER command at the last safe posture; everything else passes (duck-types
+    ``SafetyGate.filter`` for the supervisor)."""
+
+    PAIR = ("arm0_link4", "arm1_link5")
+
+    def __init__(self) -> None:
+        self._last_safe: dict[str, np.ndarray] = {}
+        self._block_pairs: set = set()
+
+    def filter(self, q_cmd, q_meas, source=CommandSource.TELEOP, ts=None, stale=False):
+        from apollo_mavis_v2_core import CollisionReport
+
+        from apollo_mavis_v2_runtime.safety.gate import GateDecision
+
+        if not self._last_safe:
+            self._last_safe = {a: np.array(q) for a, q in q_meas.items()}
+        if source is CommandSource.PLANNER:
+            self._block_pairs = {self.PAIR}
+            report = CollisionReport(
+                blocked=True, severity="blocked", pairs=[self.PAIR], min_clearance_m=0.0061
+            )
+            return GateDecision({a: self._last_safe[a] for a in q_cmd}, True, report, [])
+        self._block_pairs = set()
+        self._last_safe = {a: np.array(q) for a, q in q_cmd.items()}
+        return GateDecision(dict(q_cmd), False, CollisionReport.ok(), [])
+
+    def reseed(self, arm_id, q_meas) -> None:
+        self._last_safe[arm_id] = np.array(q_meas)
+
+
+def _rail_limit_cases():
+    from apollo_mavis_v2_runtime.control.loop import RAIL_TRAVEL_M
+
+    return [(0.0, -0.0004, 0.0), (RAIL_TRAVEL_M, RAIL_TRAVEL_M + 0.0004, RAIL_TRAVEL_M)]
+
+
+@pytest.mark.parametrize(("rail0", "goal_rail", "limit"), _rail_limit_cases())
+def test_a_rail_goal_a_hair_outside_the_travel_finishes_at_the_reachable_limit(
+    tmp_path, rail0, goal_rail, limit
+):
+    """``_confirm_plan_arrivals`` (2026-09-09): a 1-waypoint plan whose rail goal lies a
+    few tenths of a mm past an end stop (a goal copied verbatim from a carriage that
+    settled at -0.4 mm / 650.4 mm) is clamped to the travel by ``_cap_joint_step`` every
+    tick, so ``q_out`` never equals the goal. With the gate clear and no progress left
+    the plan finishes ``done`` within a few ticks - ``plan_cancel_reason None``, the
+    command at the travel end, the gate-hold clock untouched - and the manager's arrival
+    rule (2 mm on the carriage) accepts the measured posture. Before the rule the plan
+    hung ``executing`` for good and blocked every later reset / Go-to-profile / R."""
+    from conftest import q_of
+
+    from apollo_mavis_v2_runtime.session.manager import SessionManager
+
+    cell, bus, loop = _railed_loop(tmp_path, rail0)
+    goal = [0.0] * 7 + [goal_rail]
+    fut = submit(bus, "execute_plan", waypoints={"arm0": [goal]}, gripper={}, interruptible=True)
+    t = run_ticks(loop, cell, 1)
+    res = fut.result(0)
+    assert res.ok and res.detail == "executing", res
+    ticks = 1
+    while loop.plans.active_arms and ticks < 5:
+        t = run_ticks(loop, cell, 1, t)
+        ticks += 1
+    assert not loop.plans.active_arms, f"still executing after {ticks} ticks"
+    assert ticks <= 3, ticks  # "within a few ticks": the goal step + the clamp verdict
+    assert loop._plan_status == "done" and loop.plan_cancel_reason is None
+    assert loop._plan_state.get("arm0") is None
+    assert loop._plan_gate_hold_since is None
+    assert np.allclose(loop._last_cmd["arm0"][:7], 0.0)
+    assert loop._last_cmd["arm0"][7] == pytest.approx(limit, abs=1e-12)
+    t = run_ticks(loop, cell, 5, t)
+    assert SessionManager._arrived(q_of(cell, "arm0"), goal)
+
+
+def test_a_clamped_rail_goal_the_gate_holds_stays_executing_until_the_watch_cancels(tmp_path):
+    """Control case: the same clamped rail goal while the gate is BLOCKED on a pair the
+    rail cannot change. The reachable-limit rule must NOT finish it (``dec.blocked``):
+    the plan stays ``executing`` and ``_plan_gate_watch`` cancels it after
+    ``plan_gate_hold_s`` naming the blocking pair (the current, documented behaviour of
+    this corner - the reason is the gate's pair, not the clamp; 2026-09-09 review)."""
+    from apollo_mavis_v2_runtime.control.loop import GATE_HOLD_PREFIX
+
+    cell, bus, loop = _railed_loop(tmp_path, 0.0, gate=_UnrelatedPairGate(), hold_s=0.1)
+    goal = [0.0] * 7 + [-0.0004]
+    fut = submit(bus, "execute_plan", waypoints={"arm0": [goal]}, gripper={}, interruptible=True)
+    t = run_ticks(loop, cell, 1)
+    assert fut.result(0).ok
+    assert loop.plans.active_arms == ["arm0"]  # the goal went back into the executor
+    assert loop._plan_status == "executing" and loop._plan_gate_hold_since is not None
+    t = run_ticks(loop, cell, 5, t)
+    assert loop.plans.active_arms == ["arm0"] and loop._plan_status == "executing"
+    t = run_ticks(loop, cell, 10, t)  # past the 0.1 s hold limit
+    assert not loop.plans.active_arms
+    assert loop._plan_status == "cancelled"
+    assert loop.plan_cancel_reason is not None
+    assert loop.plan_cancel_reason.startswith(GATE_HOLD_PREFIX)
+    assert "arm0_link4 / arm1_link5" in loop.plan_cancel_reason
+    assert loop._last_cmd["arm0"][7] == 0.0  # never moved
+
+
+def test_a_joint_goal_the_cap_holds_is_not_reported_as_an_arrival(tmp_path):
+    """The reachable-limit rule is confined to the rail slot at a travel end: a
+    non-positive ``dq_max`` (the fail-safe hold of ``_cap_joint_step``) leaves the
+    joints at ``q_last`` with the gate clear and no progress - the plan stays
+    ``executing`` (the manager's budget reports it) instead of finishing ``done`` on
+    an arm that never moved (2026-09-09 review)."""
+    cell, bus, loop = _railed_loop(tmp_path, 0.0)
+    loop.cfg = loop.cfg.model_copy(update={"dq_max_rad": 0.0})  # bypasses the gt=0 validator
+    goal = [0.01] * 7 + [0.0]
+    fut = submit(bus, "execute_plan", waypoints={"arm0": [goal]}, gripper={}, interruptible=True)
+    t = run_ticks(loop, cell, 1)
+    assert fut.result(0).ok
+    run_ticks(loop, cell, 20, t)
+    assert loop.plans.active_arms == ["arm0"]
+    assert loop._plan_status == "executing" and loop.plan_cancel_reason is None
+    assert np.allclose(loop._last_cmd["arm0"], 0.0)  # held, not arrived

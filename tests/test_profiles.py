@@ -69,6 +69,23 @@ def test_loop_save_profile_and_set_initial_ops(fake_loop):
     assert not store.get(r2.detail).is_initial_condition
 
 
+def test_save_profile_can_designate_the_initial_condition_in_one_op(fake_loop):
+    """The Cockpit's single profile button (05-ui §8.3): name + set_initial."""
+    cell, bus, loop = fake_loop
+    f1 = bus.commands.submit(Command(op="save_profile", args={"name": "plain"}))
+    f2 = bus.commands.submit(
+        Command(op="save_profile", args={"name": "ready", "set_initial": True})
+    )
+    run_ticks(loop, cell, 1)
+    r1, r2 = f1.result(0), f2.result(0)
+    assert r1.ok and r2.ok
+    store = loop.profile_store
+    assert not store.get(r1.detail).is_initial_condition
+    assert store.get(r2.detail).is_initial_condition
+    initials = [p for p in store.list() if p.is_initial_condition]
+    assert len(initials) == 1 and initials[0].name == "ready"  # unique per kind
+
+
 def test_save_profile_requires_name(fake_loop):
     cell, bus, loop = fake_loop
     fut = bus.commands.submit(Command(op="save_profile", args={}))

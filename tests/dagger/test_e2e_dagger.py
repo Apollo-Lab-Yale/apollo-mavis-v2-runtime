@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from conftest import LiveServer, make_runtime_config
 from helpers import free_port, make_net, write_checkpoint
-from test_e2e_teleop import Ctl, Tele
+from test_e2e_teleop import PulsingCtl, Tele
 
 TASK = "dagger e2e"
 SPEC = {
@@ -24,6 +24,9 @@ SPEC = {
     "frames": {"arm0": "arm_base:arm0"},
     "sim_scene": "guardrail_env",
     "task": TASK,
+    # D6 (15-online-dagger, 2026-09-08): return-to-start is ON by default for dagger too and
+    # 409s without an initial-condition profile; this suite tests the policy plumbing.
+    "return_to_start": False,
 }
 
 
@@ -77,7 +80,10 @@ def run_artifacts(server, api):
     run_id = loop.run_id
     store = session.policy_session.reloader.store
     client = session.policy_session.trainer_client
-    ctl, tele = Ctl(server), Tele(server)
+    # PulsingCtl = the Cockpit's 25 Hz heartbeat: without it the deadman trips between
+    # two holds and the second takeover's keys are IGNORED (AWAIT_EMPTY) - the arm then
+    # stands still and the idle-frame filter (default ON) records no labels at all.
+    ctl, tele = PulsingCtl(server), Tele(server)
     art = {"run_id": run_id, "repo_id": None}
     try:
         msg = tele.latest()
@@ -160,19 +166,21 @@ def test_dataset_schema_and_modes(run_artifacts):
 
     root, run_id = run_artifacts["root"], run_artifacts["run_id"]
     assert f"_dagger_{run_id}" in run_artifacts["repo_id"]  # dedicated repo (§4)
-    info = json.loads((root / "meta" / "info.json").read_text())
-    feats = info["features"]
+    feats = json.loads((root / "manifest.json").read_text())["features"]
     assert feats["control_mode"]["info"]["labels"] == {
         "0": "policy", "1": "human", "2": "takeover_transition"}
     assert feats["policy_action"]["names"] == feats["action"]["names"]
     assert feats["policy_action"]["info"] == {"counterfactual": True}
     assert feats["policy_version"]["info"]["run_id"] == run_id
 
-    files = sorted(root.glob("data/**/*.parquet"))
-    assert files
-    table = pq.read_table(files[0])
+    import pyarrow as pa
+
+    files = sorted(root.glob("episodes/*/frames.parquet"))  # one directory per episode
+    assert len(files) == 3
+    tables = [pq.read_table(f) for f in files]
+    table = pa.concat_tables(tables)
     modes = _col(table, "control_mode").astype(int)
-    ep_idx = _col(table, "episode_index").astype(int)
+    ep_idx = np.concatenate([np.full(t.num_rows, i) for i, t in enumerate(tables)])
     m0 = modes[ep_idx == 0]
     assert set(m0.tolist()) == {0, 1, 2}  # all three modes in episode 0
     interv = _col(table, "intervention").astype(bool)
@@ -195,7 +203,8 @@ def test_dataset_schema_and_modes(run_artifacts):
 
 def test_sidecars_and_spool(run_artifacts):
     root = run_artifacts["root"]
-    eps = sorted((root / "meta" / "apollo" / "episodes").glob("*.json"))
+    dirs = sorted(p for p in (root / "episodes").iterdir() if not p.name.startswith("."))
+    eps = [d / "episode.json" for d in dirs]
     assert len(eps) == 3
     ep0 = json.loads(eps[0].read_text())
     modes = [e["mode"] for e in ep0["gate_events"]]
@@ -206,8 +215,9 @@ def test_sidecars_and_spool(run_artifacts):
     ep1 = json.loads(eps[1].read_text())
     assert ep1["gate_events"] == [] and ep1["episode_summary"]["n_label_frames"] == 0
     spools = sorted((root / "trainer_spool").glob("ep_*.parquet"))
-    assert [p.name for p in spools] == [
-        "ep_000000.parquet", "ep_000001.parquet", "ep_000002.parquet"]
+    # keyed by the episode id (12-dagger §7, 2026-09-07), one per saved episode dir
+    assert [p.name for p in spools] == [f"ep_{d.name}.parquet" for d in dirs]
+    assert json.loads(eps[0].read_text())["episode_id"] == dirs[0].name
 
 
 def test_checkpoint_run_layout(run_artifacts):
@@ -221,13 +231,20 @@ def test_checkpoint_run_layout(run_artifacts):
     assert (ck / "LAST_KNOWN_GOOD").exists()
 
 
-def test_dataset_finalized_and_reloads(run_artifacts):
+def test_dataset_exports_and_reloads(run_artifacts):
+    """The DAgger dataset is the same episode-directory store; its LeRobot v3 export
+    (built on demand, 12-dagger §4 / 10-frames §11.8) reads back with lerobot."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    from apollo_mavis_v2_runtime.recorder.export_lerobot import export_lerobot_v3
+
     root = run_artifacts["root"]
-    state = json.loads((root / "recorder_state.json").read_text())
-    assert state["finalized"] is True and state["episodes_saved"] == 3
-    ds = LeRobotDataset(run_artifacts["repo_id"], root=root)
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["episodes"] == 3 and not (root / "recorder_state.json").exists()
+    assert not list((root / "episodes").glob(".tmp-*"))
+    result = export_lerobot_v3(root, run_artifacts["repo_id"], validate=True)
+    assert result.episodes == 3
+    ds = LeRobotDataset(run_artifacts["repo_id"], root=root / "exports" / "lerobot_v3")
     assert ds.num_episodes == 3
     row = ds[0]
     assert row["task"] == TASK

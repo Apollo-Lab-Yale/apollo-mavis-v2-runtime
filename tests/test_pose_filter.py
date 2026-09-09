@@ -77,7 +77,10 @@ def test_orientation_tracks_slow_rotation_and_rejects_jitter():
     out = _run(f, raw)
     raw_ang = np.mean([se3.quat_geodesic(p.orientation, q0) for p in raw[200:]])
     out_ang = np.mean([se3.quat_geodesic(p.orientation, q0) for p in out[200:]])
-    assert out_ang < raw_ang / 5
+    # >= 4x (was 5x until the 2026-09-07 beta retune, which measures 4.04x here and
+    # halves the tracking lag below). Orientation shares `beta` with position, so the
+    # same trade applies; at rest `deadband_rad` (0 in this test) freezes the output.
+    assert out_ang < raw_ang / 4
     # slow constant rotation about z (0.5 rad/s) is followed with bounded lag
     f.reset()
     raw = [
@@ -85,7 +88,7 @@ def test_orientation_tracks_slow_rotation_and_rejects_jitter():
     ]
     out = _run(f, raw)
     lag = se3.quat_geodesic(out[-1].orientation, raw[-1].orientation)
-    assert lag < 0.15  # < ~9 deg behind at 0.5 rad/s
+    assert lag < 0.15  # < ~9 deg behind at 0.5 rad/s (measured 0.55 deg after the retune)
 
 
 def test_reset_forgets_state_and_disabled_is_passthrough():

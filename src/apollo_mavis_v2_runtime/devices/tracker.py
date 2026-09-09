@@ -442,7 +442,7 @@ class TrackerSettingsValues:
     follow_rotation: bool
     filter_enabled: bool = True
     filter_min_cutoff_hz: float = 1.0
-    filter_beta: float = 0.05
+    filter_beta: float = 5.0
 
 
 class TrackerSettings:
@@ -460,7 +460,7 @@ class TrackerSettings:
         *,
         filter_enabled: bool = True,
         filter_min_cutoff_hz: float = 1.0,
-        filter_beta: float = 0.05,
+        filter_beta: float = 5.0,
     ) -> None:
         self._lock = threading.Lock()
         self._values = TrackerSettingsValues(

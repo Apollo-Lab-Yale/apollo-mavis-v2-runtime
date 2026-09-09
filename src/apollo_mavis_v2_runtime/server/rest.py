@@ -9,9 +9,16 @@ from apollo_mavis_v2_core.protocol import (
     KEYMAP,
     ArmMaintenanceRequest,
     ArmMaintenanceResult,
+    DatasetExportRequest,
+    DatasetInfo,
+    DatasetLayoutInfo,
+    DoraInfo,
+    EpisodeInfo,
     KeymapEntry,
     MicrophoneInfo,
+    OnlineDaggerSessionInfo,
     ProfileInfo,
+    ReturnHomeResult,
     SceneInfo,
     SessionInfo,
     SessionSpec,
@@ -19,7 +26,8 @@ from apollo_mavis_v2_core.protocol import (
     TrackerCalibrationStatus,
     WorkcellStatus,
 )
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Path, Request, Response
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 import apollo_mavis_v2_runtime
@@ -31,6 +39,7 @@ from ..errors import (
     SessionError,
     SessionNotFoundError,
 )
+from ..recorder.datasets import DatasetError
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +99,132 @@ def policies(request: Request) -> list:
     return scan_policies(_runtime(request).cfg.checkpoints_root)
 
 
-@router.get("/episodes")
+@router.get("/episodes", deprecated=True)
 def episodes(request: Request) -> dict:
-    return {"repo_id": None, "total_episodes": 0, "total_frames": 0}
+    """DEPRECATED (2026-09-07): the running session's counters ride
+    ``telemetry.episode``; kept one release as an alias (``repo_id: null``
+    without a collect / DAgger session)."""
+    status = _runtime(request).manager.episode_status()
+    if status is None:
+        return {"repo_id": None, "total_episodes": 0, "total_frames": 0}
+    return {
+        "repo_id": status.repo_id,
+        "total_episodes": status.total_episodes,
+        "total_frames": status.total_frames,
+    }
+
+
+# -- datasets (2026-09-07; 04-runtime §10.6 / §13.1; 10-frames §11) ----------------------------
+# Every route reads manifest.json / episode.json only (no lerobot import); the export
+# is a batch job (202) whose progress rides telemetry.datasets.export. Episode ids are
+# 10-frames §11.3 (`20260907T141203.512Z-3f9a1c`): the `.` and `Z` travel verbatim.
+_NAME = r"^[A-Za-z0-9][A-Za-z0-9_\-]*$"
+_EPISODE_ID = r"^[0-9TZ.\-a-f]+$"
+
+
+def _dataset_error(e: DatasetError) -> HTTPException:
+    return HTTPException(404 if e.not_found else 409, str(e))
+
+
+@router.get("/datasets")
+def list_datasets(request: Request) -> list[DatasetInfo]:
+    return _runtime(request).manager.dataset_store.list()
+
+
+# Declared BEFORE the parametrised /datasets/{ns}/{name} routes on purpose (2026-09-08;
+# 15-online-dagger §7): a literal segment must never be read as a namespace.
+@router.get("/datasets/layout")
+def dataset_layout(request: Request) -> DatasetLayoutInfo:
+    """Where datasets live (``RuntimeConfig.datasets``): the default namespace, the
+    generic root and every mapped namespace root, so the UI shows the real folder in
+    its previews and never hard-codes a namespace."""
+    return _runtime(request).manager.dataset_store.layout()
+
+
+@router.get("/datasets/{ns}/{name}")
+def get_dataset(
+    request: Request, ns: str = Path(pattern=_NAME), name: str = Path(pattern=_NAME)
+) -> DatasetInfo:
+    repo_id = f"{ns}/{name}"
+    try:
+        info = _runtime(request).manager.dataset_store.describe(repo_id)
+    except Exception as e:  # noqa: BLE001 - a corrupt manifest is a 409 detail, never a 500
+        raise HTTPException(409, f"dataset {repo_id!r} is unreadable: {e}") from None
+    if info is None:
+        raise HTTPException(404, f"unknown dataset {repo_id!r}")
+    return info
+
+
+@router.get("/datasets/{ns}/{name}/episodes")
+def list_episodes(
+    request: Request, ns: str = Path(pattern=_NAME), name: str = Path(pattern=_NAME)
+) -> list[EpisodeInfo]:
+    try:
+        return _runtime(request).manager.dataset_store.episodes(f"{ns}/{name}")
+    except DatasetError as e:
+        raise _dataset_error(e) from None
+
+
+@router.delete("/datasets/{ns}/{name}/episodes/{episode_id}", status_code=204)
+def delete_episode(
+    request: Request,
+    ns: str = Path(pattern=_NAME),
+    name: str = Path(pattern=_NAME),
+    episode_id: str = Path(pattern=_EPISODE_ID),
+) -> Response:
+    """Removes ONE episode directory (10-frames §11.7): 404 unknown, 409 for the
+    open episode / a legacy tree; allowed while a session records into the dataset."""
+    who = request.client.host if request.client is not None else "unknown"
+    try:
+        _runtime(request).manager.dataset_store.delete_episode(f"{ns}/{name}", episode_id)
+    except DatasetError as e:
+        logger.info(
+            "delete episode %s of %s/%s from %s: refused - %s", episode_id, ns, name, who, e
+        )
+        raise _dataset_error(e) from None
+    logger.info("delete episode %s of %s/%s from %s: ok", episode_id, ns, name, who)
+    return Response(status_code=204)
+
+
+@router.delete("/datasets/{ns}/{name}", status_code=204)
+def delete_dataset(
+    request: Request, ns: str = Path(pattern=_NAME), name: str = Path(pattern=_NAME)
+) -> Response:
+    """The whole tree; 409 while a session records into it or an export runs."""
+    who = request.client.host if request.client is not None else "unknown"
+    try:
+        _runtime(request).manager.dataset_store.delete_dataset(f"{ns}/{name}")
+    except DatasetError as e:
+        logger.info("delete dataset %s/%s from %s: refused - %s", ns, name, who, e)
+        raise _dataset_error(e) from None
+    logger.info("delete dataset %s/%s from %s: ok", ns, name, who)
+    return Response(status_code=204)
+
+
+@router.post("/datasets/{ns}/{name}/export", status_code=202)
+def export_dataset(
+    request: Request,
+    body: DatasetExportRequest,
+    ns: str = Path(pattern=_NAME),
+    name: str = Path(pattern=_NAME),
+) -> dict:
+    """Starts the LeRobot v3 export job (10-frames §11.8) -> 202 ``{repo_id, format,
+    started_at}``; progress on ``telemetry.datasets.export``. 409 while a session
+    records into the dataset, while another export runs or for a legacy tree."""
+    rt = _runtime(request)
+    repo_id = f"{ns}/{name}"
+    try:
+        started = rt.manager.dataset_store.export(
+            repo_id,
+            body.format,
+            body.out,
+            video_file_mb=rt.cfg.recorder.export.video_file_mb,
+            data_file_mb=rt.cfg.recorder.export.data_file_mb,
+        )
+    except DatasetError as e:
+        raise _dataset_error(e) from None
+    logger.info("export %s of %s started", body.format, repo_id)
+    return {"repo_id": repo_id, "format": body.format, "started_at": started}
 
 
 # -- profiles (management CRUD only; save/set-initial ride /ws/control) ----------
@@ -100,9 +232,13 @@ def episodes(request: Request) -> dict:
 def list_profiles(request: Request) -> list[ProfileInfo]:
     return [
         ProfileInfo(
-            profile_id=p.profile_id, name=p.name, arms=sorted(p.arms),
-            notes=p.notes, created_at=p.created_at,
+            profile_id=p.profile_id,
+            name=p.name,
+            arms=sorted(p.arms),
+            notes=p.notes,
+            created_at=p.created_at,
             is_initial_condition=p.is_initial_condition,
+            workcell_kind=p.workcell_kind,
         )
         for p in _runtime(request).profile_store.list()
     ]
@@ -134,8 +270,13 @@ def patch_profile(request: Request, profile_id: str, patch: ProfilePatch) -> Pro
     except ProfileNotFoundError:
         raise HTTPException(404, f"unknown profile {profile_id!r}") from None
     return ProfileInfo(
-        profile_id=p.profile_id, name=p.name, arms=sorted(p.arms), notes=p.notes,
-        created_at=p.created_at, is_initial_condition=p.is_initial_condition,
+        profile_id=p.profile_id,
+        name=p.name,
+        arms=sorted(p.arms),
+        notes=p.notes,
+        created_at=p.created_at,
+        is_initial_condition=p.is_initial_condition,
+        workcell_kind=p.workcell_kind,
     )
 
 
@@ -189,6 +330,23 @@ def post_session(request: Request, spec: SessionSpec) -> SessionInfo:
         rt.manager.teardown()
         raise HTTPException(409, "tracker calibration in progress")
     return info
+
+
+@router.post("/session/return_home")
+def post_session_return_home(request: Request) -> ReturnHomeResult:
+    """Walk the workcell back to its designated initial-condition profile and answer
+    with where the arms ended up (04-runtime §10.5; 2026-09-08 operator request).
+
+    SYNCHRONOUS: the Cockpit's "End session" runs this and waits before it issues the
+    DELETE, so the arms are folded back before the drivers hand them over. Two
+    twin-planned, gated phases — joints first with the carriages held, then the
+    carriages — and any operator input cancels the motion. Never an error status for an
+    operational refusal (no session, no initial condition, an open episode, a faulted
+    arm, an unplannable path): the answer carries ``ok: false`` plus an operator-facing
+    ``detail`` that the UI shows in a dialog. The ``reset_to_initial`` key (``R``) fires
+    the SAME motion over /ws/control, fire-and-forget.
+    """
+    return _runtime(request).manager.return_to_initial()
 
 
 @router.delete("/session", status_code=204)
@@ -270,6 +428,62 @@ def get_arm_maintenance_last(request: Request, arm_id: str) -> ArmMaintenanceRes
     if result is None:
         raise HTTPException(404, f"no maintenance result for {arm_id!r} yet")
     return result
+
+
+# -- Online DAgger (phase-14; 15-online-dagger §7, §9) ------------------------------------------
+# Session-less. The skill is package data served as markdown and as a gzip tarball rooted
+# at mavis-online-dagger-trainer/ (install: curl -s .../skill.tgz | tar xz -C
+# ~/.claude/skills/); the sessions listing reads every <online_dagger root>/*/session.json
+# (the launch sheet's resume pill). The trainer contract itself rides the dora bus.
+@router.get("/online_dagger/skill", response_class=PlainTextResponse)
+def get_online_dagger_skill(request: Request) -> PlainTextResponse:
+    from ..online_dagger import skill_markdown
+
+    try:
+        text = skill_markdown(_runtime(request).cfg.online_dagger.skill_dir)
+    except OSError as e:
+        raise HTTPException(404, f"Online DAgger skill not found: {e}") from None
+    return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
+
+
+@router.get("/online_dagger/skill.tgz")
+def get_online_dagger_skill_tgz(request: Request) -> Response:
+    from ..online_dagger import SKILL_NAME, skill_tarball
+
+    try:
+        data = skill_tarball(_runtime(request).cfg.online_dagger.skill_dir)
+    except OSError as e:
+        raise HTTPException(404, f"Online DAgger skill not found: {e}") from None
+    return Response(
+        content=data,
+        media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{SKILL_NAME}.tgz"'},
+    )
+
+
+@router.get("/online_dagger/sessions")
+def list_online_dagger_sessions(request: Request) -> list[OnlineDaggerSessionInfo]:
+    return _runtime(request).manager.online_dagger_sessions()
+
+
+# -- external interface over dora (phase-12; 14-dora §2.6, §9) -----------------------------
+# Connection facts for foreign clients (same-host policy nodes, remote viewers). The auth
+# token is NEVER served here (read it from <var_dir>/.dora-token on the lab host). ``join``
+# is the explicit rescan a remote operator triggers after starting their daemon: 202 +
+# the current facts (idempotent while the daemon is already registered), 404 when the
+# machine is not in ``dora.machines``.
+@router.get("/dora")
+def get_dora(request: Request) -> DoraInfo:
+    return _runtime(request).dora_info()
+
+
+@router.post("/dora/machines/{machine_id}/join", status_code=202)
+def post_dora_join(request: Request, machine_id: str, response: Response) -> DoraInfo:
+    rt = _runtime(request)
+    if not rt.dora_join(machine_id):
+        raise HTTPException(404, f"machine {machine_id!r} is not in dora.machines")
+    response.status_code = 202
+    return rt.dora_info()
 
 
 __all__ = ["router"]

@@ -9,8 +9,40 @@ orientation (a slerp toward the measurement by the same adaptive factor). A rest
 deadband then drops sub-millimetre / sub-milliradian creep so a resting
 controller commands exactly zero motion.
 
+BETA IS IN Hz PER (m/s) AND THAT IS THE WHOLE TUNING TRAP (2026-09-07). The
+paper's beta ~0.007 is per PIXEL/s, where hand speeds are hundreds of units/s;
+in METRES they are 0.1-1, so a beta carried over from those figures makes
+``beta * speed`` negligible against ``min_cutoff_hz`` and the "adaptive" filter
+degenerates into a FIXED first-order low-pass. At the shipped-until-now
+``min_cutoff_hz 1.0, beta 0.05`` the cutoff never left 1.0 Hz (tau = 159 ms):
+measured against a constant-velocity ramp the output trailed the hand by 148 ms
+/ 15 mm at 0.1 m/s and 131 ms / 39 mm at 0.3 m/s — more than the 25 mm teleop
+leash, so the leash truncated every tick and ``TrackerTeleop.slip()`` folded the
+truncation into the anchor. That was the operator's "trigger has a delay /
+doesn't follow the hand". ``beta 5`` brings that to 7.6 mm /
+~25 ms at 0.3 m/s (4.3 mm / 43 ms at 0.1, 11.7 mm / 15 ms at 0.8) and costs
+nothing measurable at rest.
+
+``d_cutoff_hz`` STAYS AT 1.0 and that is a deliberate refusal. It is the cutoff
+of the speed estimate, so raising it lets the filter react to acceleration
+sooner (beta 10 + d_cutoff 10 measured 5.2 mm / 17 ms) but also couples the
+INPUT NOISE into the speed estimate, which raises the cutoff while the hand
+rests: against 3 mm-std white noise the rest suppression falls 4.9x -> 2.8x
+(``test_resting_jitter_is_suppressed_by_an_order_of_magnitude`` requires 4x).
+Buying 8 ms with a third of the jitter rejection is the wrong trade here
+because libsurvive keeps corrupting the lighthouse calibration
+(``libsurvive rewrites the lighthouse config`` in CLAUDE.md) and the degraded
+regime is exactly the noisy one — the filter has to stay usable there. The
+healthy cell measures 0.1 mm p-p at rest, an order below ``deadband_m``, so
+nothing is lost when the calibration is good.
+
+Re-measure with the same two experiments (ramp lag against a constant-velocity
+ramp, output std against white noise) before moving any of these again.
+
 Pure NumPy, no threads. The provider calls ``reset()`` on every clutch engage
-and after stale/invalid gaps; ``retune()`` serves live ``tracker_settings``.
+and after stale/invalid gaps (measured harmless either way: a reset and a
+warm filter give identical engage transients, because a resting hand leaves the
+speed estimate at ~0 anyway); ``retune()`` serves live ``tracker_settings``.
 """
 
 from __future__ import annotations
@@ -26,9 +58,9 @@ from apollo_mavis_v2_core import Pose, se3
 class PoseFilterConfig:
     enabled: bool = True
     min_cutoff_hz: float = 1.0  # cutoff at rest (lower = smoother, laggier)
-    beta: float = 0.05  # speed coefficient: cutoff = min_cutoff + beta * |velocity|
-    d_cutoff_hz: float = 1.0  # cutoff of the velocity estimate
-    deadband_m: float = 0.002  # rest deadband on position
+    beta: float = 5.0  # Hz per (m/s): cutoff = min_cutoff + beta * |velocity|
+    d_cutoff_hz: float = 1.0  # cutoff of the velocity estimate = adaptation rate
+    deadband_m: float = 0.001  # rest deadband on position (10x the measured rest noise)
     deadband_rad: float = 0.005  # rest deadband on orientation
 
 

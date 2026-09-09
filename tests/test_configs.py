@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from apollo_mavis_v2_runtime.config import load_runtime_config
+from apollo_mavis_v2_runtime.config import (
+    ControlConfig,
+    DatasetNamespaceConfig,
+    DatasetsConfig,
+    RuntimeConfig,
+    load_runtime_config,
+)
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
@@ -58,7 +64,7 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
     # key is an alias) and stays false until the first homing is checked against the
     # *_align overlay.
     hs = cfg.hardware_session
-    assert hs.default_speed_scale == 0.1 and not hasattr(hs, "default_arms")
+    assert hs.default_speed_scale == 1.0 and not hasattr(hs, "default_arms")  # 100 % (2026-09-08)
     assert hs.rail_flip is False and ov.rail_flip is False
     assert (hs.home_rail_inflation_m, hs.home_rail_step_m) == (0.025, 0.005)
     assert hs.bringup_timeout_s == 60.0
@@ -71,6 +77,17 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
 def test_shipped_configs_load(name):
     cfg = load_runtime_config(CONFIGS / name)
     assert cfg.port == 8765
+
+
+@pytest.mark.parametrize("name", ["mavis_v2.yaml", "sim.yaml"])
+def test_keyboard_translate_frame_defaults_to_world(name):
+    """Operator decision 2026-09-08 evening (04-runtime §6): the keyboard translate
+    keys act in the operator-fixed WORLD frame by default (W away from the operator,
+    A to their left, E up); "camera" — that morning's default — and "base" stay
+    selectable. Pinned on the model default AND on both shipped configs (mavis_v2.yaml
+    states it, sim.yaml inherits it)."""
+    assert ControlConfig().translate_frame == "world"
+    assert load_runtime_config(CONFIGS / name).control.translate_frame == "world"
 
 
 def test_shipped_paths_are_self_contained_under_the_workspace():
@@ -103,3 +120,62 @@ def test_apollo_home_expansion_and_anchoring(tmp_path, monkeypatch):
     assert cfg.datasets_root == tmp_path / "relative" / "datasets"  # bare relative anchored
     assert cfg.checkpoints_root == Path("/absolute/ckpts")     # absolute untouched
     assert cfg.calibration_dir == Path("~/cal").expanduser()   # ~ still works
+
+
+@pytest.mark.parametrize("name", ["mavis_v2.yaml", "sim.yaml"])
+def test_shipped_dataset_namespace_roots(name):
+    """Operator decision 2026-09-08 (15-online-dagger §0 item 6 / §7 D5): demonstrations
+    live in ~/data/bc_demo/<name>, Online DAgger sessions in ~/data/online_dagger/<session>/
+    {session.json,rollouts}; a bare dataset name resolves into bc_demo. Both shipped
+    configs state the block, and it equals the model defaults (so a config without the
+    block behaves the same). ``~`` is expanded like datasets_root; the generic root stays
+    inside the workspace."""
+    cfg = load_runtime_config(CONFIGS / name)
+    ds = cfg.datasets
+    assert ds.default_namespace == "bc_demo"
+    assert list(ds.namespaces) == ["bc_demo", "online_dagger"]
+    home = Path.home()
+    assert ds.namespaces["bc_demo"].root == home / "data" / "bc_demo"
+    assert ds.namespaces["bc_demo"].subdir is None
+    assert ds.namespaces["online_dagger"].root == home / "data" / "online_dagger"
+    assert ds.namespaces["online_dagger"].subdir == "rollouts"
+    assert all(ns.root.is_absolute() and "~" not in str(ns.root) for ns in ds.namespaces.values())
+    od = home / "data" / "online_dagger"
+    assert ds.namespaces["online_dagger"].dataset_dir("s1") == od / "s1" / "rollouts"
+    assert ds.namespaces["bc_demo"].dataset_dir("pick") == home / "data" / "bc_demo" / "pick"
+    assert ds == DatasetsConfig() == RuntimeConfig().datasets  # the block IS the defaults
+    ws = CONFIGS.resolve().parents[1]
+    assert str(cfg.datasets_root).startswith(str(ws / "var"))  # generic root unchanged
+
+
+def test_dataset_namespace_roots_expand_like_datasets_root(tmp_path, monkeypatch):
+    """${APOLLO_HOME}, ~ and bare-relative roots resolve exactly like the four dirs;
+    subdir must be one directory name; namespace keys follow the REST <ns> grammar."""
+    monkeypatch.setenv("APOLLO_HOME", str(tmp_path))
+    cfg_file = tmp_path / "c.yaml"
+    cfg_file.write_text(
+        "datasets:\n"
+        "  default_namespace: demo\n"
+        "  namespaces:\n"
+        '    demo: {root: "${APOLLO_HOME}/var/demo"}\n'
+        "    rel: {root: relative/rel, subdir: data}\n"
+        "    home: {root: ~/h}\n"
+    )
+    cfg = load_runtime_config(cfg_file)
+    ns = cfg.datasets.namespaces
+    assert cfg.datasets.default_namespace == "demo"
+    assert ns["demo"].root == tmp_path / "var" / "demo"          # ${APOLLO_HOME} expanded
+    assert ns["rel"].root == tmp_path / "relative" / "rel"       # bare relative anchored
+    assert ns["home"].root == Path("~/h").expanduser()           # ~ still works
+    assert ns["rel"].dataset_dir("x") == tmp_path / "relative" / "rel" / "x" / "data"
+    with pytest.raises(ValueError, match="single directory name"):
+        DatasetNamespaceConfig(root=tmp_path, subdir="a/b")
+    with pytest.raises(ValueError, match="single directory name"):
+        DatasetNamespaceConfig(root=tmp_path, subdir="..")
+    with pytest.raises(ValueError, match="grammar"):
+        DatasetsConfig(namespaces={"bad ns": DatasetNamespaceConfig(root=tmp_path)})
+    with pytest.raises(ValueError):
+        DatasetsConfig(default_namespace="-nope")
+    # an empty map + another default is the tests' pre-D4 layout (conftest pins it)
+    plain = DatasetsConfig(default_namespace="apollo", namespaces={})
+    assert plain.namespaces == {} and plain.default_namespace == "apollo"

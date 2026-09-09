@@ -56,6 +56,16 @@ class InputWatchdog:
         self._state = WatchdogState.AWAIT_EMPTY
         self._trip_t = None
 
+    def on_process_stall(self, now: float, stall_started: float) -> None:
+        """The PROCESS froze (GIL held by an encoder open / flush for > timeout_s): a
+        browser that was fresh when the stall began kept sending, we just could not
+        read. Credit the silence to the stall — move ``_last_rx`` to ``now`` — so a
+        frozen process is not misread as a silent browser and latched. A browser
+        that was already stale at stall start is not forgiven (2026-09-07)."""
+        if self._state is WatchdogState.OK and self._last_rx is not None:
+            if stall_started - self._last_rx <= self.timeout_s:
+                self._last_rx = now
+
     # -- per-tick ----------------------------------------------------------------
     def scale(self, now: float) -> float:
         """1.0 fresh; ramps linearly to 0.0 over ``ramp_s`` after ``timeout_s``

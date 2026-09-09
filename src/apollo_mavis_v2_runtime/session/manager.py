@@ -39,11 +39,73 @@ input) -> RUNNING. Nothing recovers without an operator click:
 :meth:`SessionManager.session_recovery` is the session path of
 ``POST /api/hardware/arms/{arm_id}/maintenance`` (``request_recovery`` on the
 hardware workcell, outcome awaited via ``recovery_result``).
+
+DATA COLLECTION on both workcells (2026-09-07; 04-runtime §10.5/§10.6; 10-frames
+§11): the hardware refusal matrix admits ``mode: collect`` (DAgger / inference stay
+409), :meth:`SessionManager._build_collect_recorder` records from the twin's
+kinematics + the ADOPTED preview cameras (``self._hw_cameras``) with the real
+D435 intrinsics into an ``EpisodeDirRecorder`` (one directory per saved episode;
+LeRobot v3 is an export), ``SessionSpec.dataset`` / ``dataset_resume`` name the
+repo (create-must-not-exist / resume-must-exist-and-match, legacy v3 trees and a
+repo being exported are 409 - all checked BEFORE any box is touched), the
+Perception Arm microphone is recorded as ``audio.wav`` inside the episode
+directory, and - ``SessionSpec.return_to_start`` (DEFAULT ON, D6) - every save /
+discard drives the arms back to the return profile (the ``start_from`` profile,
+else the kind's initial-condition profile; 409 at POST when neither exists):
+:meth:`SessionManager._return_home_worker` plans on the session's twin like
+``start_from`` itself, executes through the gated ``execute_plan`` path as an
+INTERRUPTIBLE plan (any held key / clutch / jog / arm switch cancels it and the
+arm holds where it is) while the recorder reports ``returning``. Episode
+deletion is immediate (``DatasetStore.delete_episode`` - one directory) and
+allowed during the session except for the open episode.
+
+ONLINE DAGGER (phase-14; 15-online-dagger §3, §7): ``SessionSpec.online_dagger`` on an
+external dagger session. :meth:`SessionManager._check_online_dagger` runs at ``create()``
+BEFORE any side effect (the session-directory rule, a trainer-capable policy node
+attached), then :meth:`SessionManager._build_online_dagger` creates ``<online_dagger
+root>/<s>/rollouts``, writes ``session.json`` and builds the ``OnlineDaggerCoordinator``
+whose side effects (``events`` + the session file) run on its own serial worker; the
+rollouts are recorded by the ``DaggerRecorderThread`` into repo id ``online_dagger/<s>``.
+The runtime is the algorithm-agnostic shell: no offline-dataset check, no trainer
+directory, no hyper-parameters. Every ``TakeoverGate`` event of a policy session is
+published as ``events.gate`` (through the coordinator's worker, else the publisher's
+queue). Return-to-start (D6) applies to dagger sessions too. No new motion path: the
+coordinator owns no arm.
+
+2026-09-08 (two operator-reported problems, not yet in the design docs): the
+``start_from`` worker waits ``hardware_session.start_from_fault_grace_s`` for a
+TRANSIENT post-bring-up fault to clear before it submits the pre-planned motion
+(:meth:`SessionManager._await_arms_clear`) and names the arm / controller state when
+the loop still refuses; ``goto_profile`` (:meth:`SessionManager.request_goto_profile`)
+walks the arms to a CHOSEN saved profile through the reset-to-initial machinery.
+
+SEQUENTIAL EXECUTION (2026-09-08 evening; 04-runtime §10.5, 11-safety §9): every
+twin-planned multi-arm motion - the return phases, the per-episode return,
+``start_from`` on both workcells, ``goto_profile`` - is executed ONE ARM AT A TIME in
+``PlanResult.arm_order`` (:meth:`SessionManager._execute_arms`): the sequential
+planner validated arm k only with the arms before it AT their goals and the arms
+after it AT their starts, so the paths are collision-free in that order and in no
+other. On the real cell at 23:16:52 that day a ``reset_to_initial`` submitted both
+arms' waypoints as ONE ``execute_plan``, the executor moved them simultaneously
+through combinations nobody had checked and the gate held the return at 5.2 mm
+(``grip_right_finger`` / ``view_link3``) until the budget. The gripper targets ride
+the LAST arm that moves; any refusal / cancel / fault / timeout stops the sequence
+(the remaining arms never start and the report names the arm); the loop's gate-held
+abort (``hardware_session.plan_gate_hold_s``) turns a held motion into an immediate
+"held by the safety gate (<pair>)" report. The hand-over criterion is MEASURED arrival
+(2026-09-08 review): the executor retiring an arm's waypoints only means the COMMAND
+reached the goal, and a carriage follows its latest-wins targets at the track's own
+speed, so the manager waits until ``workcell.states()[arm].q`` is within
+``PLAN_ARRIVAL_TOL_RAD`` / ``PLAN_ARRIVAL_TOL_RAIL_M`` of the last waypoint
+(:meth:`SessionManager._await_arrival`) before the next arm is submitted - and reports
+``stalled`` when it never gets there. The loop refuses a plan carrying more than one
+arm, so the incident can not recur through ``execute_plan`` either.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 import uuid
@@ -51,6 +113,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from apollo_mavis_v2_core import (
     ArmConfig,
     Command,
@@ -61,17 +124,26 @@ from apollo_mavis_v2_core import (
 from apollo_mavis_v2_core.protocol import (
     ArmBringupTelemetry,
     ArmMaintenanceResult,
+    EpisodeStatus,
+    ReturnHomeResult,
     SessionInfo,
     SessionSpec,
 )
 
 from ..config import RuntimeConfig
-from ..control.loop import DEFAULT_ACTIVE_ARM, ControlLoop, controller_error_title
+from ..control.loop import (
+    DEFAULT_ACTIVE_ARM,
+    GATE_HOLD_PREFIX,
+    RAIL_TRAVEL_M,
+    ControlLoop,
+    controller_error_title,
+)
 from ..control.pose_filter import PoseFilterConfig
 from ..control.tracker_teleop import TrackerTeleop
 from ..devices.hardware_monitor import CONNECTED_STATUSES, MONITOR_JOIN_TIMEOUT_S
 from ..devices.tracker import TrackerSettings
 from ..errors import MaintenanceUnavailableError, SessionError, SessionNotFoundError
+from ..recorder.datasets import DatasetStore
 from ..safety.gate import NullGate, SafetyGate
 from ..safety.supervisor import SafetySupervisor
 from ..safety.watchdog import ArmReportWatchdog, InputWatchdog
@@ -96,6 +168,7 @@ if TYPE_CHECKING:
     from ..bus import RuntimeBus
     from ..devices.hardware_monitor import HardwareStateMonitor
     from ..devices.hardware_probe import HardwareProbe
+    from ..dora_bridge.wiring import DoraWiring
     from ..streams.twin_overlay import TwinOverlayRenderer
 
 logger = logging.getLogger(__name__)
@@ -178,6 +251,30 @@ def _gripper_arms(scene, arm_ids: list[str]) -> list[str]:
     return [a for a in arm_ids if scene.addressing[a].has_gripper]
 
 
+MOTION_BUSY = "a planned motion is already running"
+# Measured-arrival criterion of a sequentially executed plan (2026-09-08 review): arm k
+# has ARRIVED when every joint of ``workcell.states()[k].q`` is within
+# ``PLAN_ARRIVAL_TOL_RAD`` of its last waypoint and the rail slot within
+# ``PLAN_ARRIVAL_TOL_RAIL_M``; the wait ends at the arm's budget deadline or, when that
+# is nearer, ``PLAN_ARRIVAL_GRACE_S`` after the executor retired the waypoints. The real
+# arms hold the servo command to < 1e-4 rad at rest (``cmd-meas`` on the health line);
+# the servo-faithful sim settles a small step to < 1e-3 rad in ~0.6 s and the rail to
+# < 1 mm in ~1 s (measured 2026-09-09 on ``mavis_v2``). The same tolerance is the
+# "already there" / parked-arm threshold, so an arm the planner left within it is not
+# submitted at all (``_moving_arms``).
+PLAN_ARRIVAL_TOL_RAD = 1e-3
+PLAN_ARRIVAL_TOL_RAIL_M = 2e-3
+PLAN_ARRIVAL_GRACE_S = 2.0
+PLAN_ARRIVAL_POLL_S = 0.02
+
+
+def _motion_title(label: str, profile) -> str:
+    """How the Cockpit names the profile motion whose outcome it reports."""
+    if label == "goto_profile":
+        return f"Go to profile '{profile.name}'"
+    return "Return to the initial condition"
+
+
 @dataclass
 class ActiveSession:
     """Everything one running session owns (torn down in reverse)."""
@@ -195,7 +292,15 @@ class ActiveSession:
     streams: list[str] = field(default_factory=list)  # video ids
     sources: list[object] = field(default_factory=list)  # started FrameSources
     start_from_progress: float | None = None
-    fault_detail: str = ""
+    fault_detail: str = ""  # the arms' fault text while FAULT / RECOVERING (or a worker
+    #   crash); written by the fault callback, cleared when the session runs again
+    motion_detail: str = ""  # 2026-09-08: the operator-facing outcome of the LAST profile
+    #   motion that did not arrive - a ``start_from`` plan the loop refused or could not
+    #   plan, a "Go to profile" / `R` return that failed / was cancelled / was skipped.
+    #   Survives a fault cycle (unlike ``fault_detail``) so the "then Go to profile"
+    #   hint is still there once the operator has cleared the error; replaced by the
+    #   next profile motion, "" once one arrives. On the wire as
+    #   ``SessionTelemetry.fault_detail`` / ``SessionInfo.fault_detail``.
     # phase-09c (hardware): preview cameras adopted at session fps (NOT in ``streams``:
     # teardown restores their fps instead of removing them), arms frozen in the gate
     # twin at their last monitor sample (D1), and the unwrapped HardwareWorkcell when
@@ -206,6 +311,78 @@ class ActiveSession:
     # phase-09d (hardware): ``start_from=profile`` waypoints planned INSIDE bring-up
     # (``(waypoints, grippers)``); the start_from worker executes them instead of planning
     planned_start: tuple[dict, dict] | None = None
+    # phase-14: the Online DAgger coordinator + its serial I/O worker (None otherwise)
+    online_dagger: _OnlineDagger | None = None
+
+    def notice(self, arms_carry_faults: bool = False) -> str:
+        """``SessionTelemetry.fault_detail`` / ``SessionInfo.fault_detail``: the
+        session-level text the per-arm rows do not already say. The motion notice
+        first; else the fault text, but only while no arm row carries a fault (the
+        FaultBanner lists those per arm - a bring-up fault before the first snapshot
+        is the case that needs it here)."""
+        if self.motion_detail:
+            return self.motion_detail
+        return "" if arms_carry_faults else self.fault_detail
+
+
+@dataclass
+class _ProfileMotion:
+    """The claim one twin-planned profile motion holds while it plans and runs
+    (:meth:`SessionManager._claim_profile_motion`)."""
+
+    label: str
+
+
+@dataclass
+class _OnlineDagger:
+    """What an Online DAgger session owns besides the DAgger stack (15-online-dagger §3):
+    the coordinator, the serial worker its events / ``session.json`` writes run on,
+    the hub it is attached to as ``trainer_sink`` and the session directory."""
+
+    coordinator: Any  # OnlineDaggerCoordinator
+    worker: Any  # SerialWorker
+    hub: Any  # ExternalPolicyHub
+    paths: Any  # OnlineDaggerPaths
+    repo_id: str  # "online_dagger/<session_name>"
+    created_fresh: bool  # this create() made the session directory (not a resume)
+
+    def start(self) -> None:
+        """Session announced: the session file, then the hub replays its cached trainer
+        status / policy version into the coordinator (bus-thread path from here on)."""
+        self.coordinator.on_session_start()
+        self.hub.attach_trainer_sink(self.coordinator)
+
+    def close(self) -> None:
+        """Teardown (after the recorder stopped): detach from the hub, write the last
+        ``session.json`` (``last_used_at``) and drain the worker."""
+        try:
+            self.hub.detach_trainer_sink(self.coordinator)
+        finally:
+            try:
+                self.coordinator.close()
+            finally:
+                self.worker.close(wait=True)
+
+    def discard_fresh(self) -> None:
+        """A FRESH session whose bring-up failed right after the directory was created:
+        remove it again so the name stays usable (never on a resume)."""
+        if not self.created_fresh:
+            return
+        import shutil
+
+        try:
+            shutil.rmtree(self.paths.session_dir, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("Online DAgger session dir cleanup failed")
+
+    def abandon(self) -> None:
+        """Bring-up failed ANYWHERE after the coordinator was built (recorder, executor,
+        a ``start()``): drop the worker (the coordinator never started, nothing to drain)
+        and remove a fresh directory so the next POST with the name is not a 409."""
+        try:
+            self.worker.close(wait=False)
+        finally:
+            self.discard_fresh()
 
 
 @dataclass
@@ -287,6 +464,13 @@ class SessionManager:
         self._creating = False  # create() is validating / bringing a session up (under _lock)
         self._creating_kind: str | None = None  # spec.kind of the create() in flight
         self._bringup: _BringupProgress | None = None  # hardware bring-up rows (phase-09c)
+        # 2026-09-08: at most ONE twin-planned profile motion (per-episode return, `R`
+        # return, Go to profile, the exit return) plans and runs at a time. The loop's
+        # "plan executing" blocker runs BEFORE a worker plans (tens to hundreds of ms on
+        # the twin), so two workers could both pass it and the second execute_plan
+        # would replace the first mid-motion; this claim closes that window.
+        self._profile_motion: _ProfileMotion | None = None
+        self._profile_motion_lock = threading.Lock()
         # phase-09d: the RailHomingService registers itself here (``active_arm``) so
         # create() refuses ANY session kind while a rail-homing job / request is live
         self.maintenance_guard: Any = None
@@ -306,6 +490,32 @@ class SessionManager:
         self._hw_camera_errors: dict[str, str] = {}
         self.camera_factory: Callable[[object], object] | None = None
         self._twin_scenes: dict[str, object] = {}  # digital-twin scene cache (status rows)
+        # Data collection (2026-09-07): the recorded datasets (the store asks this
+        # manager which repo the running session records into and which episode is
+        # open, so its listing / deletion can mark and protect them) and the
+        # Runtime-owned microphone reader (assigned after construction by
+        # ``Runtime.__init__``; None = no audio sidecars). 2026-09-08 (15-online-dagger
+        # §7 / D5): per-namespace roots - ``cfg.datasets_root`` stays the generic root,
+        # ``cfg.datasets`` maps bc_demo / online_dagger to the operator's ~/data folders;
+        # ``dataset_store.root_of`` is the only spelling of a dataset directory here.
+        self.dataset_store = DatasetStore(
+            cfg.datasets_root,
+            default_namespace=cfg.datasets.default_namespace,
+            namespaces=cfg.datasets.namespaces,
+        )
+        self.dataset_store.in_use_repo = self.in_use_repo
+        self.dataset_store.open_episode = self.open_episode
+        self.dataset_store.episode_delete_refusal = self.episode_delete_refusal
+        self.microphone: Any = None
+        # phase-12 (14-dora §4.2 / §7): the dora wiring (Runtime-owned, assigned after
+        # construction) is told about bring-up / session start / teardown, and the sim
+        # preview keeps the LAST session's final joint vector when the preview scene equals
+        # the session scene (the parked Perception Arm survives session end in sim too).
+        self.dora: DoraWiring | None = None
+        self._parked_q: dict[str, Any] = {}  # arm_id -> q (incl. rail) at the last teardown
+        self._parked_scene: str | None = None
+        self._preview_scene_cache: dict[str, Any] = {}  # scene_id -> BuiltScene (previews)
+        self._pending_preview: Any = None  # (RenderService, scene, cameras) warmed in teardown
 
     # -- info ------------------------------------------------------------------
     @property
@@ -359,6 +569,8 @@ class SessionManager:
                     state=SessionState.BRINGUP.value,
                     kind=bp.spec.kind,
                     speed_scale=bp.spec.speed_scale,
+                    policy_source=bp.spec.policy_source,
+                    online_dagger=bp.spec.online_dagger,
                 )
             raise SessionNotFoundError("no active session")
         return SessionInfo(
@@ -370,6 +582,9 @@ class SessionManager:
             state=s.state.value,
             kind=s.spec.kind,
             speed_scale=s.spec.speed_scale,
+            policy_source=s.spec.policy_source,  # phase-12 echo
+            fault_detail=s.notice(),  # 2026-09-08: refused start_from / Go-to outcome
+            online_dagger=s.spec.online_dagger,  # phase-14 echo
         )
 
     def bringup_telemetry(self) -> list[ArmBringupTelemetry] | None:
@@ -395,7 +610,11 @@ class SessionManager:
     def _validate(self, spec: SessionSpec) -> WorkcellConfig:
         if self.session is not None:
             raise SessionError("a session already exists")
-        if spec.kind != "hardware" and spec.mode in ("dagger", "inference"):
+        if (
+            spec.kind != "hardware"
+            and spec.mode in ("dagger", "inference")
+            and spec.policy_source != "external"  # phase-12: no checkpoint is resolved
+        ):
             from ..dagger.registry import resolve_policy
 
             resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)  # 409 early
@@ -447,15 +666,43 @@ class SessionManager:
                         "to finish"
                     )
                 wc = self._validate(spec)
+                if spec.mode in ("collect", "dagger"):
+                    self._check_dataset_spec(spec, wc)  # before any box / camera is touched
                 if spec.kind == "hardware":
                     twin_scene, samples = self._validate_hardware(spec, wc)
-                    # hardware_session_active from here on (monitor hand-over): after the
-                    # refusal matrix, before the first side effect (monitor.pause())
-                    self._creating_kind = spec.kind
-                    session = self._bringup_hardware(spec, wc, twin_scene, samples)
-                else:
-                    session = self._bringup_sim(spec, wc)
+                if spec.online_dagger is not None:
+                    self._check_online_dagger(spec)  # 15-online-dagger §3/§7: before side effects
+                if spec.mode in ("collect", "dagger"):  # D6: dagger rollouts return too
+                    self._check_return_to_start(spec)  # after the profile checks above
+                # phase-12: every 409 above is evaluated BEFORE the idle arm reader is paused
+                # (the refusal matrix reads monitor samples only, so it never needs the
+                # reader's connections released); the bring-up itself is bracketed
+                dora = self.dora if (self.dora is not None and self.dora.enabled) else None
+                if dora is not None:
+                    dora.before_bringup()  # idle arm reader releases its connections
+                try:
+                    if spec.kind == "hardware":
+                        # hardware_session_active from here on (monitor hand-over): after the
+                        # refusal matrix, before the first side effect (monitor.pause())
+                        self._creating_kind = spec.kind
+                        session = self._bringup_hardware(spec, wc, twin_scene, samples)
+                    else:
+                        session = self._bringup_sim(spec, wc)
+                except Exception:
+                    if dora is not None:
+                        dora.after_teardown()  # nothing came up: idle publishing resumes
+                    raise
                 self.session = session
+                if dora is not None:
+                    try:
+                        dora.after_session_start(self._session_facts(session, wc))
+                    except Exception:  # noqa: BLE001 - the bus never blocks a session
+                        logger.exception("dora session announce failed")
+                if session.online_dagger is not None:
+                    try:
+                        session.online_dagger.start()  # session.json + trainer sink attach
+                    except Exception:  # noqa: BLE001 - never blocks the session
+                        logger.exception("Online DAgger coordinator start failed")
             finally:
                 self._creating = False
                 self._creating_kind = None
@@ -463,6 +710,337 @@ class SessionManager:
             target=self._start_from_worker, args=(session,), name="start-from", daemon=True
         ).start()
         return self.info()
+
+    def _task_repo_id(self, spec: SessionSpec, wc: WorkcellConfig) -> str | None:
+        """The phase-07 task-derived repo id (10-frames §8.1) for ``dataset: None``, from
+        the scene's rail flags; None when the scene cannot be resolved here (the
+        recorder build refuses later)."""
+        from ..recorder.features import ArmMeta, build_repo_id
+
+        scene_id = (
+            spec.sim_scene or wc.sim_scene if spec.kind == "sim"
+            else spec.digital_twin_scene or wc.digital_twin_scene
+        )
+        if not scene_id:
+            return None
+        try:
+            from apollo_mavis_v2_sim import REGISTRY
+
+            meta = REGISTRY.meta(scene_id)
+            arms = [ArmMeta(a, bool(meta.rail.get(a, False))) for a in spec.arms]
+            frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
+            return build_repo_id(spec.task or "task", arms, frames, "delta_ee")
+        except Exception:  # noqa: BLE001 - unknown scene / bad frame: refused downstream
+            return None
+
+    def _check_dataset_spec(self, spec: SessionSpec, wc: WorkcellConfig | None = None) -> None:
+        """``SessionSpec.dataset`` contract (04-runtime §10.5): a NEW dataset must not
+        exist yet, a RESUMED one must (its schema is checked once the features are
+        known, in :meth:`_build_collect_recorder`); a legacy phase-07 LeRobot v3 tree
+        is read-only and a repo the export job is rewriting is refused too — those
+        two checks also cover the task-derived repo of ``dataset: None`` (and a
+        DAgger run's ``_dagger_<run_id>`` repo is always fresh)."""
+        if spec.dataset is None:
+            if spec.mode != "collect" or wc is None:
+                return
+            repo_id = self._task_repo_id(spec, wc)
+            if repo_id is None:
+                return
+            self._refuse_exporting_or_legacy(repo_id)
+            return
+        repo_id = self.dataset_store.resolve(spec.dataset)
+        self._refuse_exporting_or_legacy(repo_id)
+        layout = self.dataset_store.layout_of(repo_id)
+        exists = layout is not None
+        if spec.dataset_resume and not exists:
+            raise SessionError(
+                f"unknown dataset {repo_id!r} - it has no recorded episode yet; start it as a "
+                "new dataset instead"
+            )
+        if not spec.dataset_resume and exists:
+            raise SessionError(
+                f"dataset {repo_id!r} already exists - choose 'Continue existing' to append "
+                "to it, or another name"
+            )
+
+    def _refuse_exporting_or_legacy(self, repo_id: str) -> None:
+        if self.dataset_store.exporting == repo_id:
+            raise SessionError(f"dataset {repo_id!r} is being exported - retry in a moment")
+        if self.dataset_store.layout_of(repo_id) == "lerobot_v3":
+            raise SessionError(
+                f"dataset {repo_id!r} is a legacy LeRobot v3 dataset (read-only; already "
+                "trainable as-is) - record into a new dataset"
+            )
+
+    def _return_profile_for(self, spec: SessionSpec):
+        """The return-to-start profile (04-runtime §10.5): the ``start_from`` profile
+        when one was chosen, else the kind's designated initial-condition profile,
+        else None."""
+        if spec.start_from.startswith("profile:"):
+            try:
+                return self.profile_store.get(spec.start_from.split(":", 1)[1])
+            except ProfileNotFoundError:
+                return None
+        return self.profile_store.initial_for(spec.kind)
+
+    def _check_return_to_start(self, spec: SessionSpec) -> None:
+        """D6: the flag is on by default; with neither a ``start_from`` profile nor an
+        initial-condition profile the POST is refused (the LaunchSheet disables Start
+        with the same reason first)."""
+        if spec.return_to_start and self._return_profile_for(spec) is None:
+            raise SessionError(
+                "return_to_start needs a start_from profile or an initial-condition profile - "
+                "set an initial condition or untick 'Return to start'"
+            )
+
+    # -- Online DAgger (phase-14; 15-online-dagger §3, §7) -------------------------------------
+    def online_dagger_root(self):
+        """Where Online DAgger session directories live: the mapped ``online_dagger``
+        namespace root (``~/data/online_dagger``), else ``<datasets_root>/online_dagger``."""
+        mapped = self.dataset_store.namespaces.get("online_dagger")
+        return mapped.root if mapped is not None else self.dataset_store.root / "online_dagger"
+
+    def online_dagger_sessions(self):
+        """``GET /api/online_dagger/sessions``: every ``<root>/*/session.json`` (newest
+        first); a missing root lists nothing."""
+        from ..dagger.online_dagger import OnlineDaggerCoordinator
+
+        return OnlineDaggerCoordinator.scan_sessions(self.online_dagger_root())
+
+    def _online_dagger_paths(self, od):
+        """The session directory (15-online-dagger §0 item 6): the rollouts dataset is
+        ``root_of("online_dagger/<s>")`` so REST / the store address it like any dataset;
+        the session directory is its parent when the namespace maps a ``subdir`` (the
+        shipped layout ``<root>/<s>/rollouts``), else the dataset directory itself."""
+        from ..dagger.online_dagger import OnlineDaggerPaths
+
+        repo_id = f"online_dagger/{od.session_name}"
+        rollouts = self.dataset_store.root_of(repo_id)
+        mapped = self.dataset_store.namespaces.get("online_dagger")
+        session_dir = rollouts.parent if (mapped is not None and mapped.subdir) else rollouts
+        return OnlineDaggerPaths(session_dir=session_dir, rollouts_dir=rollouts)
+
+    def _external_hub_or_409(self):
+        """The dora hub with a FRESH policy spec, or the 409 every external session
+        shares (14-dora §6.1): ``(dora, hub, announce)``."""
+        dora = self.dora
+        hub = dora.policy_hub if dora is not None else None
+        if hub is None or not dora.bridge.attached:
+            raise SessionError("no external policy attached (dora bridge is not attached)")
+        ann = hub.spec()
+        if ann is None:
+            raise SessionError(
+                "no external policy attached (no policy_spec heartbeat within "
+                f"{self.cfg.dora.policy.spec_stale_s:g} s)"
+            )
+        return dora, hub, ann
+
+    def _check_online_dagger(self, spec: SessionSpec) -> None:
+        """The Online DAgger refusal matrix (15-online-dagger §3, §7), evaluated at
+        ``create()`` BEFORE any side effect: the session-directory rule (``resume: false``
+        on an existing name / ``resume: true`` on a missing one are 409; a resume with an
+        unreadable ``session.json`` is 409 rather than overwritten), the rollouts dataset
+        must be neither exporting nor a legacy tree, then a trainer-capable policy node
+        must be attached (a fresh spec that lacks the ``online_dagger`` capability is its
+        own 409). There is NO offline-dataset check: the trainer configures its own anchor
+        (operator decision 2026-09-08, §0 item 2)."""
+        od = spec.online_dagger
+        assert od is not None
+        paths = self._online_dagger_paths(od)
+        exists = paths.session_dir.is_dir()
+        if exists and not od.resume:
+            raise SessionError(
+                f"Online DAgger session '{od.session_name}' already exists - resume it or pick "
+                "another name"
+            )
+        if od.resume and not exists:
+            raise SessionError(f"Online DAgger session '{od.session_name}' not found")
+        if od.resume and paths.session_json.exists():
+            # a corrupt record must never be overwritten by a fresh document: the rollouts
+            # rows and the counters a resume continues live only here
+            from ..recorder.manifest import read_json
+
+            if not isinstance(read_json(paths.session_json), dict):
+                raise SessionError(
+                    f"Online DAgger session '{od.session_name}': session.json is unreadable - "
+                    "fix or remove it"
+                )
+        # the rollouts dataset is a dataset like any other: a running export of it or a
+        # legacy LeRobot v3 tree at its path is refused here, before any side effect
+        # (the same 409s every collect / dagger POST gets from _check_dataset_spec)
+        self._refuse_exporting_or_legacy(f"online_dagger/{od.session_name}")
+        _dora, hub, _ann = self._external_hub_or_409()
+        if not hub.trainer_capable():
+            raise SessionError(
+                "no Online DAgger trainer attached (the policy node does not report the "
+                "online_dagger capability)"
+            )
+
+    def _build_online_dagger(self, spec: SessionSpec, session_id: str, run_id: str, ann, hub, dora):
+        """Session directory + ``session.json`` + the coordinator (15-online-dagger §3).
+        Runs inside the sim bring-up before the recorder / loop exist; no motion. Creates
+        ``<root>/<s>/rollouts`` ONLY (the trainer owns whatever else it puts there) and
+        writes the first ``session.json`` of a FRESH directory (a resumed one is left as
+        it is until the session is RUNNING). The coordinator's ``publish`` /
+        ``write_session`` go through ONE serial worker so no event or file write ever
+        runs on the tick, and the events keep their order."""
+        from ..dagger.online_dagger import (
+            OnlineDaggerCoordinator,
+            SerialWorker,
+            write_session_json_atomic,
+        )
+        from ..recorder.manifest import read_json
+
+        od = spec.online_dagger
+        assert od is not None
+        paths = self._online_dagger_paths(od)
+        created_fresh = not paths.session_dir.is_dir()
+        resume_doc = None
+        if od.resume:
+            resume_doc = read_json(paths.session_json)
+            if not isinstance(resume_doc, dict) and paths.session_json.exists():
+                # _check_online_dagger refused this already; belt and braces before side effects
+                raise SessionError(
+                    f"Online DAgger session '{od.session_name}': session.json is unreadable - "
+                    "fix or remove it"
+                )
+        paths.mkdirs()
+        worker = SerialWorker()
+        publisher = dora.publisher
+
+        def publish(kind: str, payload: dict) -> None:
+            # the id is pinned HERE: the publisher resolves a missing one from its live
+            # facts on its worker thread, so an event still queued at session_ended() (a
+            # teardown discard) or published during BRINGUP would spell "" and trainers
+            # filter by session id (the same reason enqueue_event captures it eagerly)
+            worker.submit(publisher.publish_event, kind, payload, session_id)
+
+        def write_session(doc: dict) -> None:
+            worker.submit(write_session_json_atomic, paths.session_json, doc)
+
+        coordinator = OnlineDaggerCoordinator(
+            od,
+            session_id=session_id,
+            paths=paths,
+            spec=spec,
+            task=spec.task,
+            run_id=run_id,
+            spec_stale_s=self.cfg.dora.policy.spec_stale_s,
+            policy_version=int(ann.policy_version),
+            publish=publish,
+            write_session=write_session,
+            session_file_hz=self.cfg.online_dagger.session_file_hz,
+        )
+        if od.resume:
+            if isinstance(resume_doc, dict):
+                coordinator.from_session_json(resume_doc)
+            else:
+                logger.warning(
+                    "Online DAgger resume of %r: no session.json - starting the count at 0",
+                    od.session_name,
+                )
+        else:
+            # a FRESH directory gets its first document now (listed at once; abandon()
+            # removes the whole directory if the bring-up fails). A RESUMED record is NOT
+            # rewritten here: the bring-up can still 409 after this point (frame mismatch,
+            # recorder schema) and the file must not then point at a session that never
+            # ran, nor move in the last_used_at listing; on_session_start() writes it once
+            # the session is RUNNING.
+            write_session_json_atomic(paths.session_json, coordinator.to_session_json())
+        logger.info(
+            "Online DAgger session %r (%s): dir %s, rollouts %s",
+            od.session_name,
+            "resume" if od.resume else "new",
+            paths.session_dir,
+            paths.rollouts_dir,
+        )
+        return _OnlineDagger(
+            coordinator=coordinator,
+            worker=worker,
+            hub=hub,
+            paths=paths,
+            repo_id=f"online_dagger/{od.session_name}",
+            created_fresh=created_fresh,
+        )
+
+    @staticmethod
+    def _online_dagger_saved_hook(inner, coordinator):
+        """Recorder-thread hook of an Online DAgger session: the coordinator FIRST
+        (``events.episode_saved`` + ``online_dagger`` block, the ``session.json`` rollouts
+        row - one worker submit), THEN the executor's boundary callback. The callback arms
+        the boundary the next tick consumes, whose ``gate.reset()`` events go through the
+        same worker: this order puts ``episode_saved`` before the boundary's
+        ``events.gate`` on the wire, never after."""
+
+        def hook(index: int, summary, spool_path: str) -> None:
+            try:
+                coordinator.on_episode_saved(summary.episode_id, index, summary, spool_path)
+            except Exception:  # noqa: BLE001 - the coordinator never breaks a save
+                logger.exception("Online DAgger on_episode_saved failed")
+            if inner is not None:
+                inner(index, summary, spool_path)
+
+        return hook
+
+    @staticmethod
+    def _online_dagger_discard_hook(coordinator):
+        """Recorder-thread hook: a discarded rollout -> ``events.episode_discarded`` (the
+        recorder already removed the episode's temp directory; nothing is persisted)."""
+
+        def hook(index: int | None, episode_id: str | None, reason: str) -> None:
+            try:
+                coordinator.on_episode_discarded(episode_id, index, reason)
+            except Exception:  # noqa: BLE001
+                logger.exception("Online DAgger on_episode_discarded failed")
+
+        return hook
+
+    def _gate_events_hook(self):
+        """``GatedPolicyExecutor.on_gate_events`` for a policy session WITHOUT a
+        coordinator (15-online-dagger §3): the dora publisher's queue (drained on the
+        ``dora-publisher`` thread), None when the bridge is off."""
+        dora = self.dora
+        if dora is None or not dora.enabled:
+            return None
+        return dora.publish_gate_events
+
+    # -- dataset store hooks (04-runtime §10.6) ---------------------------------------------
+    def in_use_repo(self) -> str | None:
+        """The repo id the running collect / DAgger session records into, else None."""
+        session = self.session
+        if session is None or session.recorder_thread is None:
+            return None
+        return getattr(session.recorder_thread, "repo_id", None)
+
+    def open_episode(self) -> str | None:
+        """The id of the episode being recorded right now (deletion -> 409), else None."""
+        session = self.session
+        if session is None or session.recorder_thread is None:
+            return None
+        return getattr(session.recorder_thread, "open_episode_id", None)
+
+    def episode_delete_refusal(self, repo_id: str) -> str | None:
+        """``DatasetStore.episode_delete_refusal``: a SAVED rollout of the running Online
+        DAgger session may not be deleted while it runs (15-online-dagger §3) — the
+        coordinator's ``rollouts_saved`` / ``session.json`` rows and the trainer's buffer
+        (told about discards only, never deletions) would silently diverge from the
+        dataset. Every other dataset keeps the phase-13 rule (only the open episode is
+        protected). None = allowed."""
+        session = self.session
+        od = session.online_dagger if session is not None else None
+        if od is None or od.repo_id != repo_id:
+            return None
+        return (
+            f"dataset {repo_id!r} is in use by the running Online DAgger session - end the "
+            "session first (the trainer is told about discards, not deletions)"
+        )
+
+    def episode_status(self) -> EpisodeStatus | None:
+        """The recorder's status (the deprecated ``GET /api/episodes`` alias)."""
+        session = self.session
+        if session is None or session.recorder_thread is None:
+            return None
+        return session.recorder_thread.status()
 
     def _bringup_sim(self, spec: SessionSpec, wc: WorkcellConfig) -> ActiveSession:
         from apollo_mavis_v2_sim import (
@@ -482,11 +1060,21 @@ class SessionManager:
         scene_id = spec.sim_scene or wc.sim_scene
         safety = wc.safety
         session_cfg = self._session_workcell_config(spec, wc, scene_id)
+        # phase-12 (14-dora §7): a STANDBY preview render service is warmed now (its EGL
+        # renderer set-up stalls the GPU driver ~150 ms, which is fine at session start and
+        # unacceptable at teardown) so the camera streams hand over within one frame period
+        if self.dora is not None and self.dora.enabled and self._pending_preview is None:
+            try:
+                self._pending_preview = self._prepare_sim_previews()
+            except Exception:  # noqa: BLE001 - the standby is an optimisation
+                logger.exception("standby preview warm-up failed")
         rs = RenderService()
         rs.start()
         overrides = _microphone_overrides(session_cfg)
         scene = _servo_faithful_scene(scene_id, overrides)
-        workcell = SimWorkcell(scene, session_cfg, render_service=rs)
+        workcell = SimWorkcell(
+            scene, session_cfg, render_service=rs, depth_cameras=self._depth_cameras()
+        )
         workcell.start()
 
         # Twin: always built for planning (goto / start_from); it is the GATE
@@ -496,6 +1084,7 @@ class SessionManager:
             inflation_m=safety.geom_inflation_m,
             render_service=rs if safety.safety_debug else None,
             allowed_pairs_extra=safety.allowed_pairs_extra,
+            hysteresis_m=safety.hysteresis_m,  # the planner escapes the gate's band too
         )
         if safety.safety_debug:
             gate = SafetyGate(twin, safety)
@@ -523,6 +1112,7 @@ class SessionManager:
         session_id = uuid.uuid4().hex
         recorder_thread = None
         policy_session = None
+        started: list = []  # what to stop, in reverse, if the bring-up fails after a start()
         try:
             if spec.mode == "collect":
                 recorder_thread = self._build_collect_recorder(
@@ -555,17 +1145,32 @@ class SessionManager:
                     recorder=recorder_thread,
                     gripper_arms=_gripper_arms(scene, spec.arms),
                     tracker=self._tracker_provider(),
+                    plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
+                    speed_scale=spec.speed_scale,
                 )
+            # the three starts sit INSIDE the rollback scope: a start that raises must
+            # stop what came up before it and, for Online DAgger, drop a fresh session dir
+            loop.start()
+            started.append(loop)
+            if recorder_thread is not None:
+                recorder_thread.start()
+                started.append(recorder_thread)
+            if policy_session is not None:
+                policy_session.start()
+                started.append(policy_session)
         except Exception:
+            for obj in reversed(started):
+                try:
+                    obj.stop()
+                except Exception:  # noqa: BLE001 - keep unwinding
+                    logger.exception("bring-up rollback: %s.stop() failed", type(obj).__name__)
+            online_dagger = getattr(policy_session, "online_dagger", None)
+            if online_dagger is not None:
+                online_dagger.abandon()  # a fresh name stays usable (15-online-dagger §3)
             workcell.stop()
             rs.stop()
             self.start_previews()
             raise
-        loop.start()
-        if recorder_thread is not None:
-            recorder_thread.start()
-        if policy_session is not None:
-            policy_session.start()
 
         # Video: session cameras at session fps + reserved "sim"/"twin".
         session = ActiveSession(
@@ -579,6 +1184,7 @@ class SessionManager:
             render_service=rs,
             recorder_thread=recorder_thread,
             policy_session=policy_session,
+            online_dagger=getattr(policy_session, "online_dagger", None),
         )
         self.attach_fault_state(session)
         fps = self.cfg.video.session_fps
@@ -603,7 +1209,8 @@ class SessionManager:
         """The hardware refusal matrix (409 via :class:`SessionError`), evaluated
         BEFORE anything is touched; returns ``(twin_scene, monitor samples)``.
 
-        teleop only (phase-09c) -> at least one arm, every arm in the hardware
+        teleop or collect (phase-09c; data collection since 2026-09-07 - DAgger /
+        inference on hardware stay 409) -> at least one arm, every arm in the hardware
         config AND in the twin scene, and - phase-09d - EVERY configured arm in
         the session ("hardware sessions include every configured arm") -> a
         resolvable ``digital_twin_scene`` -> no rail homing in flight on ANY arm
@@ -615,8 +1222,11 @@ class SessionManager:
         -> ``start_from`` profile covers the arms.
         """
         self._require_armed()
-        if spec.mode != "teleop":
-            raise SessionError("hardware sessions support teleop only (phase-09c)")
+        if spec.mode not in ("teleop", "collect"):
+            raise SessionError(
+                "hardware sessions support teleop and data collection only "
+                f"({spec.mode} on hardware: not yet)"
+            )
         if not spec.arms:
             raise SessionError("session needs at least one arm")
         ids = [a.id for a in wc.arms]
@@ -703,7 +1313,20 @@ class SessionManager:
             uncovered = [a for a in spec.arms if a not in profile.arms]
             if uncovered:
                 raise SessionError(f"profile {pid!r} does not cover arms {uncovered}")
+        if spec.mode == "collect" and not self._live_hardware_cameras():
+            # checked HERE, before any box is enabled (2026-09-07 review)
+            raise SessionError(
+                "data collection needs at least one live hardware camera - none is open "
+                "(see the Hardware tab camera tiles)"
+            )
         return twin_scene, samples
+
+    def _live_hardware_cameras(self) -> dict:
+        return {
+            cid: cam
+            for cid in list(self._hw_cameras)
+            if (cam := self.hardware_camera(cid)) is not None
+        }
 
     def _hardware_driver_factory(self, scale: float, rail_homing: str | None = None) -> Callable:
         """``XArmDriverConfig -> XArmDriver`` with the D2 speed scale applied to
@@ -907,6 +1530,7 @@ class SessionManager:
                     REGISTRY.build(twin_scene, overrides),
                     inflation_m=safety.geom_inflation_m,
                     allowed_pairs_extra=safety.allowed_pairs_extra,
+                    hysteresis_m=safety.hysteresis_m,  # the planner escapes the gate's band too
                 )
             except Exception as e:  # noqa: BLE001 - TwinAuditError / scene build
                 raise SessionError(f"digital twin {twin_scene!r} unavailable: {e}") from e
@@ -969,10 +1593,12 @@ class SessionManager:
                 tcp_mps, joint_radps = teleop_rate_caps(unscaled, caps)
                 logger.info(
                     "hardware loop: plan executor capped by the servo stream - slew %.5f rad/tick, "
-                    "cart %.5f m/tick (host slew %.5f)",
+                    "cart %.5f m/tick, rail %.5f m/tick (host slew %.5f, host rail %.5f)",
                     caps.slew_rad_per_tick,
                     caps.cart_step_m if caps.cart_step_m is not None else float("nan"),
+                    control_cfg.jog.rail_m_per_tick,
                     unscaled.jog.slew_rad_per_tick,
+                    unscaled.jog.rail_m_per_tick,
                 )
                 logger.info(
                     "hardware loop: teleop capped by the servo stream - tcp %.4f m/s, "
@@ -998,6 +1624,8 @@ class SessionManager:
                 workcell_kind="hardware",
                 gripper_arms=[a.id for a in session_cfg.arms if a.gripper != "none"],
                 tracker=self._tracker_provider() if tracker else None,
+                plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
+                speed_scale=scale,
             )
             return HardwareRig(
                 arms=list(arms),
@@ -1061,6 +1689,7 @@ class SessionManager:
         )
         rig: HardwareRig | None = None
         session: ActiveSession | None = None
+        recorder_thread = None
         try:
             rig = self.connect_hardware_rig(
                 arms=list(spec.arms),
@@ -1075,7 +1704,37 @@ class SessionManager:
             planned = None
             if spec.start_from.startswith("profile:"):
                 planned = self._plan_profile_start(spec, rig, progress)
+            # 11b. data collection (2026-09-07, §10.5): the recorder reads the ADOPTED
+            #      preview cameras (the UVC nodes are open exactly once) and the twin's
+            #      kinematics; built before the loop starts so a dataset refusal (409)
+            #      never leaves a running loop behind.
+            if spec.mode == "collect":
+                cams = self._live_hardware_cameras()
+                if not cams:  # re-checked: a preview may have died during the connect
+                    raise SessionError(
+                        "data collection needs at least one live hardware camera - none is "
+                        "open (see the Hardware tab camera tiles)"
+                    )
+                for a in spec.arms:
+                    progress.set(a, "recorder", "pending", "opening the dataset writer")
+                recorder_thread = self._build_collect_recorder(
+                    spec,
+                    rig.session_cfg,
+                    rig.workcell,
+                    rig.twin.scene,
+                    session_id,
+                    kind="hardware",
+                    cameras=cams,
+                    camera_cfgs={c.id: c for c in wc.cameras},
+                )
+                rig.loop.recorder = recorder_thread
+                for a in spec.arms:
+                    progress.set(
+                        a, "recorder", "ok", f"recording into {recorder_thread.repo_id}"
+                    )
             rig.loop.start()
+            if recorder_thread is not None:
+                recorder_thread.start()
             loop, workcell = rig.loop, rig.workcell
             session = ActiveSession(
                 session_id=session_id,
@@ -1086,6 +1745,7 @@ class SessionManager:
                 supervisor=rig.supervisor,
                 twin=rig.twin,
                 render_service=None,
+                recorder_thread=recorder_thread,
                 frozen_arms=sorted(rig.frozen),
                 inner_workcell=rig.inner,
                 planned_start=planned,
@@ -1116,6 +1776,11 @@ class SessionManager:
             logger.info("hardware session %s: bring-up complete (%s)", session_id, labels)
             return session
         except BaseException:
+            if recorder_thread is not None:
+                try:
+                    recorder_thread.stop()  # finalize the (empty) dataset, never half-open
+                except Exception:  # noqa: BLE001
+                    logger.exception("hardware bring-up abort: recorder stop failed")
             self._abort_hardware_bringup(
                 rig.loop if rig is not None else None,
                 rig.workcell if rig is not None else None,
@@ -1130,9 +1795,11 @@ class SessionManager:
         motion from its MEASURED posture to the profile posture on the gate twin
         (``twin.plan`` - RRT-Connect, frozen arms as static obstacles; the rail
         slot follows the profile when it has one, else stays) before the loop
-        starts; returns ``(waypoints, grippers)`` for ``execute_plan``. A failed
-        plan raises ``SessionError`` ("profile motion not collision-free") and the
-        caller tears the session down."""
+        starts; returns ``(waypoints, grippers)`` for ``execute_plan``, the
+        waypoints keyed in the planner's ``arm_order`` (the start_from worker
+        executes them one arm at a time in that order). A failed plan raises
+        ``SessionError`` ("profile motion not collision-free") and the caller tears
+        the session down."""
         from apollo_mavis_v2_core import PlanRequest
 
         pid = spec.start_from.split(":", 1)[1]
@@ -1155,7 +1822,9 @@ class SessionManager:
         for a in rig.arms:
             progress.set(a, "start_from", "pending", f"planning the motion to profile {pid!r}")
         rig.twin.sync({a: states[a] for a in rig.arms})  # measured context for the planner
-        result = rig.twin.plan(PlanRequest(q_start=q_start, q_goal=q_goal))
+        result = rig.twin.plan(
+            PlanRequest(q_start=q_start, q_goal=q_goal, speed_scale=spec.speed_scale)
+        )
         if not result.ok:
             pair = f" ({' / '.join(result.failing_pair)})" if result.failing_pair else ""
             raise SessionError(
@@ -1169,7 +1838,7 @@ class SessionManager:
                 "ok",
                 f"{len(result.waypoints.get(a, ()))} waypoints planned to profile {pid!r}",
             )
-        return result.waypoints, grippers
+        return self._ordered_waypoints(result), grippers
 
     def _freeze_unselected_arms(
         self, twin, meta, arms: list[str], samples: dict, progress: _BringupProgress
@@ -1237,7 +1906,13 @@ class SessionManager:
         workcell,
         scene,
         session_id: str,
-        dagger_ctx: dict | None = None,  # {"run_id", "gate"} -> DaggerRecorderThread
+        dagger_ctx: dict | None = None,  # {"run_id", "gate"[, "repo_id", "coordinator"]}
+        #   -> DaggerRecorderThread; "repo_id" = record into THIS repo verbatim (Online DAgger
+        #   rollouts "online_dagger/<s>", resumed when it exists) instead of _dagger_<run_id>
+        *,
+        kind: str = "sim",
+        cameras: dict | None = None,  # hardware: the adopted preview cameras (id -> camera)
+        camera_cfgs: dict | None = None,  # hardware: CameraConfig by id (intrinsics)
     ):
         """Collect/DAgger recorder stack (04-runtime §10; 10-frames §5-§9).
 
@@ -1245,23 +1920,49 @@ class SessionManager:
         only collect/dagger sessions ever pay them. With ``dagger_ctx`` the
         schema gains the 12-dagger §4 columns and the repo id the
         ``_dagger_{run_id}`` suffix (dedicated repo; seed data never mutated).
+
+        ``kind == "hardware"`` (2026-09-07): ``scene`` is the digital-twin
+        ``BuiltScene`` (kinematics for the recording-frame conversion and the
+        wrist-camera extrinsics), ``cameras`` the live UVC previews and
+        ``camera_cfgs`` their configs — the factory D435 intrinsics go into the
+        sidecar, the twin camera of the same name (``<id>`` or ``<id>_cam``) gives
+        ``T_W_C``. The dataset repo follows ``SessionSpec.dataset`` (resume =
+        schema-checked against ``manifest.json`` incl. the feature info blocks, 409
+        on a mismatch) and gets ``audio.wav`` inside every episode directory when
+        the microphone reader is live (hardware; sim only with the fake backend).
         """
         import hashlib
 
         import numpy as np
         from apollo_mavis_v2_core import parse_frame
 
-        from ..recorder.episode_recorder import LeRobotEpisodeRecorder
+        from ..recorder.episode_recorder import EpisodeDirRecorder, dataset_incompatibility
         from ..recorder.features import ArmMeta, build_features, build_repo_id, build_robot_type
         from ..recorder.frames import RecordingFrameConverter
         from ..recorder.kinematics import RecorderKinematics
+        from ..recorder.manifest import is_legacy_v3, read_manifest
         from ..recorder.sidecars import SidecarWriter, pose_json
         from ..recorder.thread import RecorderThread
 
+        sim = kind == "sim"
+        cams = dict(workcell.cameras) if cameras is None else dict(cameras)
+        cam_cfgs = (
+            {c.id: c for c in session_cfg.cameras} if camera_cfgs is None else dict(camera_cfgs)
+        )
         action_space = "delta_ee"  # canonical (10-frames §1.2); per-session later
         arms = [ArmMeta(a, bool(scene.meta.rail[a])) for a in spec.arms]
         frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
         kin = RecorderKinematics(scene)
+
+        def twin_camera(cam_id: str) -> str | None:
+            """MJCF camera that models ``cam_id`` (sim: itself; hardware: ``<id>_cam``)."""
+            for name in (cam_id, f"{cam_id}_cam"):
+                try:
+                    kin.camera_static(name)
+                except KeyError:
+                    continue
+                return name
+            return None
 
         # camera:<id> recording frames need a declared camera with static T_W_C
         # (10-frames §5.1); wrist/moving cameras are rejected here (-> 409).
@@ -1270,32 +1971,58 @@ class SessionManager:
             parsed = parse_frame(ref)
             if parsed.kind != "camera":
                 continue
-            if parsed.ident not in workcell.cameras:
+            if parsed.ident not in cams:
                 raise SessionError(f"frames[{arm_id!r}]: unknown camera {parsed.ident!r}")
-            if not kin.camera_static(parsed.ident):
+            twin_cam = twin_camera(parsed.ident)
+            if twin_cam is None or not kin.camera_static(twin_cam):
                 raise SessionError(
                     f"frames[{arm_id!r}]: camera {parsed.ident!r} is not static in world"
                 )
-            camera_poses[parsed.ident] = kin.camera_world(parsed.ident)
+            camera_poses[parsed.ident] = kin.camera_world(twin_cam)
         converter = RecordingFrameConverter(frames, camera_poses)
 
-        cam_res = {cid: cam.resolution for cid, cam in workcell.cameras.items()}
+        cam_res = {cid: tuple(cam.resolution) for cid, cam in cams.items()}
         features = build_features(arms, frames, cam_res, action_space)
-        repo_id = build_repo_id(spec.task or "task", arms, frames, action_space)
+        if spec.dataset is not None:
+            repo_id = self.dataset_store.resolve(spec.dataset)
+        elif dagger_ctx is not None and dagger_ctx.get("repo_id"):
+            repo_id = str(dagger_ctx["repo_id"])  # Online DAgger rollouts (15-online-dagger §4)
+        else:
+            repo_id = build_repo_id(spec.task or "task", arms, frames, action_space)
         if dagger_ctx is not None:
             from ..dagger.recorder import dagger_features
 
             features = dagger_features(features, dagger_ctx["run_id"])
-            repo_id = f"{repo_id}_dagger_{dagger_ctx['run_id']}"
-        root = self.cfg.datasets_root / repo_id
-        recorder = LeRobotEpisodeRecorder(
-            self.cfg.recorder,
-            features,
-            root,
-            repo_id,
-            build_robot_type(len(arms), sim=True),
-            default_task=spec.task or "",
-        )
+            if not dagger_ctx.get("repo_id"):
+                repo_id = f"{repo_id}_dagger_{dagger_ctx['run_id']}"
+        root = self.dataset_store.root_of(repo_id)  # per-namespace roots (D4)
+        robot_type = build_robot_type(len(arms), sim=sim)
+        if is_legacy_v3(root):
+            raise SessionError(
+                f"dataset {repo_id!r} is a legacy LeRobot v3 dataset (read-only; already "
+                "trainable as-is) - record into a new dataset"
+            )
+        try:
+            manifest = read_manifest(root)
+        except ValueError as e:  # unsupported layout major
+            raise SessionError(f"dataset {repo_id!r}: {e}") from e
+        why = dataset_incompatibility(manifest, features, self.cfg.recorder.fps, robot_type)
+        if why is not None:
+            raise SessionError(
+                f"dataset {repo_id!r} cannot be continued by this session: {why} - record "
+                "into a new dataset"
+            )
+        try:
+            recorder = EpisodeDirRecorder(
+                self.cfg.recorder,
+                features,
+                root,
+                repo_id,
+                robot_type,
+                default_task=spec.task or "",
+            )
+        except (ValueError, RuntimeError) as e:  # codec family / encoder refusals (§7.5)
+            raise SessionError(f"dataset {repo_id!r}: {e}") from e
 
         sidecars = SidecarWriter(root)
         scene_sha = sidecars.archive_scene_xml(scene.xml)
@@ -1304,10 +2031,18 @@ class SessionManager:
             spec.mode,
             spec.model_dump(mode="json"),
             {
-                "kind": "sim",
+                "kind": kind,
                 "config_sha256": hashlib.sha256(session_cfg.model_dump_json().encode()).hexdigest(),
                 "arm_ids": list(spec.arms),
                 "rail": {a.arm_id: a.has_rail for a in arms},
+                "cameras": {
+                    cid: {
+                        "resolution": list(cam_res[cid]),
+                        "kind": getattr(cam_cfgs.get(cid), "kind", "sim"),
+                        "twin_camera": twin_camera(cid),
+                    }
+                    for cid in cams
+                },
             },
             session_cfg.safety.model_dump(mode="json"),
         )
@@ -1321,67 +2056,907 @@ class SessionManager:
                 "rail_origin_in_world": pose_json(kin.base_world(arm.arm_id, q0)),
                 "has_rail": arm.has_rail,
             }
-        initial = self.profile_store.initial_for("sim")
+        initial = self.profile_store.initial_for(kind)  # type: ignore[arg-type]
         profile_snapshot = None
         if spec.start_from.startswith("profile:"):
             profile_snapshot = self.profile_store.get(spec.start_from.split(":", 1)[1]).model_dump(
                 mode="json"
             )
+        return_profile = self._return_profile_for(spec) if spec.return_to_start else None
         meta_base = {
             "session_id": session_id,
             "scene_xml_sha256": scene_sha,
             "start_from": spec.start_from,
             "initial_condition_profile_id": initial.profile_id if initial else None,
+            "return_profile_id": return_profile.profile_id if return_profile else None,
             "profile_snapshot": profile_snapshot,
             "frames": dict(frames),
             "arm_bases": arm_bases,
         }
-        cam_cfgs = {c.id: c for c in session_cfg.cameras}
 
         def extrinsics_fn(arm_states):  # runs on the recorder thread (owns kin)
             q_by_arm = {a: np.asarray(arm_states[a].q) for a in spec.arms}
             out = {}
-            for cam_id in workcell.cameras:
+            for cam_id in cams:
                 cfg = cam_cfgs.get(cam_id)
+                twin_cam = twin_camera(cam_id)
+                static = kin.camera_static(twin_cam) if twin_cam else False
                 out[cam_id] = {
-                    "T_W_C": pose_json(kin.camera_world(cam_id, q_by_arm)),
-                    "extrinsics_frame": "world" if kin.camera_static(cam_id) else None,
+                    "T_W_C": pose_json(kin.camera_world(twin_cam, q_by_arm)) if twin_cam else None,
+                    "extrinsics_frame": "world" if static else None,
+                    "twin_camera": twin_cam,  # hardware: the MJCF camera standing in for it
                     "intrinsics": (cfg.intrinsics.model_dump() if cfg and cfg.intrinsics else None),
-                    "calibration_file": None,  # sim: pose comes from the MJCF
+                    "calibration_file": None,  # pose comes from the (twin) MJCF
                     "calibration_sha256": None,
                 }
             return out
 
+        audio = None
+        mic = self.microphone
+        mic_backend = getattr(getattr(mic, "cfg", None), "backend", None)
+        if (
+            self.cfg.recorder.audio
+            and mic is not None
+            and getattr(mic, "active", False)
+            and (not sim or mic_backend == "fake")  # 04-runtime §10.5: sim only with a fake reader
+        ):
+            from ..recorder.audio import EpisodeAudioSink
+
+            audio = EpisodeAudioSink(mic)
+
         if dagger_ctx is not None:
             from ..dagger.recorder import DaggerRecorderThread
 
-            return DaggerRecorderThread(
+            dagger_thread = DaggerRecorderThread(
                 recorder,
                 self.bus,
-                workcell.cameras,
+                cams,
                 arms,
                 converter,
                 kin,
                 fps=self.cfg.recorder.fps,
-                sidecars=sidecars,
                 episode_meta_base=meta_base,
                 extrinsics_fn=extrinsics_fn,
+                audio=audio,
+                action_filter=spec.action_filter,
                 gate=dagger_ctx["gate"],
                 run_id=dagger_ctx["run_id"],
                 dataset_root=root,
+                coordinator=dagger_ctx.get("coordinator"),
             )
-        return RecorderThread(
+            dagger_thread.on_episode_done = self._on_episode_done  # D6: dagger returns too
+            return dagger_thread
+        thread = RecorderThread(
             recorder,
             self.bus,
-            workcell.cameras,
+            cams,
             arms,
             converter,
             kin,
             fps=self.cfg.recorder.fps,
-            sidecars=sidecars,
             episode_meta_base=meta_base,
             extrinsics_fn=extrinsics_fn,
+            audio=audio,
+            repo_id=repo_id,
+            dataset_root=root,
+            action_filter=spec.action_filter,
         )
+        thread.on_episode_done = self._on_episode_done
+        return thread
+
+    # -- return-to-start (D6; 04-runtime §10.5) ---------------------------------------------
+    def _on_episode_done(self, outcome: str, index: int | None) -> None:
+        """Recorder-thread hook fired after every save / discard (BEFORE the recorder
+        flips back to idle, so telemetry reads ``saving -> returning -> idle``): start
+        the return motion when the session asked for it. Never blocks the recorder."""
+        session = self.session
+        if (
+            session is None
+            or session.spec.mode not in ("collect", "dagger")  # D6 (15-online-dagger)
+            or not session.spec.return_to_start
+            or session.recorder_thread is None
+        ):
+            return
+        rt = session.recorder_thread
+        if session.state is not SessionState.RUNNING:  # faulted / recovering / tearing down
+            rt.set_returning(False, f"return skipped: session {session.state.value}")
+            return
+        if session.supervisor.watchdog.tripped:
+            # The browser's deadman is latched (keys down / stale): a planned motion
+            # would start under an operator who is not in control - hold instead.
+            rt.set_returning(False, "return skipped: browser input latched - release every key")
+            return
+        profile = self._return_profile_for(session.spec)
+        if profile is None:
+            rt.set_returning(False, "return skipped: no return profile")
+            return
+        token = self._claim_profile_motion("return_to_start")
+        if token is None:  # an `R` / Go-to-profile motion is planning or running
+            rt.set_returning(False, f"return skipped: {MOTION_BUSY}")
+            return
+        rt.set_returning(True, f"returning to profile '{profile.name}'")
+        threading.Thread(
+            target=self._return_home_worker,
+            args=(session, profile, outcome, token),
+            name="return-to-start",
+            daemon=True,
+        ).start()
+
+    # -- one profile motion at a time ---------------------------------------------------------
+    def _claim_profile_motion(self, label: str) -> _ProfileMotion | None:
+        """Claim the single profile-motion slot for ``label``; None when another
+        motion (per-episode return, `R`, Go to profile, exit return) holds it. The
+        holder releases it with :meth:`_release_profile_motion` and ITS token only, so a
+        late release after a teardown can never drop a newer session's claim."""
+        with self._profile_motion_lock:
+            if self._profile_motion is not None:
+                return None
+            token = _ProfileMotion(label)
+            self._profile_motion = token
+            return token
+
+    def _release_profile_motion(self, token: _ProfileMotion | None) -> None:
+        with self._profile_motion_lock:
+            if token is not None and self._profile_motion is token:
+                self._profile_motion = None
+
+    @property
+    def profile_motion_in_flight(self) -> str | None:
+        """The label of the profile motion planning / running right now, else None."""
+        claim = self._profile_motion
+        return claim.label if claim is not None else None
+
+    # -- shared return machinery: goals, one planned phase, the wait -----------------------
+    def _return_goals(self, session: ActiveSession, profile, arms):
+        """Per-arm return targets toward ``profile`` (04-runtime §10.5).
+
+        Returns ``(states, q_start, q_joint, q_full, grippers)`` keyed by the arms
+        the profile actually covers (an arm it does not cover simply stays where
+        it is). ``q_joint`` carries the profile's 7 joints with the arm's CURRENT
+        rail value in the rail slot; ``q_full`` carries the profile's rail too
+        (identical to ``q_joint`` when the profile stores no rail for that arm, i.e.
+        ``rail_pos_m is None`` = "keep the carriage"). Splitting the two is what
+        lets the exit return move the joints FIRST and the carriage after
+        (2026-09-08 operator decision: sliding a rail with the arm extended sweeps
+        it through the cell, folding first does not).
+
+        Rail GOALS are snapped into ``[0, RAIL_TRAVEL_M]`` (2026-09-09): a carriage
+        that settled a few tenths of a mm past an end stop reads e.g. -0.0004 m, and a
+        goal copied verbatim from such a reading (the joints phase keeps the current
+        carriage; a profile saved from it stores the same value) can never be reached
+        by the loop's command path, whose per-tick clamp pins the rail slot to the
+        travel. The START stays the raw measurement (the planner is given the arm
+        where it is); the goal a hair inside the travel is within the arrival
+        tolerance either way, so nothing observable changes except that the plan's
+        goal is reachable by construction (``ControlLoop._confirm_plan_arrivals`` keeps
+        its reachable-limit fallback for goals from other sources).
+        """
+        states = session.workcell.states()
+        q_start: dict[str, list[float]] = {}
+        q_joint: dict[str, list[float]] = {}
+        q_full: dict[str, list[float]] = {}
+        grippers: dict[str, float] = {}
+        for arm_id in arms:
+            posture = profile.arms.get(arm_id)
+            if posture is None:
+                continue  # the profile does not cover this arm: it stays
+            st = states[arm_id]
+            joints = [float(x) for x in posture.q]
+            goal_joint = list(joints)
+            goal_full = list(joints)
+            if st.q.shape[0] > 7:  # rail slot LAST; None = keep the current carriage
+                current_rail = min(max(float(st.q[7]), 0.0), RAIL_TRAVEL_M)
+                rail = posture.rail_pos_m
+                goal_joint.append(current_rail)
+                goal_full.append(
+                    current_rail if rail is None else min(max(float(rail), 0.0), RAIL_TRAVEL_M)
+                )
+            q_start[arm_id] = [float(x) for x in st.q]
+            q_joint[arm_id] = goal_joint
+            q_full[arm_id] = goal_full
+            if arm_id in session.loop.gripper_arms:
+                grippers[arm_id] = float(posture.gripper_open_frac)
+        return states, q_start, q_joint, q_full, grippers
+
+    def _plan_return(self, session: ActiveSession, states, q_start: dict, q_goal: dict):
+        """``twin.plan`` for one return phase (plain sim: keep the plan twin fresh)."""
+        from apollo_mavis_v2_core import PlanRequest
+
+        if session.supervisor.twin is None:
+            session.twin.sync(states)
+        # the escape from a pinched start is judged at the speed the plan will run at
+        return session.twin.plan(
+            PlanRequest(q_start=q_start, q_goal=q_goal, speed_scale=session.spec.speed_scale)
+        )
+
+    @staticmethod
+    def _plan_failure_text(result) -> str:
+        pair = f" ({' / '.join(result.failing_pair)})" if result.failing_pair else ""
+        return f"{result.failure}{pair}"
+
+    # -- sequential execution of a planned multi-arm motion (2026-09-08 evening) --------
+    @staticmethod
+    def _ordered_waypoints(result) -> dict:
+        """``result.waypoints`` re-keyed in ``result.arm_order`` - the order the
+        sequential planner validated (arm k with arms < k at their GOALS and arms > k
+        at their STARTS) and therefore the ONLY order the paths may be executed in.
+        Falls back to the dict's insertion order for a planner that does not fill
+        ``arm_order`` (test fakes); arms the order does not name come last."""
+        waypoints = dict(result.waypoints)
+        order = [a for a in (getattr(result, "arm_order", None) or []) if a in waypoints]
+        order += [a for a in waypoints if a not in order]
+        return {a: waypoints[a] for a in order}
+
+    @staticmethod
+    def _moving_arms(waypoints: dict) -> list[str]:
+        """The arms whose waypoints actually go somewhere (in ``waypoints`` order): an
+        arm the planner left at its start (every point within the arrival tolerance of
+        the first - 1e-3 rad / m, the manager's "already there" threshold; a hardware
+        start that differs from the goal by the SDK's ~1e-4 rad read-back noise is
+        parked, not a 1-2 tick micro-plan) is not submitted at all - it has nothing to
+        arrive at."""
+        import numpy as np
+
+        out = []
+        for arm_id, wps in waypoints.items():
+            pts = [np.asarray(w, dtype=np.float64) for w in wps]
+            if pts and any(np.max(np.abs(q - pts[0])) > PLAN_ARRIVAL_TOL_RAD for q in pts[1:]):
+                out.append(arm_id)
+        return out
+
+    @staticmethod
+    def _arrival_error(q_meas, goal) -> tuple[float, float | None]:
+        """``(max joint error rad, rail error m | None)`` of a measured q against a
+        goal (the rail slot compared only when both carry one)."""
+        import numpy as np
+
+        q = np.asarray(q_meas, dtype=np.float64)
+        g = np.asarray(goal, dtype=np.float64)
+        n = min(7, q.shape[0], g.shape[0])
+        joints = float(np.max(np.abs(q[:n] - g[:n]))) if n else 0.0
+        rail = float(abs(q[7] - g[7])) if q.shape[0] > 7 and g.shape[0] > 7 else None
+        return joints, rail
+
+    @classmethod
+    def _arrived(cls, q_meas, goal) -> bool:
+        joints, rail = cls._arrival_error(q_meas, goal)
+        return joints <= PLAN_ARRIVAL_TOL_RAD and (rail is None or rail <= PLAN_ARRIVAL_TOL_RAIL_M)
+
+    def _await_arrival(
+        self,
+        session: ActiveSession,
+        arm_id: str,
+        goal,
+        *,
+        running: Callable[[], bool],
+        deadline: float,
+    ) -> tuple[str, str]:
+        """Wait until ``arm_id``'s MEASURED q is within the arrival tolerance of ``goal``
+        (the arm's last waypoint). ``("done", "")`` on arrival; ``("cancelled", ...)`` when
+        the session leaves its motion state or the arm faults meanwhile; ``("stalled",
+        "<how far off after how long>")`` at ``deadline`` (monotonic). Polls the driver's
+        cached states every ``PLAN_ARRIVAL_POLL_S``; never commands anything."""
+        t0 = time.monotonic()
+        while True:
+            try:
+                q = session.workcell.states()[arm_id].q
+            except Exception:  # noqa: BLE001 - a read hiccup is not an arrival
+                q = None
+            if q is not None and self._arrived(q, goal):
+                return "done", ""
+            if not running():
+                return "cancelled", f"session {session.state.value}"
+            if arm_id in session.loop.faulted_arms:
+                return "cancelled", "driver fault"
+            now = time.monotonic()
+            if now >= deadline:
+                if q is None:
+                    return "stalled", f"no state read-back after {now - t0:.1f} s"
+                joints, rail = self._arrival_error(q, goal)
+                off = f"joints off by {joints * 1e3:.1f} mrad"
+                if rail is not None and rail > PLAN_ARRIVAL_TOL_RAIL_M:
+                    off += f", carriage off by {rail * 1e3:.0f} mm"
+                return "stalled", f"did not arrive: {off} after {now - t0:.1f} s"
+            time.sleep(PLAN_ARRIVAL_POLL_S)
+
+    @staticmethod
+    def _span(wps) -> float:
+        """Largest |q - q[0]| over an arm's waypoints (rad / m; log line only)."""
+        import numpy as np
+
+        pts = [np.asarray(w, dtype=np.float64) for w in wps]
+        return max((float(np.max(np.abs(q - pts[0]))) for q in pts[1:]), default=0.0)
+
+    @staticmethod
+    def _sequence_detail(detail: str, order: list[str], i: int) -> str:
+        """Name the arm a multi-arm sequence stopped at and the arms that never
+        started; a single-arm sequence reports exactly as before."""
+        if len(order) < 2:
+            return detail
+        rest = [arm_label(a) for a in order[i + 1 :]]
+        text = f"{detail} - {arm_label(order[i])}"
+        return f"{text}; {', '.join(rest)} not moved" if rest else text
+
+    def _submit_execute_plan(self, waypoints: dict, grippers: dict, *, interruptible: bool):
+        """One ``execute_plan`` through the bus; returns the loop's ack."""
+        return self.bus.commands.submit(
+            Command(
+                op="execute_plan",
+                args={
+                    "waypoints": waypoints,
+                    "gripper": grippers,
+                    "interruptible": interruptible,
+                },
+                source="internal",
+            )
+        ).result(timeout=5.0)
+
+    def _execute_arms(
+        self,
+        session: ActiveSession,
+        waypoints: dict,
+        grippers: dict,
+        *,
+        interruptible: bool,
+        running: Callable[[], bool],
+        budget_s: Callable[[str, list], float],
+        tag: str,
+        timeout_reason: str,
+        submit: Callable[[dict, dict], Any] | None = None,
+        on_progress: Callable[[float], None] | None = None,
+    ) -> tuple[str, str]:
+        """Execute a planned multi-arm motion ONE ARM AT A TIME in ``waypoints`` order
+        (= ``PlanResult.arm_order``, see :meth:`_ordered_waypoints`) through the gated
+        ``execute_plan`` path: submit one arm's waypoints, wait until the executor has
+        retired them, then the next arm. The gripper targets ride the LAST arm that
+        moves (an interruptible plan applies them on that arm's arrival). Any refusal /
+        cancel / fault / timeout stops the sequence - the remaining arms never start.
+        2026-09-08: a two-arm return submitted as ONE plan moved both arms at once
+        through never-validated combinations and the gate held it at 5.2 mm.
+
+        ``running()`` false stops the wait (the motion is cancelled through the loop);
+        ``budget_s(arm, wps)`` is the per-arm deadline; ``submit(wps, grippers)`` may
+        wrap :meth:`_submit_execute_plan` (start_from's retry-once); ``on_progress``
+        receives the fraction of ALL waypoints retired so far. Returns ``(status,
+        detail)`` with ``detail`` naming the arm for a multi-arm sequence:
+
+        ``done`` - every arm reached its last waypoint AND its measured posture is
+        there (``_await_arrival``: the executor retiring the waypoints only says the
+        COMMAND arrived; a carriage trails its latest-wins targets at the track's speed);
+        ``refused`` - the loop nacked an arm's plan (``detail`` = its reason, plus the
+        arms that did / did not move when it was not the first arm);
+        ``timeout`` - an arm ran past its budget, the motion was STOPPED through the
+        loop (``detail`` = the budget);
+        ``held`` - the loop's gate-held abort cancelled the plan (``detail`` = the
+        blocking pair and distance, ``GATE_HOLD_PREFIX`` stripped);
+        ``stalled`` - the command arrived but the measured arm did not settle at the
+        goal within the arm's deadline (``detail`` = how far off, after how long); the
+        remaining arms never start;
+        ``cancelled`` - operator input / a driver fault / teardown interrupted it
+        (``detail`` = ``loop.plan_cancel_reason``) and the arms hold where they are.
+
+        A profile that moves no arm but sets a gripper still submits ONE gripper-only
+        ``execute_plan`` (``waypoints={}``), so the targets are not dropped.
+        """
+        loop = session.loop
+        plans = loop.plans
+        submit = submit or (
+            lambda wps, grip: self._submit_execute_plan(wps, grip, interruptible=interruptible)
+        )
+        order = self._moving_arms(waypoints)
+        total = sum(len(w) for w in waypoints.values()) or 1
+        retired = sum(len(waypoints[a]) for a in waypoints if a not in order)  # parked arms
+        if not order:  # nothing moves: nothing to arrive at - only the gripper targets
+            if grippers:
+                ack = submit({}, grippers)
+                if not ack.ok:
+                    return "refused", ack.detail
+            if on_progress is not None:
+                on_progress(1.0)
+            return "done", ""
+        logger.info(
+            "%s: executing one arm at a time in planner order %s (parked: %s)",
+            tag,
+            [
+                f"{a} ({len(waypoints[a])} waypoints, max |dq| {self._span(waypoints[a]):.4f})"
+                for a in order
+            ],
+            [a for a in waypoints if a not in order] or "none",
+        )
+        for i, arm_id in enumerate(order):
+            wps = waypoints[arm_id]
+            last = i == len(order) - 1
+            if not running():  # the session left its motion state between two arms
+                return "cancelled", self._sequence_detail(
+                    f"session {session.state.value}", order, i
+                )
+            ack = submit({arm_id: wps}, grippers if last else {})
+            if not ack.ok:
+                # the first arm: nothing moved, the loop's words verbatim; a later arm:
+                # say which arm was refused and that the earlier ones DID move
+                detail = ack.detail if i == 0 else self._sequence_detail(ack.detail, order, i)
+                return "refused", detail
+            budget = float(budget_s(arm_id, wps))
+            deadline = time.monotonic() + budget
+            timed_out = False
+            while plans.active_arms:
+                if not running():
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                if on_progress is not None:
+                    left = len(plans._waypoints.get(arm_id, ())) - plans._index.get(arm_id, 0)
+                    on_progress(min(1.0, (retired + len(wps) - max(0, left)) / total))
+                time.sleep(0.02)
+            if plans.active_arms:
+                # deadline / a fault / teardown: STOP the motion through the loop first
+                why = timeout_reason if timed_out else f"session {session.state.value}"
+                self._cancel_plan_via_loop(f"{tag}: {why}")
+            if timed_out:
+                return "timeout", self._sequence_detail(f"budget {budget:.1f} s", order, i)
+            reason = loop.plan_cancel_reason
+            if reason:
+                if reason.startswith(GATE_HOLD_PREFIX):
+                    pair = reason[len(GATE_HOLD_PREFIX) :].lstrip(": ")
+                    return "held", self._sequence_detail(pair, order, i)
+                return "cancelled", self._sequence_detail(reason, order, i)
+            # The command is at the goal; now the ARM has to be (2026-09-08 review): the
+            # next arm's path was validated against this arm AT its goal, and the gate
+            # checks commanded postures, so a carriage still travelling would be invisible
+            # to it. The wait shares the arm's budget, with at least the grace.
+            status, detail = self._await_arrival(
+                session,
+                arm_id,
+                wps[-1],
+                running=running,
+                deadline=max(deadline, time.monotonic() + PLAN_ARRIVAL_GRACE_S),
+            )
+            if status != "done":
+                logger.warning("%s: %s %s - %s", tag, arm_label(arm_id), status, detail)
+                return status, self._sequence_detail(detail, order, i)
+            retired += len(wps)
+            if on_progress is not None:
+                on_progress(min(1.0, retired / total))
+        return "done", ""
+
+    def _run_return_plan(
+        self, session: ActiveSession, waypoints: dict, grippers: dict, *, interruptible: bool
+    ) -> tuple[str, str]:
+        """Execute ONE planned return phase - one arm at a time in the planner's order
+        (:meth:`_execute_arms`) - and wait for it; the per-arm budget is
+        :meth:`_return_budget_s` of that arm's waypoints. Returns ``(status, detail)``
+        as :meth:`_execute_arms` does (``done`` / ``refused`` / ``timeout`` / ``held``
+        / ``stalled`` / ``cancelled``); the wait ends when the session leaves RUNNING."""
+        return self._execute_arms(
+            session,
+            waypoints,
+            grippers,
+            interruptible=interruptible,
+            running=lambda: session.state is SessionState.RUNNING,
+            budget_s=lambda arm_id, wps: self._return_budget_s(session, {arm_id: wps}),
+            tag="return-to-start",
+            timeout_reason="return timed out",
+        )
+
+    def _return_home_worker(
+        self, session: ActiveSession, profile, outcome: str, token: _ProfileMotion | None = None
+    ) -> None:
+        """The ``start_from`` machinery, per episode: ``twin.plan`` from the MEASURED
+        posture to the profile, executed as an INTERRUPTIBLE ``execute_plan`` at the
+        session's speed scale. Any operator input cancels it (the loop reports the
+        reason: movement key / clutch / jog / arm switch) and the arm holds where it
+        is; a planning failure produces no motion. ``EpisodeStatus.detail`` carries
+        the outcome until the next ``episode_new``. ONE phase (joints and carriage
+        together) — the two-phase split is the exit / reset path
+        (:meth:`_return_to_initial_motion`), not the per-episode one. Both arms are
+        executed one after the other in the planner's ``arm_order`` (module
+        docstring)."""
+        import numpy as np
+
+        rt = session.recorder_thread
+        try:
+            states, q_start, _q_joint, q_goal, grippers = self._return_goals(
+                session, profile, session.spec.arms
+            )
+            if not q_goal:
+                rt.set_returning(
+                    False, f"return skipped: profile '{profile.name}' covers no session arm"
+                )
+                return
+            if all(np.allclose(q_start[a], q_goal[a], atol=1e-3) for a in q_goal):
+                rt.set_returning(False, "")  # already at the return profile
+                return
+            result = self._plan_return(session, states, q_start, q_goal)
+            if not result.ok:
+                failure = self._plan_failure_text(result)
+                logger.warning("return-to-start plan failed: %s", failure)
+                rt.set_returning(False, f"return failed: {failure} - arm holds")
+                return
+            if session.state is not SessionState.RUNNING:
+                rt.set_returning(False, f"return skipped: session {session.state.value}")
+                return
+            status, detail = self._run_return_plan(
+                session, self._ordered_waypoints(result), grippers, interruptible=True
+            )
+            if status == "refused":
+                rt.set_returning(False, f"return refused: {detail}")
+            elif status == "timeout":
+                rt.set_returning(False, "return timed out - held by the gate; arm stopped")
+                logger.warning("return-to-start after %s timed out (%s)", outcome, detail)
+            elif status == "held":  # the loop's gate-held abort (plan_gate_hold_s)
+                rt.set_returning(False, f"return stopped - {GATE_HOLD_PREFIX}: {detail}")
+                logger.warning("return-to-start after %s held by the gate: %s", outcome, detail)
+            elif status == "stalled":  # the command arrived, the measured arm did not
+                rt.set_returning(False, f"return stopped - {detail}")
+                logger.warning("return-to-start after %s stalled: %s", outcome, detail)
+            elif status == "cancelled":
+                rt.set_returning(False, f"return cancelled: {detail}")
+                logger.info("return-to-start after %s cancelled: %s", outcome, detail)
+            else:
+                rt.set_returning(False, "")
+                session.motion_detail = ""  # arrived at the return profile: notice resolved
+                logger.info(
+                    "return-to-start after %s complete (profile %r)", outcome, profile.name
+                )
+        except Exception as e:
+            logger.exception("return-to-start worker failed")
+            try:
+                rt.set_returning(False, f"return failed: {e!r}")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            self._release_profile_motion(token)
+
+    def _return_budget_s(self, session: ActiveSession, waypoints: dict) -> float:
+        """Executor-time estimate of the return (every joint incl. the rail slot at the
+        loop's slew) x 3 for gate holds, min 30 s — like ``rail_homing``'s
+        ``plan_duration_s``, never a flat 120 s."""
+        import numpy as np
+
+        cfg = session.loop.cfg.jog
+        rate = 1.0 / session.loop.dt if session.loop.dt > 0 else 100.0
+        longest = 0.0
+        for wps in waypoints.values():
+            qs = [np.asarray(list(w), dtype=np.float64) for w in wps]
+            ticks = 0.0
+            for a, b in zip(qs[:-1], qs[1:], strict=False):
+                dq = np.abs(b - a)
+                limit = np.full(dq.shape, float(cfg.slew_rad_per_tick))
+                if dq.shape[0] > 7:
+                    limit[7:] = float(cfg.rail_m_per_tick)
+                ticks += float(np.max(dq / limit)) if dq.size else 0.0
+            longest = max(longest, ticks / rate)
+        return max(30.0, 3.0 * longest + 10.0)
+
+    def _cancel_plan_via_loop(self, reason: str) -> None:
+        session = self.session
+        if session is None or not session.loop.plans.active_arms:
+            return
+        try:
+            self.bus.commands.submit(
+                Command(op="cancel_plan", args={"reason": reason}, source="internal")
+            ).result(timeout=1.0)
+        except Exception:  # noqa: BLE001 - the loop may already be stopping
+            logger.warning("cancel_plan (%s) did not complete within 1 s", reason)
+
+    # -- return to the initial condition: the `R` key and the Cockpit's exit ----------------
+    # 2026-09-08 (operator request). ONE motion, two entry points:
+    #   * `reset_to_initial` (key `R`) — fire-and-forget, the ack only says it started;
+    #   * POST /api/session/return_home — synchronous, the Cockpit runs it BEFORE it
+    #     tears the session down and shows a dialog when it does not arrive.
+    # Both walk to the workcell kind's designated initial-condition profile and both
+    # are no-ops (a reason, no motion) when no initial condition is designated. The
+    # motion is twin-planned, gated like every other command and INTERRUPTIBLE: any
+    # movement key / clutch / jog / arm switch cancels it and the arms hold.
+    def _initial_profile(self, kind: str) -> ReturnHomeResult | Any:
+        """This kind's designated initial-condition profile, or the terminal
+        ``ReturnHomeResult`` to report instead. A missing designation is a SUCCESS
+        (``skipped``): the operator has simply never set one, and both entry points
+        are specified to do nothing then."""
+        try:
+            profile = self.profile_store.initial_for(kind)  # type: ignore[arg-type]
+        except Exception as e:  # noqa: BLE001 - an unreadable store is a refusal, not a 500
+            return ReturnHomeResult(
+                ok=False, status="failed", detail=f"profile store unreadable: {e}"
+            )
+        if profile is None:
+            return ReturnHomeResult(
+                ok=True,
+                status="skipped",
+                detail=(
+                    f"no initial condition designated for the {kind} workcell - save a "
+                    "profile with 'use as initial condition' to enable this"
+                ),
+            )
+        return profile
+
+    def _reset_blockers(self, session: ActiveSession, profile) -> ReturnHomeResult | None:
+        """What forbids the motion once a session and a target profile exist; None =
+        go ahead. Shared by both entry points so they cannot refuse differently."""
+        result = ReturnHomeResult(
+            ok=False, status="refused", detail="", profile_id=profile.profile_id
+        )
+        if self.open_episode() is not None:
+            # ``open_episode_id`` is set while recording AND while saving (the store
+            # keeps the directory open until the writer is done): say which.
+            if self._recorder_state(session) == "saving":
+                return result.model_copy(
+                    update={"detail": "an episode is still saving - wait for it to finish"}
+                )
+            return result.model_copy(
+                update={"detail": "an episode is still recording - save or discard it first"}
+            )
+        if session.state is not SessionState.RUNNING:
+            return result.model_copy(
+                update={
+                    "status": "failed",
+                    "detail": f"the session is {session.state.value}, not running",
+                }
+            )
+        faulted = sorted(session.loop.faulted_arms)
+        recovering = sorted(session.loop.recovering_arms - session.loop.faulted_arms)
+        if faulted:
+            names = " / ".join(arm_label(a) for a in faulted)
+            return result.model_copy(
+                update={
+                    "status": "failed",
+                    "detail": f"{names} is faulted - clear the error and resume first",
+                }
+            )
+        if recovering:
+            # RECOVERING is lifted by releasing every live input, not by clearing errors
+            names = " / ".join(arm_label(a) for a in recovering)
+            return result.model_copy(
+                update={
+                    "status": "failed",
+                    "detail": f"{names} is recovering - release every input (clutch / keys) first",
+                }
+            )
+        if session.loop.plans.active_arms or self._profile_motion is not None:
+            return result.model_copy(update={"detail": MOTION_BUSY})
+        return None
+
+    @staticmethod
+    def _recorder_state(session: ActiveSession) -> str:
+        """``EpisodeStatus.state`` of the session's recorder ("idle" without one)."""
+        rt = session.recorder_thread
+        status = getattr(rt, "status", None)
+        if rt is None or not callable(status):
+            return "idle"
+        try:
+            return str(status().state)
+        except Exception:  # noqa: BLE001 - a recorder hiccup must not hide the refusal
+            return "idle"
+
+    def request_reset_to_initial(self, profile) -> tuple[bool, str]:
+        """``ControlLoop.on_reset_to_initial`` (LOOP THREAD): validate, then hand the
+        motion to a worker thread. Returns the ack ``(ok, detail)`` immediately — the
+        loop must never block on planning. ``profile`` is the initial-condition profile
+        the loop already resolved, so this does no disk I/O on the loop thread."""
+        return self._start_profile_motion(
+            profile, ack=f"returning to '{profile.name}'", label="reset_to_initial"
+        )
+
+    def request_goto_profile(self, profile) -> tuple[bool, str]:
+        """``ControlLoop.on_goto_profile`` (LOOP THREAD; ``ActionMsg goto_profile``,
+        2026-09-08): the reset-to-initial motion toward a CHOSEN saved profile instead
+        of the designated initial condition — the same two twin-planned, gated,
+        INTERRUPTIBLE phases (joints with the carriages held, then the carriages when
+        the profile stores a rail slot), the same blockers (an open episode, a faulted
+        / recovering arm, a plan already running). The loop resolved ``profile`` from
+        the store; a profile of another workcell kind is refused here as well."""
+        session = self.session
+        if session is not None and profile.workcell_kind != session.spec.kind:
+            return False, f"profile '{profile.name}' is for the {profile.workcell_kind} workcell"
+        return self._start_profile_motion(
+            profile, ack=f"going to profile '{profile.name}'", label="goto_profile"
+        )
+
+    def _start_profile_motion(self, profile, *, ack: str, label: str) -> tuple[bool, str]:
+        """Shared by the two fire-and-forget entry points: the blockers, then the
+        worker thread; ``ack`` is the success detail, ``label`` names the op in logs."""
+        session = self.session
+        if session is None:
+            return False, "no active session"
+        blocked = self._reset_blockers(session, profile)
+        if blocked is not None:
+            return blocked.ok, blocked.detail
+        token = self._claim_profile_motion(label)
+        if token is None:  # lost the race against another motion's claim
+            return False, MOTION_BUSY
+        session.motion_detail = ""  # this motion's outcome replaces the last notice
+        threading.Thread(
+            target=self._profile_motion_worker,
+            args=(session, profile, label, token),
+            name=label.replace("_", "-"),
+            daemon=True,
+        ).start()
+        return True, ack
+
+    def _profile_motion_worker(
+        self, session: ActiveSession, profile, label: str, token: _ProfileMotion
+    ) -> None:
+        try:
+            self._profile_motion_reported(session, profile, label)
+        finally:
+            self._release_profile_motion(token)
+
+    def _profile_motion_reported(
+        self, session: ActiveSession, profile, label: str
+    ) -> ReturnHomeResult:
+        """Run the two-phase motion and leave its outcome where the operator can see
+        it: ``session.motion_detail`` (telemetry ``session.fault_detail``, the Cockpit's
+        SESSION banner row) carries every outcome but an arrival - the fire-and-forget
+        entry points (`R`, Go to profile) ack "started" and would otherwise stay silent
+        when the twin cannot plan the path or the operator's own key cancels it."""
+        try:
+            result = self._return_to_initial_motion(session, profile, label=label)
+        except Exception as e:  # noqa: BLE001 - a worker bug must not kill the session
+            logger.exception("%s worker failed", label)
+            result = ReturnHomeResult(
+                ok=False, status="failed", detail=repr(e), profile_id=profile.profile_id
+            )
+        session.motion_detail = (
+            "" if result.status == "done" else f"{_motion_title(label, profile)}: {result.detail}"
+        )
+        log = logger.info if result.ok else logger.warning
+        log("%s: %s%s", label, result.status, f" - {result.detail}" if result.detail else "")
+        return result
+
+    def return_to_initial(self) -> ReturnHomeResult:
+        """``POST /api/session/return_home``: run the motion SYNCHRONOUSLY (the caller
+        is a REST request the Cockpit awaits before it tears the session down) and
+        report where the arms ended up. Never raises for an operational refusal — the
+        UI branches on ``ok`` and shows ``detail``."""
+        session = self.session
+        if session is None:
+            return ReturnHomeResult(ok=False, status="refused", detail="no active session")
+        profile = self._initial_profile(session.spec.kind)
+        if isinstance(profile, ReturnHomeResult):
+            return profile
+        blocked = self._reset_blockers(session, profile)
+        if blocked is not None:
+            return blocked
+        token = self._claim_profile_motion("return_home")
+        if token is None:
+            return ReturnHomeResult(
+                ok=False, status="refused", detail=MOTION_BUSY, profile_id=profile.profile_id
+            )
+        try:
+            session.motion_detail = ""
+            return self._profile_motion_reported(session, profile, "return_home")
+        finally:
+            self._release_profile_motion(token)
+
+    def _return_to_initial_motion(
+        self, session: ActiveSession, profile, *, label: str = "reset_to_initial"
+    ) -> ReturnHomeResult:
+        """Two twin-planned, gated phases (2026-09-08 operator decision):
+
+        1. the JOINTS to the profile's posture with each carriage held where it is;
+        2. the CARRIAGES to the profile's rail positions with the joints held.
+
+        A phase whose start already equals its goal is skipped. Phase 2 does not run
+        if phase 1 did not arrive, and it is skipped entirely for a profile that
+        stores no rail position (``rail_pos_m is None`` = keep the carriage), which is
+        how the seeded default postures are stored. The profile's gripper target rides
+        the LAST phase that runs and is applied on arrival only.
+
+        Within a phase the arms move ONE AT A TIME in the planner's ``arm_order``
+        (:meth:`_execute_arms`; 2026-09-08 evening - the first live run of this
+        motion executed both arms' sequentially planned paths simultaneously and the
+        gate held them at 5.2 mm).
+        """
+        import numpy as np
+
+        _states, q_start, q_joint, q_full, grippers = self._return_goals(
+            session, profile, session.spec.arms
+        )
+        arms = sorted(q_joint)
+        base = ReturnHomeResult(
+            ok=False, status="failed", detail="", arms=arms, profile_id=profile.profile_id
+        )
+        if not q_joint:
+            return base.model_copy(
+                update={
+                    "ok": True,
+                    "status": "skipped",
+                    "detail": f"profile '{profile.name}' covers no arm of this session",
+                }
+            )
+        joints_move = any(
+            not np.allclose(q_start[a][:7], q_joint[a][:7], atol=1e-3) for a in q_joint
+        )
+        rail_move = any(not np.allclose(q_joint[a], q_full[a], atol=1e-3) for a in q_full)
+        if not joints_move and not rail_move:
+            return base.model_copy(
+                update={
+                    "ok": True,
+                    "status": "skipped",
+                    "detail": (
+                        f"already at profile '{profile.name}'"
+                        if label == "goto_profile"
+                        else "already at the initial condition"
+                    ),
+                }
+            )
+        phases = []
+        if joints_move:
+            phases.append(("joints", q_joint))
+        if rail_move:
+            phases.append(("carriage", q_full))
+        for i, (label, goal) in enumerate(phases):
+            last = i == len(phases) - 1
+            status, detail = self._return_phase(
+                session, goal, grippers if last else {}, label=label
+            )
+            if status == "skipped":
+                continue
+            if status != "done":
+                return base.model_copy(
+                    update={
+                        # the wire's ``timeout`` = "stopped where they are, not at the goal";
+                        # the loop's gate-held abort (``held``) is that, just reported at
+                        # once, and so is an arm whose measured posture never settled at
+                        # the commanded goal (``stalled``)
+                        "status": "timeout" if status in ("held", "stalled") else status,
+                        "detail": self._return_phase_text(label, status, detail, len(phases) > 1),
+                    }
+                )
+        return base.model_copy(update={"ok": True, "status": "done", "detail": ""})
+
+    def _return_phase(
+        self, session: ActiveSession, goal: dict, grippers: dict, *, label: str
+    ) -> tuple[str, str]:
+        """Plan + run one phase from the arms' MEASURED posture to ``goal``.
+        ``("skipped", "")`` when they are already there."""
+        import numpy as np
+
+        states = session.workcell.states()
+        q_start = {a: [float(x) for x in states[a].q] for a in goal}
+        if all(np.allclose(q_start[a], goal[a], atol=1e-3) for a in goal):
+            return "skipped", ""
+        if session.state is not SessionState.RUNNING:
+            return "cancelled", f"session {session.state.value}"
+        result = self._plan_return(session, states, q_start, goal)
+        if not result.ok:
+            failure = self._plan_failure_text(result)
+            logger.warning("return-to-initial (%s) plan failed: %s", label, failure)
+            return "failed", failure
+        return self._run_return_plan(
+            session, self._ordered_waypoints(result), grippers, interruptible=True
+        )
+
+    @staticmethod
+    def _return_phase_text(label: str, status: str, detail: str, two_phase: bool) -> str:
+        """Operator-facing sentence for a phase that did not arrive. The wording is
+        what the Cockpit's dialog shows, so it names the phase only when there are
+        two of them (otherwise "the joints" is noise)."""
+        where = f" while moving the {label}" if two_phase else ""
+        if status == "failed":
+            return (
+                f"the digital twin could not plan a collision-free path{where}: {detail}. "
+                "The arms have not moved."
+            )
+        if status == "timeout":
+            return (
+                f"the motion was held by the safety gate{where} and stopped part-way "
+                f"({detail})."
+            )
+        if status == "held":  # the loop's gate-held abort (plan_gate_hold_s)
+            return (
+                f"the motion was held by the safety gate{where} and stopped ({detail}). "
+                "The arms hold where they are."
+            )
+        if status == "stalled":  # the command arrived, the measured arm did not settle
+            return (
+                f"an arm did not settle at its goal{where} ({detail}). "
+                "The arms hold where they are."
+            )
+        if status == "cancelled":
+            return f"the motion was cancelled{where}: {detail}. The arms hold where they are."
+        return f"the motion was refused{where}: {detail}."
 
     def _build_policy_stack(
         self,
@@ -1415,9 +2990,13 @@ class SessionManager:
         from ..recorder.kinematics import RecorderKinematics
 
         dcfg = self.cfg.dagger
+        frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
+        if spec.policy_source == "external":  # phase-12 (14-dora §6.1)
+            return self._build_external_policy_stack(
+                spec, session_cfg, workcell, scene, session_id, ik, kin, twin, supervisor, frames
+            )
         resolved = resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)
         info = resolved.info
-        frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
         if info.action_space != "delta_ee" or any(f != info.action_frame for f in frames.values()):
             raise SessionError("policy/dataset frame mismatch")
         from ..dagger.policies import MLPPolicy, resolve_device
@@ -1449,6 +3028,7 @@ class SessionManager:
             workcell_kind="sim",
             gripper_arms=_gripper_arms(scene, spec.arms),
             tracker=self._tracker_provider(),
+            plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
         )
         if spec.mode == "inference":
             loop = GatedPolicyExecutor(
@@ -1465,6 +3045,7 @@ class SessionManager:
                 version_label=resolved.policy_id,
                 recorder=None,
                 recorder_fps=self.cfg.recorder.fps,
+                on_gate_events=self._gate_events_hook(),
                 **common,
             )
             return loop, None, InferenceSession(loop, runner)
@@ -1548,10 +3129,178 @@ class SessionManager:
             trainer_client=client,
             recorder=recorder_thread,
             recorder_fps=self.cfg.recorder.fps,
+            on_gate_events=self._gate_events_hook(),
             **common,
         )
-        recorder_thread.on_episode_saved = loop.on_episode_saved
+        recorder_thread.on_episode_saved = self._episode_saved_hook(
+            loop.on_episode_saved, recorder_thread, run_id
+        )
         return loop, recorder_thread, DaggerSession(loop, runner, reloader, client)
+
+    def _episode_saved_hook(self, inner, recorder_thread, run_id: str):
+        """Chain the executor's boundary callback with the dora ``events.episode_saved``
+        publish (phase-12; 14-dora §4.2) - a no-op when the bridge is off."""
+        dora = self.dora
+        if dora is None or not dora.enabled:
+            return inner
+        root = str(getattr(getattr(recorder_thread, "recorder", None), "root", "") or "") or None
+
+        def hook(index: int, summary, spool_path: str) -> None:
+            if inner is not None:
+                inner(index, summary, spool_path)
+            try:
+                dora.publish_episode_saved(index, summary, spool_path, root, run_id)
+            except Exception:  # noqa: BLE001 - the bus never breaks a save
+                logger.exception("dora episode_saved publish failed")
+
+        return hook
+
+    def _build_external_policy_stack(
+        self, spec, session_cfg, workcell, scene, session_id, ik, kin, twin, supervisor, frames
+    ):
+        """``policy_source: external`` (phase-12; 14-dora §6.1): the policy node drives
+        through the dora bus. Requires the bridge ``attached`` and a fresh ``policy_spec``
+        (409 ``no external policy attached``, no waiting); frame / space checked like a
+        checkpoint (409 ``policy/dataset frame mismatch``); ``spec.action_names`` must
+        equal the session's action layout and ``state_names`` be a subset of its state
+        layout. No ``resolve_policy`` / ``MLPPolicy`` / ``PolicyReloaderImpl`` /
+        ``AsyncTrainerClientImpl``: DAgger keeps the recorder and publishes
+        ``events.episode_saved``; ``trainer_alive`` stays null. Every ``TakeoverGate``
+        event is published as ``events.gate`` (15-online-dagger §3).
+
+        Online DAgger (``spec.online_dagger``; phase-14): the rollouts are recorded into
+        ``online_dagger/<session_name>`` (resumed when ``online_dagger.resume``), the
+        ``OnlineDaggerCoordinator`` is handed to the executor and hooked to the recorder's
+        save / discard and to the gate, and ``trainer_alive`` follows the trainer's status
+        freshness."""
+        from ..dagger.gate import TakeoverGateImpl
+        from ..dagger.loop import (
+            DaggerSession,
+            GatedPolicyExecutor,
+            InferenceSession,
+        )
+        from ..dagger.policy_runner import ActionAnchor, SlewLimits
+        from ..dora_bridge.policy_source import ExternalPolicySource, spec_from_announce
+        from ..recorder.features import arm_action_names, arm_state_names
+
+        dora, hub, ann = self._external_hub_or_409()
+        pspec = spec_from_announce(ann)
+        if pspec.action_space != "delta_ee" or any(
+            f != pspec.action_frame for f in frames.values()
+        ):
+            raise SessionError("policy/dataset frame mismatch")
+        arms_meta = [(a, bool(scene.meta.rail[a])) for a in spec.arms]
+        action_names = [n for a, r in arms_meta for n in arm_action_names(a, r, "delta_ee")]
+        state_names = [n for a, r in arms_meta for n in arm_state_names(a, r)]
+        if list(pspec.action_names) != action_names:
+            raise SessionError(
+                f"external policy action_names {list(pspec.action_names)} != session layout "
+                f"{action_names}"
+            )
+        if not set(pspec.state_names) <= set(state_names):
+            raise SessionError(
+                "external policy state_names are not a subset of the session state layout: "
+                f"{sorted(set(pspec.state_names) - set(state_names))}"
+            )
+        dcfg = self.cfg.dagger
+        source = ExternalPolicySource(
+            hub,
+            dora.publisher,
+            session_id=session_id,
+            spec=pspec,
+            policy_id=ann.policy_id,
+            arms_meta=arms_meta,
+            rate_hz=float(ann.rate_hz) if ann.rate_hz else dcfg.policy_rate_hz,
+            chunk_dt_s=ann.chunk_dt_s,
+            cfg=self.cfg.dora.policy,
+        )
+        gate = TakeoverGateImpl(list(spec.arms), dcfg.t_blend_s)
+        anchor = ActionAnchor(
+            ik, kin, SlewLimits(window_s=dcfg.slew_window_s), action_space="delta_ee"
+        )
+        common = dict(
+            ik=ik,
+            kin=kin,
+            planner=twin,
+            profile_store=self.profile_store,
+            workcell_kind="sim",
+            gripper_arms=_gripper_arms(scene, spec.arms),
+            tracker=self._tracker_provider(),
+            plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
+        )
+        if spec.mode == "inference":
+            loop = GatedPolicyExecutor(
+                workcell,
+                self.cfg.control,
+                self.bus,
+                supervisor,
+                list(spec.arms),
+                gate=gate,
+                runner=source,
+                anchor=anchor,
+                arms_meta=arms_meta,
+                session_mode="inference",
+                recorder=None,
+                recorder_fps=self.cfg.recorder.fps,
+                on_gate_events=self._gate_events_hook(),
+                **common,
+            )
+            return loop, None, InferenceSession(loop, source)
+        run_id = session_id[:8]
+        dagger_ctx: dict = {"run_id": run_id, "gate": gate}
+        online_dagger = None
+        if spec.online_dagger is not None:
+            online_dagger = self._build_online_dagger(spec, session_id, run_id, ann, hub, dora)
+            dagger_ctx.update(
+                repo_id=online_dagger.repo_id, coordinator=online_dagger.coordinator
+            )
+        try:
+            recorder_thread = self._build_collect_recorder(
+                spec, session_cfg, workcell, scene, session_id, dagger_ctx=dagger_ctx
+            )
+            loop = GatedPolicyExecutor(
+                workcell,
+                self.cfg.control,
+                self.bus,
+                supervisor,
+                list(spec.arms),
+                gate=gate,
+                runner=source,
+                anchor=anchor,
+                arms_meta=arms_meta,
+                session_mode="dagger",
+                run_id=run_id,
+                reloader=None,
+                trainer_client=None,
+                recorder=recorder_thread,
+                recorder_fps=self.cfg.recorder.fps,
+                coordinator=online_dagger.coordinator if online_dagger is not None else None,
+                # gate events: the coordinator's serial worker, else the publisher's queue
+                on_gate_events=(
+                    online_dagger.coordinator.on_gate_events
+                    if online_dagger is not None
+                    else self._gate_events_hook()
+                ),
+                **common,
+            )
+            if online_dagger is not None:
+                recorder_thread.on_episode_saved = self._online_dagger_saved_hook(
+                    loop.on_episode_saved, online_dagger.coordinator
+                )
+                recorder_thread.on_episode_discarded = self._online_dagger_discard_hook(
+                    online_dagger.coordinator
+                )
+            else:
+                recorder_thread.on_episode_saved = self._episode_saved_hook(
+                    loop.on_episode_saved, recorder_thread, run_id
+                )
+            policy_session = DaggerSession(loop, source, None, None)
+        except BaseException:
+            if online_dagger is not None:
+                online_dagger.abandon()  # a fresh name stays usable after a 409 / 500
+            raise
+        policy_session.online_dagger = online_dagger  # picked up by _bringup_sim -> ActiveSession
+        return loop, recorder_thread, policy_session
 
     def _session_workcell_config(
         self, spec: SessionSpec, wc: WorkcellConfig, scene_id: str
@@ -1572,10 +3321,25 @@ class SessionManager:
                     session.state = SessionState.RUNNING  # keep_current: no motion
                     self._bringup = None  # hardware bring-up rows shown until running
                 return
-            if session.state is not SessionState.BRINGUP:
-                return  # faulted during bring-up: no start_from motion
-            session.state = SessionState.START_FROM
+            if session.state is SessionState.TEARDOWN:
+                return  # ended before the motion started
+            # 2026-09-08: an arm can be RECOVERING for a tick or two right after the
+            # driver enabled it (controller state 4, transient). Give such a fault
+            # ``start_from_fault_grace_s`` to clear BEFORE the plan is handed to the loop
+            # instead of letting the loop refuse it and dropping the plan for good. A
+            # fault that persists still refuses below (never move a faulted arm).
             session.start_from_progress = 0.0
+            grace_deadline = time.monotonic() + float(
+                self.cfg.hardware_session.start_from_fault_grace_s
+            )
+            self._await_arms_clear(session, grace_deadline)
+            if session.state is SessionState.TEARDOWN:
+                return
+            if session.state in (SessionState.BRINGUP, SessionState.RUNNING):
+                # RUNNING: the fault callback already walked RECOVERING -> RUNNING
+                session.state = SessionState.START_FROM
+            # else FAULT / RECOVERING persists: the loop refuses the plan below and the
+            # refusal is reported specifically instead of silently dropping the motion
             if session.planned_start is not None:
                 # hardware (phase-09d): planned on the gate twin inside bring-up
                 waypoints, grippers = session.planned_start
@@ -1603,14 +3367,22 @@ class SessionManager:
 
                 if session.supervisor.twin is None:  # plain sim: keep the plan twin fresh
                     session.twin.sync(states)
-                result = session.twin.plan(PlanRequest(q_start=q_start, q_goal=q_goal))
-                waypoints = result.waypoints
+                result = session.twin.plan(
+                    PlanRequest(
+                        q_start=q_start, q_goal=q_goal, speed_scale=session.spec.speed_scale
+                    )
+                )
+                waypoints = self._ordered_waypoints(result)  # executed in arm_order
             if result is not None and not result.ok:
                 logger.error("start_from plan failed: %s %s", result.failure, result.failing_pair)
-                session.fault_detail = f"start_from plan failed: {result.failure}"
+                session.motion_detail = (
+                    f"start_from plan failed: {self._plan_failure_text(result)} - the arms have "
+                    "not moved; Go to profile retries it"
+                )
                 if session.state is SessionState.START_FROM:
                     session.state = SessionState.RUNNING  # arms stay held; operator decides
                 session.start_from_progress = None
+                self._bringup = None  # the bring-up is over either way
                 self.bus.commands.submit(
                     Command(
                         op="_plan_ready",
@@ -1619,39 +3391,134 @@ class SessionManager:
                     )
                 )
                 return
-            total = sum(len(w) for w in waypoints.values()) or 1
-            self.bus.commands.submit(
-                Command(
-                    op="execute_plan",
-                    args={"waypoints": waypoints, "gripper": grippers},
-                    source="internal",
-                )
+
+            def submit(wps: dict, grip: dict):
+                ack = self._submit_execute_plan(wps, grip, interruptible=False)
+                if not ack.ok and self._await_arms_clear(session, grace_deadline):
+                    # refused, but the arms cleared within the remaining grace: ONE retry
+                    logger.info(
+                        "start_from refused (%s) - arms clear now, retrying once", ack.detail
+                    )
+                    ack = self._submit_execute_plan(wps, grip, interruptible=False)
+                return ack
+
+            def progress(frac: float) -> None:
+                session.start_from_progress = frac
+
+            # ONE ARM AT A TIME in the planner's order (2026-09-08 evening; module
+            # docstring): ``waypoints`` is keyed in ``PlanResult.arm_order`` by
+            # ``_ordered_waypoints`` / ``_plan_profile_start``. Once a plan is in the loop
+            # the wait follows the EXECUTOR, not ``session.state``: a transient driver
+            # fault mid-plan walks the session START_FROM -> FAULT -> RECOVERING ->
+            # RUNNING through the callback while the arm's waypoints keep executing;
+            # keyed on the state this used to exit at once, leaving
+            # ``start_from_progress`` None and the bring-up rows on screen for good.
+            # ``start_from_progress`` counts over ALL arms' waypoints.
+            status, detail = self._execute_arms(
+                session,
+                waypoints,
+                grippers,
+                interruptible=False,
+                running=lambda: session.state is not SessionState.TEARDOWN,
+                budget_s=lambda arm_id, wps: max(
+                    120.0, self._return_budget_s(session, {arm_id: wps})
+                ),
+                tag="start_from",
+                timeout_reason="timed out",
+                submit=submit,
+                on_progress=progress,
             )
-            plans = session.loop.plans
-            deadline = time.monotonic() + 120.0
-            while time.monotonic() < deadline and session.state == SessionState.START_FROM:
-                active = plans.active_arms
-                remaining = sum(
-                    len(plans._waypoints.get(a, ())) - plans._index.get(a, 0) for a in active
-                )
-                session.start_from_progress = 1.0 - remaining / total
-                if not active and session.loop.tick_count > 1:
-                    break
-                time.sleep(0.05)
+            if status == "refused":  # a faulted arm refuses the plan: say so, never a silent hold
+                detail = self._start_from_refusal(session, detail)
+                logger.warning("start_from refused by the loop: %s", detail)
+                session.motion_detail = detail  # survives the fault cycle (unlike fault_detail)
+            elif status != "done":
+                # a cancel / gate hold / timeout part-way: which arm, why, and that the
+                # remaining arms never started (``_sequence_detail``)
+                verb = {
+                    "held": GATE_HOLD_PREFIX,
+                    "timeout": "timed out",
+                    "stalled": "stalled (the arm did not settle at its goal)",
+                }.get(status, status)
+                session.motion_detail = f"start_from {verb}: {detail} (Go to profile retries it)"
+                logger.warning("start_from %s: %s", verb, detail)
             session.start_from_progress = None
             if session.state is SessionState.START_FROM:  # a driver fault may own it now
                 session.state = SessionState.RUNNING
-                self._bringup = None
+            self._bringup = None  # the motion is over either way: no more bring-up rows
         except Exception as e:
             logger.exception("start_from worker failed")
             session.fault_detail = repr(e)
             session.state = SessionState.FAULT
+            self._bringup = None
+
+    START_FROM_FAULT_POLL_S = 0.05
+
+    @staticmethod
+    def _stuck_arms(session: ActiveSession) -> list[str]:
+        """Session arms the loop would refuse a plan for: FAULTED or RECOVERING."""
+        loop = session.loop
+        return sorted(loop.faulted_arms | loop.recovering_arms)
+
+    def _await_arms_clear(self, session: ActiveSession, deadline: float) -> bool:
+        """Poll (``START_FROM_FAULT_POLL_S``) until no session arm is FAULTED / RECOVERING
+        in the loop AND the session itself has left FAULT / RECOVERING, or ``deadline``
+        (monotonic) passes, or a teardown starts. True = clear. Returns at once when
+        the arms are already clear or the deadline is in the past, so callers can bound
+        every wait by one grace budget."""
+        while True:
+            if session.state is SessionState.TEARDOWN:
+                return False
+            if not self._stuck_arms(session) and session.state not in (
+                SessionState.FAULT,
+                SessionState.RECOVERING,
+            ):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self.START_FROM_FAULT_POLL_S)
+
+    def _start_from_refusal(self, session: ActiveSession, ack_detail: str) -> str:
+        """Operator-facing ``fault_detail`` for a start_from plan the loop refused:
+        WHICH arm (user-facing name), its controller state and error code, and what to
+        do about it. Falls back to the loop's own words when no arm can be named."""
+        loop = session.loop
+        faulted = sorted(loop.faulted_arms)
+        # RECOVERING is lifted by releasing every live input (clutch / keys), not by
+        # clearing errors - a clutch held through bring-up must not be reported as a C0
+        recovering = sorted(loop.recovering_arms - loop.faulted_arms)
+        if not faulted and not recovering:  # cleared between the refusal and now
+            m = re.search(r"arm '([^']+)' is faulted", ack_detail)
+            faulted = [m.group(1)] if m else []  # the loop's nack names the arm
+        if not faulted and not recovering:
+            return f"start_from refused: {ack_detail}"
+        parts = []
+        if faulted:
+            try:
+                states = session.workcell.states()
+            except Exception:  # noqa: BLE001 - a dead driver must not hide the refusal
+                states = {}
+            names = ", ".join(arm_label(a) for a in faulted)
+            ctrl = " / ".join(str(getattr(states.get(a), "state", "?")) for a in faulted)
+            codes = " / ".join(f"C{getattr(states.get(a), 'error_code', '?')}" for a in faulted)
+            parts.append(
+                f"{names} faulted (controller state {ctrl}, code {codes}) - "
+                "use Clear errors & resume"
+            )
+        if recovering:
+            names = ", ".join(arm_label(a) for a in recovering)
+            parts.append(f"{names} is recovering - release every input (clutch / keys)")
+        return f"start_from refused: {'; '.join(parts)}, then Go to profile"
 
     # -- driver faults: FAULT -> RECOVERING -> RUNNING (phase-09b; 04-runtime §15) -----------
     def attach_fault_state(self, session: ActiveSession) -> None:
-        """Wire ``session.loop.on_fault_state`` to this session's state (also the
-        seam tests use to install a hand-built session)."""
+        """Wire the loop's SessionManager hooks — ``on_fault_state`` to this session's
+        state, ``on_reset_to_initial`` to the ``R``-key return and ``on_goto_profile``
+        to the "Go to profile" op (both 2026-09-08). Also the seam the tests use to
+        install a hand-built session."""
         session.loop.on_fault_state = lambda state, s=session: self._on_arm_fault_state(s, state)
+        session.loop.on_reset_to_initial = self.request_reset_to_initial
+        session.loop.on_goto_profile = self.request_goto_profile
 
     def _on_arm_fault_state(self, session: ActiveSession, state: str | None) -> None:
         """Control-loop callback (loop thread): the aggregate per-arm fault state
@@ -1793,14 +3660,59 @@ class SessionManager:
                 return
             session.state = SessionState.TEARDOWN
             hardware = session.spec.kind == "hardware"
+            # A return-to-start (or any plan) in flight: stop it through the loop so the
+            # arm HOLDS, instead of workcell.stop() cutting the stream mid-move.
+            self._cancel_plan_via_loop("session teardown")
             try:
                 if session.policy_session is not None:
                     session.policy_session.stop()  # trainer stop -> reloader -> runner
                 if session.recorder_thread is not None:
                     session.recorder_thread.stop()  # discard + finalize (§10.4)
                 session.loop.stop()
+                if session.online_dagger is not None:  # phase-14: last session.json, sink off
+                    try:
+                        session.online_dagger.close()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Online DAgger coordinator close failed")
+                if not hardware:  # phase-12: the parked pose survives into the sim preview
+                    try:
+                        # the LAST loop snapshot's joints (what the last in-session camera frames
+                        # were stamped with), falling back to the workcell's measured state
+                        got = self.bus.snapshot.get()
+                        snap = got[0] if got is not None and got[0].tick >= 0 else None
+                        states = snap.arms if snap is not None else session.workcell.states()
+                        self._parked_q = {a: np.array(st.q) for a, st in states.items()}
+                        self._parked_scene = (
+                            session.spec.sim_scene
+                            or (
+                                self.cfg.workcell_config("sim") or ArmConfig(id="x")  # type: ignore[union-attr]
+                            ).sim_scene
+                        )
+                        # the standby previews (warmed at session start) take the parked pose now;
+                        # wait for one fresh frame so the hand-over shows the parked arm, not the
+                        # keyframe (<= one preview period)
+                        if self._preview_service is None and self._pending_preview is None:
+                            self._pending_preview = self._prepare_sim_previews()
+                        self._repose_pending_preview()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("parked pose capture failed")
+                # phase-12: hand each camera stream straight over to its warmed preview twin
+                # (same stream id) so the dora publisher misses at most one frame period
+                warmed = self._pending_preview[2] if self._pending_preview else []
+                pending_cams = {c.camera_id: c for c in warmed}
                 for sid in session.streams:
+                    t_rm = time.monotonic()
                     self.hub.remove_stream(sid)
+                    cam = pending_cams.get(sid)
+                    if cam is not None and not self.hub.has(sid):
+                        self.hub.add_stream(sid, cam, self.cfg.video.preview_fps)
+                        self._preview_sources.append(cam)
+                        self._preview_ids.append(sid)
+                        logger.info(
+                            "teardown: stream %s handed to the warmed preview in %.0f ms",
+                            sid,
+                            (time.monotonic() - t_rm) * 1e3,
+                        )
                 for src in session.sources:
                     src.stop()
                 if session.render_service is not None:
@@ -1817,6 +3729,106 @@ class SessionManager:
             if hardware and self.hardware_monitor is not None:
                 self.hardware_monitor.resume()
         self.start_previews()
+        if self.dora is not None and self.dora.enabled:
+            self.dora.after_teardown()  # session announce -> idle; idle arm reader resumes
+
+    # -- phase-12: parked pose + session facts for the dora publisher (14-dora §4.2/§7) ----
+    def _depth_cameras(self) -> set[str]:
+        """Sim cameras rendered WITH a depth sibling: the dora ``publish.depth_cameras`` when
+        the bridge is enabled (03-sim §7 lifts "depth off in v1" for exactly these)."""
+        dora = self.dora
+        if dora is None or not dora.enabled:
+            return set()
+        return set(dora.depth_camera_ids)
+
+    def idle_sim_q(self) -> dict[str, np.ndarray]:
+        """Joint vectors (incl. rail) the sim preview shows between sessions: the last
+        session's final ``q`` when its scene equals the preview scene, else keyframe 0."""
+        wc = self.cfg.workcell_config("sim")
+        scene = self._preview_scene
+        if wc is None or scene is None:
+            return {}
+        if self._parked_q and self._parked_scene == wc.sim_scene:
+            return {a: np.array(q) for a, q in self._parked_q.items() if a in scene.meta.arm_ids}
+        out: dict[str, np.ndarray] = {}
+        key = scene.model.key_qpos[0] if scene.model.nkey > 0 else scene.model.qpos0
+        for arm_id in scene.meta.arm_ids:
+            out[arm_id] = np.array(key[scene.addressing[arm_id].qpos_adr], dtype=np.float64)
+        return out
+
+    def _preview_qpos(self, scene, scene_id: str | None) -> np.ndarray | None:
+        if not self._parked_q or self._parked_scene != scene_id:
+            return None
+        qpos = np.array(
+            scene.model.key_qpos[0] if scene.model.nkey > 0 else scene.model.qpos0,
+            dtype=np.float64,
+        )
+        for arm_id, q in self._parked_q.items():
+            if arm_id in scene.meta.arm_ids:
+                adr = scene.addressing[arm_id].qpos_adr
+                qpos[adr] = np.asarray(q, dtype=np.float64)[: len(adr)]
+        return qpos
+
+    def _session_facts(self, session: ActiveSession, wc: WorkcellConfig):
+        """``SessionFacts`` for the dora ``session`` announce + ``obs_state`` layout."""
+        from ..dora_bridge.publishers import SessionFacts
+        from ..recorder.features import arm_action_names, arm_state_names
+        from ..recorder.frames import RecordingFrameConverter
+
+        spec = session.spec
+        arms = list(spec.arms)
+        has_rail = {a: bool(session.workcell.arms[a].has_rail) for a in arms}
+        frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in arms}
+        scene_id = (
+            (spec.sim_scene or wc.sim_scene)
+            if spec.kind == "sim"
+            else (spec.digital_twin_scene or wc.digital_twin_scene)
+        )
+        if spec.kind == "sim":
+            cams = list(session.workcell.cameras)
+        else:
+            cams = [c.id for c in wc.cameras]
+        q_by_arm = {}
+        try:
+            q_by_arm = {a: np.asarray(st.q) for a, st in session.workcell.states().items()}
+        except Exception:  # noqa: BLE001
+            pass
+        announces = self.dora.camera_announces(cams, scene_id, q_by_arm) if self.dora else {}
+        loop = session.loop
+        runner = getattr(loop, "runner", None)
+        gate = getattr(loop, "gate", None)
+        recorder = session.recorder_thread
+        return SessionFacts(
+            session_id=session.session_id,
+            spec=spec,
+            kind=spec.kind,
+            scene_id=scene_id,
+            arm_ids=arms,
+            has_rail=has_rail,
+            frames=frames,
+            action_names=[n for a in arms for n in arm_action_names(a, has_rail[a], "delta_ee")],
+            state_names=[n for a in arms for n in arm_state_names(a, has_rail[a])],
+            camera_ids=cams,
+            cameras=announces,
+            policy_source=spec.policy_source,
+            dataset_root=(
+                str(getattr(getattr(recorder, "recorder", None), "root", "") or "") or None
+            ),
+            run_id=getattr(loop, "run_id", "") or None,
+            converter=RecordingFrameConverter(frames, {}),
+            engaged_arm=(lambda: gate.engaged_arm()) if gate is not None else (lambda: None),
+            gate_events=lambda: list(session.supervisor.events),
+            policy_version=(
+                (lambda: int(runner.current_version()))
+                if runner is not None and hasattr(runner, "current_version")
+                else (lambda: None)
+            ),
+            online_dagger=(
+                session.online_dagger.coordinator.announce()
+                if session.online_dagger is not None
+                else None
+            ),
+        )
 
     # -- pre-session camera previews (~15 fps, 04-runtime §13.4) --------------------
     def start_previews(self) -> None:
@@ -1831,19 +3843,67 @@ class SessionManager:
     def _start_sim_previews(self) -> None:
         if self._preview_service is not None:
             return
+        pending = self._pending_preview or self._prepare_sim_previews()
+        self._pending_preview = None
+        if pending is None:
+            return
+        rs, scene, cams = pending
+        fps = self.cfg.video.preview_fps
+        for cam in cams:  # already rendering: the encoders pick a fresh frame within a period
+            if cam.camera_id in self._preview_ids:
+                continue  # handed over during teardown already
+            self.hub.add_stream(cam.camera_id, cam, fps)
+            self._preview_sources.append(cam)
+            self._preview_ids.append(cam.camera_id)
+        self._preview_scene = scene
+        self._preview_service = rs
+
+    def _repose_pending_preview(self, wait_s: float = 0.15) -> None:
+        pending = self._pending_preview
+        wc = self.cfg.workcell_config("sim")
+        if pending is None or wc is None:
+            return
+        rs, scene, cams = pending
+        qpos = self._preview_qpos(scene, wc.sim_scene)
+        if qpos is None:
+            return
+        before = {c.camera_id: (c.latest().seq if c.latest() is not None else -1) for c in cams}
+        rs.submit_state("preview", qpos, 0.0)
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:  # every camera rendered the parked pose once
+            fresh = all(
+                (c.latest() is not None and c.latest().seq > before[c.camera_id]) for c in cams
+            )
+            if fresh:
+                break
+            time.sleep(0.005)
+
+    def _prepare_sim_previews(self):
+        """Build + START the sim preview render service and its cameras WITHOUT publishing
+        them on the hub -> ``(render_service, scene, cameras)`` or ``None``. ``teardown()``
+        calls this while the session streams still run so the previews are warm (renderer,
+        MjData, first frames) when the session cameras leave the hub — the fixed-viewpoint
+        consumer sees no gap beyond one frame period (phase-12; 14-dora §7)."""
         wc = self.cfg.workcell_config("sim")
         if wc is None or not wc.sim_scene:
-            return
+            return None
         try:
             from apollo_mavis_v2_sim import REGISTRY, RenderService, SimCamera
         except ImportError:
-            return
+            return None
         rs = RenderService()
         rs.start()
-        scene = REGISTRY.build(wc.sim_scene, _microphone_overrides(wc, wc.sim_scene))
+        scene = self._preview_scene_cache.get(wc.sim_scene)
+        if scene is None:  # a MuJoCo compile (~0.3-0.5 s): built once per process
+            scene = REGISTRY.build(wc.sim_scene, _microphone_overrides(wc, wc.sim_scene))
+            self._preview_scene_cache[wc.sim_scene] = scene
         rs.register_source("preview", scene.model)
-        self._preview_scene = scene
+        qpos = self._preview_qpos(scene, wc.sim_scene)
+        if qpos is not None:
+            rs.submit_state("preview", qpos, 0.0)  # phase-12: parked pose, not the keyframe
         fps = self.cfg.video.preview_fps
+        depth = self._depth_cameras()
+        cams = []
         for name in scene.meta.cameras:
             cam = SimCamera(
                 camera_id=name,
@@ -1851,12 +3911,11 @@ class SessionManager:
                 mjcf_camera=name,
                 fps=fps,
                 source="preview",
+                depth=name in depth,  # phase-12: cam_<id>_depth for the dora depth list
             )
             cam.start()
-            self.hub.add_stream(name, cam, fps)
-            self._preview_sources.append(cam)
-            self._preview_ids.append(name)
-        self._preview_service = rs
+            cams.append(cam)
+        return rs, scene, cams
 
     def stop_previews(self) -> None:
         """Stop the SIM preview sources only; hardware camera previews are kept
@@ -2097,7 +4156,11 @@ class SessionManager:
         scene = None
         connected = False
         states = {}
-        if self.session is not None:
+        # Only a SIM session owns a scene. `HardwareWorkcell` has no `.scene` at all, so
+        # an explicit `?kind=sim` while a hardware session runs (the Welcome page polls it)
+        # used to 500 here; fall back to the preview scene and report connected=False,
+        # which is the truth — no sim session owns those arms (fixed 2026-09-07).
+        if self.session is not None and self.session.spec.kind == "sim":
             scene = self.session.workcell.scene
             connected = True
             states = self.session.workcell.states()

@@ -2,8 +2,10 @@
 
 Labels follow HG-DAgger Eq. 2: only ``control_mode == 1`` (human) frames;
 ``takeover_transition`` frames are excluded. Data arrives via the recorder's
-``trainer_spool/ep_*.parquet`` copies (the live LeRobot shard has no footer);
-the trainer never touches the writer API.
+``trainer_spool/ep_<episode_id>.parquet`` copies — the trainer reads ONLY the
+spool, never a video or a ``LeRobotDataset`` (12-dagger §7). The watermark
+stays the capture-order ``episode_index``; the ``episode_id`` of every episode
+is kept alongside (``LabelIndex.episode_ids``).
 """
 
 from __future__ import annotations
@@ -43,7 +45,8 @@ class LabelIndex:
 
     states: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), np.float32))
     actions: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), np.float32))
-    episodes: list[int] = field(default_factory=list)
+    episodes: list[int] = field(default_factory=list)  # capture-order watermark
+    episode_ids: list[str] = field(default_factory=list)  # 10-frames §11.3 ids, same order
     new_since_checkpoint: int = 0  # trailing rows added since the last checkpoint
 
     def add_seed(self, states: np.ndarray, actions: np.ndarray) -> int:
@@ -51,13 +54,16 @@ class LabelIndex:
         self._append(states, actions)
         return int(states.shape[0])
 
-    def add_episode(self, episode_index: int, data: dict[str, np.ndarray]) -> int:
+    def add_episode(
+        self, episode_index: int, data: dict[str, np.ndarray], episode_id: str = ""
+    ) -> int:
         mask = label_mask(data["control_mode"])
         n = int(np.count_nonzero(mask))
         if n:
             self._append(data["state"][mask], data["action"][mask])
             self.new_since_checkpoint += n
         self.episodes.append(int(episode_index))
+        self.episode_ids.append(str(episode_id))
         return n
 
     def _append(self, states: np.ndarray, actions: np.ndarray) -> None:
@@ -80,7 +86,8 @@ class LabelIndex:
 def build_label_index(spool_paths: list[str | Path]) -> LabelIndex:
     idx = LabelIndex()
     for i, p in enumerate(sorted(str(x) for x in spool_paths)):
-        idx.add_episode(i, read_spool(p))
+        name = Path(p).stem
+        idx.add_episode(i, read_spool(p), name[3:] if name.startswith("ep_") else name)
     return idx
 
 
@@ -106,5 +113,11 @@ class FiftyFiftySampler:
         return self.index.states[idx], self.index.actions[idx]
 
 
-__all__ = ["read_spool", "label_mask", "LabelIndex", "build_label_index",
-           "FiftyFiftySampler", "MODE_HUMAN"]
+__all__ = [
+    "read_spool",
+    "label_mask",
+    "LabelIndex",
+    "build_label_index",
+    "FiftyFiftySampler",
+    "MODE_HUMAN",
+]

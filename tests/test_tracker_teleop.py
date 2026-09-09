@@ -79,7 +79,16 @@ class Rig:
         # The tracker target rate limit (04-runtime §6) is OFF by default so
         # the anchor/delta tests stay exact per tick; rate-limit tests opt in.
         unlimited = TargetRateConfig(v_mps=1e9, w_radps=1e9)
-        self.cfg = ControlConfig(target_rate=TargetRateConfig() if rate_limit else unlimited)
+        # translate_frame "base": these rigs' fake kinematics put the TCP straight in
+        # q[:3] with an identity orientation, so the pre-2026-09-08 base frame is what
+        # makes "one KeyW tick == +0.0012 m in x" exact. The runtime DEFAULT is
+        # "world" (W = world -y, operator-fixed; 2026-09-08 evening, superseding that
+        # morning's "camera") and is covered by test_teleop_math.py /
+        # test_camera_frame.py; nothing here is about the frame.
+        self.cfg = ControlConfig(
+            target_rate=TargetRateConfig() if rate_limit else unlimited,
+            translate_frame="base",
+        )
         self.cell = FakeWorkcell(
             {"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")}
         )
@@ -339,16 +348,22 @@ def test_watchdog_scale_shrinks_step_toward_target():
     rig.sample([0.0, 0.0, 0.0])
     rig.hold(CLUTCH)
     rig.tick(2)
-    t_last_rx = rig.t  # last heartbeat
-    rig.t = t_last_rx + 0.25  # deadman 0.2 s + half the 0.1 s ramp -> scale 0.5
+    # the browser goes silent while the loop keeps ticking (no heartbeat, 100 Hz):
+    # a single 0.25 s time jump would be a PROCESS stall to the loop (2026-09-07:
+    # a stall credits the deadman instead of tripping it)
+    rig.tick(24, heartbeat=False)
+    rig.t += DT  # deadman 0.2 s + half the 0.1 s ramp -> scale 0.5
     rig.sample([0.01, 0.0, 0.0])
     rig.loop.run_tick(rig.t)
     assert rig.loop.supervisor.watchdog.scale(rig.t) == pytest.approx(0.5)
     assert rig.cmd()[0] == pytest.approx(0.005)
-    rig.t = t_last_rx + 0.35  # ramp finished: latched at zero -> hold
+    rig.tick(9, heartbeat=False)  # the ramp runs out under a still hand: the arm keeps
+    reached = rig.cmd()[0]  # closing on 0.01 with a shrinking scale, never past it
+    assert 0.005 < reached < 0.01
+    rig.t += DT  # 0.35 s: ramp finished, latched at zero -> hold
     rig.sample([0.02, 0.0, 0.0])
     rig.loop.run_tick(rig.t)
-    assert rig.cmd()[0] == pytest.approx(0.005)
+    assert rig.cmd()[0] == pytest.approx(reached)  # a further hand move: no motion
 
 
 # -- keyboard interplay -----------------------------------------------------------------------

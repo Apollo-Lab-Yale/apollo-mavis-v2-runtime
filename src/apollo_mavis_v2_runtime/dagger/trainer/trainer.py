@@ -40,8 +40,7 @@ class BCFineTuner:
         self.net = net.to(device).train()
         self.cfg = cfg
         self.device = device
-        self.opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr,
-                                     weight_decay=cfg.weight_decay)
+        self.opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     def burst(self, sampler: FiftyFiftySampler, k_steps: int) -> BurstStats:
         losses: list[float] = []
@@ -108,8 +107,9 @@ class TrainerMain:
 
     # -- run loop --------------------------------------------------------------------
     def run(self) -> int:
-        logger.info("trainer up: device=%s port=%d run=%s",
-                    self.device, self.cfg.port, self.cfg.run_id)
+        logger.info(
+            "trainer up: device=%s port=%d run=%s", self.device, self.cfg.port, self.cfg.run_id
+        )
         try:
             while not self._stop:
                 req = self.control.poll(timeout_ms=100)
@@ -134,8 +134,12 @@ class TrainerMain:
             path = req.get("episode_path", "")
             try:
                 data = read_spool(path)
+                summary = req.get("summary", {})
                 n = self.index.add_episode(
-                    int(req.get("summary", {}).get("episode_index", -1)), data)
+                    int(summary.get("episode_index", -1)),
+                    data,
+                    str(summary.get("episode_id", "")),
+                )
             except Exception as e:
                 logger.exception("submit_episode failed")
                 return {"ok": False, "detail": repr(e)}
@@ -207,14 +211,22 @@ class TrainerMain:
         self.version += 1
         d = self.store.version_dir(self.version)
         d.mkdir(parents=True, exist_ok=True)
-        save_policy_bundle(str(d / STATE_DICT), self.net, {
-            "action_space": self.cfg.action_space,
-            "action_frame": self.cfg.action_frame,
-        })
-        torch.save({"optimizer": self.tuner.opt.state_dict(),
-                    "steps_total": self.steps_total,
-                    "trained_on_frames": self.trained_on_frames},
-                   self.store.trainer_state_path(self.version))
+        save_policy_bundle(
+            str(d / STATE_DICT),
+            self.net,
+            {
+                "action_space": self.cfg.action_space,
+                "action_frame": self.cfg.action_frame,
+            },
+        )
+        torch.save(
+            {
+                "optimizer": self.tuner.opt.state_dict(),
+                "steps_total": self.steps_total,
+                "trained_on_frames": self.trained_on_frames,
+            },
+            self.store.trainer_state_path(self.version),
+        )
         info = CheckpointInfo(
             run_id=self.cfg.run_id,
             version=self.version,
@@ -236,8 +248,9 @@ class TrainerMain:
         self.index.mark_checkpoint()
         if sanity_ok:
             self.store.advance_latest(self.version)  # sanity_ok only (§7)
-        logger.info("checkpoint v%06d sanity_ok=%s loss=%.6f",
-                    self.version, sanity_ok, stats.mean_loss)
+        logger.info(
+            "checkpoint v%06d sanity_ok=%s loss=%.6f", self.version, sanity_ok, stats.mean_loss
+        )
 
     # -- rollback/resume ---------------------------------------------------------------
     def _load_weights_version(self, version: int) -> bool:
@@ -251,8 +264,9 @@ class TrainerMain:
 
     def _load_trainer_state(self, version: int) -> None:
         try:
-            payload = torch.load(self.store.trainer_state_path(version),
-                                 map_location=self.device, weights_only=False)
+            payload = torch.load(
+                self.store.trainer_state_path(version), map_location=self.device, weights_only=False
+            )
             self.tuner.opt.load_state_dict(payload["optimizer"])
             self.steps_total = int(payload.get("steps_total", 0))
             self.trained_on_frames = int(payload.get("trained_on_frames", 0))

@@ -15,7 +15,7 @@ import time
 import httpx
 import numpy as np
 import pytest
-from conftest import LiveServer, RuntimeConfig, VideoConfig
+from conftest import ControlConfig, DatasetsConfig, LiveServer, RuntimeConfig, VideoConfig
 from websockets.sync.client import connect as ws_connect
 
 SPEC = {
@@ -38,7 +38,14 @@ def _debug_config(tmp_path) -> RuntimeConfig:
     return RuntimeConfig(
         workcells={"sim": wc},
         profiles_dir=tmp_path / "profiles",
+        # no mapped dataset roots: the startup sweep must never touch the operator's ~/data
+        datasets=DatasetsConfig(default_namespace="apollo", namespaces={}),
         video=VideoConfig(preview_fps=15, session_fps=30),
+        # "KeyQ descends" is the whole replay: pin the pre-2026-09-08 base frame
+        # (the runtime default is "world" since 2026-09-08 evening; "camera", where
+        # the keys follow the tool, was that morning's). See the note in
+        # conftest.make_runtime_config.
+        control=ControlConfig(translate_frame="base"),
     )
 
 
@@ -65,7 +72,7 @@ def test_gate_blocks_before_contact_warn_then_blocked(server):
             end = time.monotonic() + 5.0
             while time.monotonic() < end:
                 seq += 1
-                # KeyQ = translate z-neg; arm0 base is identity -> descend.
+                # KeyQ = translate z-neg; base frame + arm0 base identity -> descend.
                 ctl.send(json.dumps(
                     {"t": "keys", "seq": seq, "ts": time.time(), "held": ["KeyQ"]}
                 ))

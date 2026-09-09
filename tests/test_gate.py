@@ -145,3 +145,41 @@ def test_null_gate_passthrough():
     dec = NullGate().filter(mk(0.4), mk(0.0))
     assert not dec.blocked and dec.report.severity == "ok"
     assert np.allclose(dec.q_out["arm0"], 0.4)
+
+
+def test_escape_continues_through_the_hysteresis_band():
+    """2026-09-09: step 6's "no NEW violating pair" uses the step-3 window. While blocked,
+    a pair the escape has opened into the band [δ, δ + hysteresis) is still the SAME
+    violation at q_meas, so an opening command keeps passing until the pair clears the
+    band; before the fix it read as new and the arm was held inside the band for good
+    (a twin plan at 10 / 50 % speed cannot jump the 2 mm band in one tick)."""
+    twin = FakeTwin()
+    g = SafetyGate(twin, SafetyConfig())  # unblock at 0.008 + 0.002
+    g.filter(mk(0.0), mk(0.0))
+    twin.violations = [(PAIR, 0.002)]
+    twin.dist_cmd[PAIR] = 0.0025
+    twin.dist_meas[PAIR] = 0.002
+    dec = g.filter(mk(0.1), mk(0.0))
+    assert dec.blocked and np.allclose(dec.q_out["arm0"], 0.1)  # T8 escape inside the shell
+    # measured now inside the band, the command opens further but stays inside it
+    twin.violations = []
+    twin.dist_meas[PAIR] = 0.0085
+    twin.dist_cmd[PAIR] = 0.0090
+    dec = g.filter(mk(0.2), mk(0.1))
+    assert dec.blocked and not dec.events
+    assert np.allclose(dec.q_out["arm0"], 0.2)  # passes: same pair, still opening
+    # ... a CLOSING command inside the band is still held ...
+    twin.dist_meas[PAIR] = 0.0090
+    twin.dist_cmd[PAIR] = 0.0088
+    dec = g.filter(mk(0.3), mk(0.2))
+    assert dec.blocked and np.allclose(dec.q_out["arm0"], 0.2)
+    # ... and clearing the band unblocks
+    twin.dist_cmd[PAIR] = 0.0101
+    dec = g.filter(mk(0.3), mk(0.2))
+    assert not dec.blocked and [e.kind for e in dec.events] == ["cleared"]
+    # a pair NOT violating at q_meas by the window (unblocked: δ only) stays "new"
+    twin.violations = [(PAIR, 0.005)]
+    twin.dist_cmd[PAIR] = 0.006
+    twin.dist_meas[PAIR] = 0.0095  # inside the band but the gate is not blocked
+    dec = g.filter(mk(0.4), mk(0.3))
+    assert dec.blocked and np.allclose(dec.q_out["arm0"], 0.3)  # held

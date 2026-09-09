@@ -73,14 +73,16 @@ def scan_policies(root: Path) -> list[PolicyInfo]:
     promoted = promoted_id(root)
     out: list[PolicyInfo] = []
     for policy_id, d, info, is_deploy in _iter_checkpoints(root):
-        out.append(PolicyInfo(
-            policy_id=policy_id,
-            path=str(d),
-            action_space=info.action_space,  # type: ignore[arg-type]
-            action_frame=info.action_frame,
-            policy_version=info.version,
-            promoted=is_deploy and policy_id == promoted,
-        ))
+        out.append(
+            PolicyInfo(
+                policy_id=policy_id,
+                path=str(d),
+                action_space=info.action_space,  # type: ignore[arg-type]
+                action_frame=info.action_frame,
+                policy_version=info.version,
+                promoted=is_deploy and policy_id == promoted,
+            )
+        )
     return out
 
 
@@ -122,5 +124,4 @@ def resolve_policy(root: Path, mode: str, policy: str | None) -> ResolvedPolicy:
     return ResolvedPolicy(pid, info, d / STATE_DICT)
 
 
-__all__ = ["scan_policies", "resolve_policy", "promoted_id", "ResolvedPolicy",
-           "PROMOTED_FILE"]
+__all__ = ["scan_policies", "resolve_policy", "promoted_id", "ResolvedPolicy", "PROMOTED_FILE"]
