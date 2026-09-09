@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     import numpy as np
 
     from .control.snapshot import StateSnapshot
+    from .devices.gello import GelloSample
     from .devices.microphone import MicFrame
     from .devices.tracker import TrackerSample
 
@@ -25,7 +26,8 @@ class RuntimeBus:
     senders), ``snapshot`` (control -> telemetry/recorder/twin-sync),
     ``policy_action`` (policy runner -> control, phase-08), ``tracker``
     (TrackerReader -> control/telemetry, 13-tracker §2), ``microphone``
-    (MicrophoneReader -> telemetry, phase-11) and ``encoded[stream_id]``
+    (MicrophoneReader -> telemetry, phase-11), ``gello`` (GelloReader -> the
+    gello loop / telemetry / REST, 16-gello §4) and ``encoded[stream_id]``
     (encoders -> WS/MJPEG).
     """
 
@@ -37,6 +39,7 @@ class RuntimeBus:
         self.policy_action: LatestSlot[Any] = LatestSlot()
         self.tracker: LatestSlot[TrackerSample] = LatestSlot()
         self.microphone: LatestSlot[MicFrame] = LatestSlot()
+        self.gello: LatestSlot[GelloSample] = LatestSlot()
         self.encoded: dict[str, LatestSlot[bytes]] = {}
 
     def arm_slot(self, arm_id: str) -> LatestSlot:

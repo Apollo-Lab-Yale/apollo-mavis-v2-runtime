@@ -80,6 +80,9 @@ DEFAULT_ACTIVE_ARM = "grip"
 # the explicit takeover / handback actions share one string; train_now its own.
 TAKEOVER_UNAVAILABLE = "takeover not available in teleop"
 NOT_ONLINE_DAGGER = "not an Online DAgger session"
+# phase-15 (16-gello §8.2; 2026-09-09 review): the GELLO Cockpit buttons outside a gello
+# session - the documented mode refusal, not the dispatcher's "unknown op"
+NOT_GELLO = "not a GELLO Manipulation session"
 
 
 def controller_error_title(code: int) -> str:
@@ -709,7 +712,7 @@ class ControlLoop:
         try:
             logger.info(
                 "loop: %d ticks/%.1fs (%.0f Hz, tick p50 %.1f ms p99 %.1f ms, +%d overruns) "
-                "active=%s src=%s held=%s%s%s gate=%s%s ik_slips=+%d ik_diverged=+%d "
+                "active=%s src=%s held=%s%s%s%s gate=%s%s ik_slips=+%d ik_diverged=+%d "
                 "dq_capped=+%d cmd-meas=%s%s%s",
                 ticks,
                 window,
@@ -721,6 +724,7 @@ class ControlLoop:
                 getattr(source, "value", source),
                 sorted(held) if held else "[]",
                 self._tracker_health(now, tslip - prev["tslip"]),
+                self._mode_health(now),
                 " watchdog=LATCHED" if self._watchdog_logged else "",
                 self._gate_health(),
                 f" faulted={sorted(self._faulted)}" if self._faulted else "",
@@ -772,6 +776,12 @@ class ControlLoop:
         if slips:
             out += f" leash_slips=+{slips} (+{self.tracker.slip_pos_total_m:.3f} m total)"
         return out
+
+    def _mode_health(self, now: float) -> str:
+        """Mode-loop segment of the health line, printed right after the tracker
+        segment (``""`` here; ``GelloLoop`` adds `` gello=<state> age=<ms> lag=<rad>``,
+        16-gello §6.4)."""
+        return ""
 
     def _gate_health(self) -> str:
         report = self.supervisor.merged_report()
@@ -1687,6 +1697,16 @@ class ControlLoop:
         GatedPolicyExecutor of an Online DAgger session only; every other session nacks."""
         return CommandResult(cmd.corr_id, False, NOT_ONLINE_DAGGER)
 
+    def _op_gello_pause(self, cmd: Command) -> CommandResult:
+        """``gello_pause`` (phase-15; 16-gello §8.2) is served by the ``GelloLoop`` of a
+        GELLO Manipulation session only; every other session nacks with the mode reason
+        (the ``train_now`` / ``NOT_ONLINE_DAGGER`` precedent)."""
+        return CommandResult(cmd.corr_id, False, NOT_GELLO)
+
+    def _op_gello_resume(self, cmd: Command) -> CommandResult:
+        """``gello_resume`` (phase-15; 16-gello §8.2): see :meth:`_op_gello_pause`."""
+        return CommandResult(cmd.corr_id, False, NOT_GELLO)
+
     def _episode_op(self, cmd: Command, op: str) -> CommandResult:
         """Episode ops validate/transition inline (fast); writer work runs on
         the RecorderThread. Invalid transitions ack ``ok=false`` (§10.4)."""
@@ -1992,6 +2012,7 @@ __all__ = [
     "GATE_HOLD_PREFIX",
     "GRIPPER_SEND_EVERY_N_TICKS",
     "HeldSources",
+    "NOT_GELLO",
     "NOT_ONLINE_DAGGER",
     "PLAN_STATUS_LINGER_TICKS",
     "STUDIO_WARNING_DEFAULT",

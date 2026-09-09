@@ -18,9 +18,14 @@ COMMANDS = {"command_joints", "command_rail", "command_gripper"}
 # RailHoldArm (phase-09d) is the second adapter: it pins the rail slot of the gated
 # command to the reported position (the rail-homing job never moves the carriage)
 # and forwards; command_rail is refused there, never forwarded.
+# tools/axis_purity_measure.py (2026-09-09) is an OFFLINE measurement script ("not collected
+# by pytest"): it drives the real ControlLoop over a servo-faithful SimWorkcell in lockstep
+# and hands the loop's gated output to the SIM arms itself (no ArmSender threads, no wall
+# clock) - never a driver. It is not a runtime command source.
 ALLOWED = {
     SRC / "control" / "arm_sender.py",
     SRC / "session" / "hardware.py",
+    SRC / "tools" / "axis_purity_measure.py",
 }
 ADAPTERS = {"RailFlipArm": 3, "RailHoldArm": 2}  # class -> command_* forwards inside it
 

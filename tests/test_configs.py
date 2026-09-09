@@ -13,6 +13,7 @@ from apollo_mavis_v2_runtime.config import (
     ControlConfig,
     DatasetNamespaceConfig,
     DatasetsConfig,
+    GelloConfig,
     RuntimeConfig,
     load_runtime_config,
 )
@@ -101,7 +102,8 @@ def test_shipped_paths_are_self_contained_under_the_workspace():
     cfg = load_runtime_config(CONFIGS / "mavis_v2.yaml")
     ws = CONFIGS.resolve().parents[1]  # <ws>/apollo-mavis-v2-runtime/configs -> <ws>
     for p in (cfg.profiles_dir, cfg.datasets_root, cfg.checkpoints_root,
-              cfg.calibration_dir, cfg.tracker.libsurvive_config_path):
+              cfg.calibration_dir, cfg.tracker.libsurvive_config_path,
+              cfg.gello.calibration_path):
         assert p.is_absolute() and str(p).startswith(str(ws / "var"))
 
 
@@ -179,3 +181,29 @@ def test_dataset_namespace_roots_expand_like_datasets_root(tmp_path, monkeypatch
     # an empty map + another default is the tests' pre-D4 layout (conftest pins it)
     plain = DatasetsConfig(default_namespace="apollo", namespaces={})
     assert plain.namespaces == {} and plain.default_namespace == "apollo"
+
+
+@pytest.mark.parametrize("name", ["mavis_v2.yaml", "sim.yaml"])
+def test_shipped_gello_block_pins_the_defaults(name):
+    """phase-15 (16-gello §9.1): both shipped configs state the GELLO block with backend
+    ``none`` (the lab render switches to ``dynamixel``), the hidden kitchen twin as the scene
+    the GELLO card launches, the Perception Arm's GELLO hold posture, and the engagement
+    numbers; the block equals the model defaults. ``twin_overlay.scene`` stays null (the
+    overlays follow the hardware workcell's digital_twin_scene until the lab render says
+    otherwise)."""
+    cfg = load_runtime_config(CONFIGS / name)
+    g = cfg.gello
+    assert g.backend == "none" and g.scene_id == "mavis_v2_kitchen"
+    assert g.view_posture_rad == [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029]
+    assert g.view_rail_m == 0.0
+    assert (g.port, g.usb_serial, g.baud) == ("/dev/ttyUSB0", None, None)
+    assert g.joint_ids == [1, 2, 3, 4, 5, 6, 7] and g.gripper_id == 8
+    assert g.joint_signs == [1] * 7 and g.joint_offsets_rad is None
+    assert (g.poll_hz, g.stale_s, g.max_jump_rad) == (100.0, 0.2, 0.5)
+    assert (g.engage_tol_rad, g.leash_rad, g.gripper_quantum, g.max_joint_vel_rad_s) == (
+        0.10, 0.80, 0.01, 0.6,
+    )
+    ws = CONFIGS.resolve().parents[1]
+    assert g.calibration_path == ws / "var" / "gello_calibration.json"
+    assert g == GelloConfig() == RuntimeConfig().gello  # the block IS the defaults
+    assert cfg.twin_overlay.scene is None

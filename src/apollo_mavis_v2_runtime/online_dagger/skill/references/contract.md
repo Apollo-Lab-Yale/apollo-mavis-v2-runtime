@@ -41,7 +41,26 @@ metadata), never your `trainer_status.policy_version` claim; a change shows as "
 
 Fields in order: `mavis_schema, epoch, session_id, state, spec, kind, arm_ids, has_rail,
 frames, action_space, action_names, state_names, camera_ids, cameras, policy_source,
-dataset_root, run_id, deprecated_keys, online_dagger`.
+dataset_root, run_id, deprecated_keys, online_dagger, external_arms`.
+
+`external_arms: list[str]` (appended last, phase-15 / 16-gello D5) names the arms the session
+accepts `policy_action` for. `[]` = every session arm (every Online DAgger / inference session
+- today's behaviour). A GELLO Manipulation session (`spec.mode == "gello"`) announces
+`["view"]`: only the Perception Arm may be driven from the bus, and `action_names` /
+`state_names` are then the view block alone (`view_ee.dx ... view_gripper.pos,
+view_rail.dpos`) while `arm_ids` still lists both arms (`obs_state` carries both). Derive
+your layout from the announce as usual and you are compatible with both, with ONE rule for the
+frame (2026-09-09): when `external_arms` is non-empty your `spec.action_frame` MUST be
+`frames[external_arms[0]]` - a gello session lists the Manipulation Arm FIRST in `arm_ids` /
+`frames`, so "the first announced arm's frame" is `arm_base:grip` and is refused (`viewpoint
+node action_frame 'arm_base:grip' != the session's view frame 'arm_base:view'`); with
+`external_arms` empty take the first arm's frame as before (every frame equals it in an
+Online DAgger session). `mavis-policy-node`'s `FakePolicy.on_session` /
+`validate_against_session` do this for you. The `obs_state` metadata `state_names` always
+names the FULL published vector (every session arm, both blocks in gello); the announced
+`state_names` is the layout you may DECLARE - select your dims by name from the obs
+metadata, never by position. A spec that publishes the two-arm layout in a gello session is
+ignored (the arm holds). A trainer ignores gello sessions (`spec.online_dagger` is null there).
 
 `state` is the runtime's session state (`idle`, `bringup`, `start_from`, `running`,
 `recovering`, `fault`, `teardown`); the trainer loop acts on **`running`**. `spec` is the
@@ -250,7 +269,7 @@ Collection) have no `actor` / `control_mode`: every frame is expert.
 | `POST /api/session` 409 | `no external policy attached (...)` | no `spec` heartbeat from your node within 3 s / bridge not attached |
 | 409 | `no Online DAgger trainer attached (the policy node does not report the online_dagger capability)` | node running without `--online-dagger` |
 | 409 | `policy/dataset frame mismatch` | `spec.action_names` / `action_frame` / `state_names` do not match the session |
-| 409 | `hardware sessions support teleop and data collection only` | Online DAgger is sim-only until the operator admits it on hardware |
+| 409 | `hardware sessions support teleop, data collection and GELLO Manipulation only` | Online DAgger is sim-only until the operator admits it on hardware (GELLO was admitted in phase-15) |
 | 409 | `Online DAgger session '<s>' already exists - resume it or pick another name` | `resume: false` on an existing name |
 | 409 | `Online DAgger session '<s>' not found` | `resume: true` on a name that has no directory |
 | 409 | `Online DAgger session '<s>': session.json is unreadable - fix or remove it` | a corrupt record is never overwritten |

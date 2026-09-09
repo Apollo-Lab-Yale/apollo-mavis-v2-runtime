@@ -86,9 +86,11 @@ def test_full_features_1arm(features_1arm=None):
 
 
 def test_action_source_labels_mirror_command_source():
-    """Five labels, verbatim core CommandSource values (10-frames §7.3)."""
+    """Six labels, verbatim core CommandSource values (10-frames §7.3); 5 = gello is
+    reserved (phase-15; 16-gello §12.2: GELLO records nothing in v1)."""
     assert ACTION_SOURCE_LABELS == {
         "0": "policy", "1": "teleop", "2": "joint_jog", "3": "takeover", "4": "planner",
+        "5": "gello",
     }
     assert set(ACTION_SOURCE_LABELS.values()) == {s.value for s in CommandSource}
 

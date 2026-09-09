@@ -28,10 +28,18 @@ class MaintenanceUnavailableError(RuntimeError_):
     HTTP 409."""
 
 
+class GelloUnavailableError(RuntimeError_):
+    """A session-less GELLO op (``POST /api/gello/calibrate``, phase-15) cannot run:
+    a session exists / is starting, the leader has no fresh valid sample, or the
+    Manipulation Arm's current joints are unknown for the requested kind; maps to
+    HTTP 409."""
+
+
 __all__ = [
     "RuntimeError_",
     "SafetyConfigError",
     "SessionError",
     "SessionNotFoundError",
     "MaintenanceUnavailableError",
+    "GelloUnavailableError",
 ]
