@@ -108,6 +108,25 @@ def twin() -> DigitalTwin:
     )
 
 
+# The shell the 2026-09-08/09 incidents happened at, before the cell's geom_inflation_m was
+# raised to 0.025 (2026-09-09 evening). GRIP_BAND_START / VIEW_SELF_PINCH are ABSOLUTE joint
+# vectors found by random search AT this value: their whole point is one pair 6.00 mm deep
+# (sub-delta) and another at 9.73 mm (inside [delta, delta + hysteresis)), which only holds
+# for delta = 0.008. The planner logic they pin is delta-independent, so the replay keeps the
+# historical shell; the live value is exercised by every test using the `twin` fixture.
+HISTORICAL_INFLATION_M = 0.008
+
+
+@pytest.fixture(scope="module")
+def twin_delta8() -> DigitalTwin:
+    cfg = cell_safety_config()
+    return DigitalTwin(
+        REGISTRY.build("mavis_v2"),
+        inflation_m=HISTORICAL_INFLATION_M,
+        hysteresis_m=cfg.hysteresis_m,
+    )
+
+
 def violating_pairs(twin, q_by_arm) -> dict[tuple[str, str], float]:
     ctx = np.array(twin._q_meas_full)
     for arm_id, q in q_by_arm.items():
@@ -185,10 +204,23 @@ def random_pinch(twin, rng: np.random.Generator, lo, hi, depth_m: float = PINCH_
 
 
 def start_and_goals(twin):
+    """A start pinched ``PINCH_DEPTH_M`` inside the shell, and a goal on the FAR side of
+    ``view_link3`` that is collision-free at the twin's CONFIGURED inflation.
+
+    The goal used to be the fixed ``free + 0.25 * (init - free)``, which was 13.6 cm clear
+    of ``PINCH_PAIR`` but only ~2 cm clear of the gripper's outer knuckles: raising
+    ``geom_inflation_m`` 0.008 -> 0.025 on 2026-09-09 put it inside the shell and the plan
+    failed ``goal_in_collision`` on ``grip_left_outer_knuckle / view_link3``. The fraction is
+    now searched instead of pinned, so the fixture follows the cell's gate value. ``init`` is
+    the seeded initial condition, clear by >= 7.5 cm over the whole rail square, so a
+    collision-free fraction always exists."""
     q_start = pinch_on_line(twin, GRIP_FREE, GRIP_INIT, PINCH_DEPTH_M)
     free, init = np.asarray(GRIP_FREE), np.asarray(GRIP_INIT)
-    q_goal = free + 0.25 * (init - free)  # the far side of view_link3, 13.6 cm clear
-    return q_start, q_goal
+    for frac in np.linspace(0.25, 1.0, 76):
+        q_goal = free + frac * (init - free)
+        if not violating_pairs(twin, {"grip": q_goal, "view": np.asarray(VIEW_INIT)}):
+            return q_start, q_goal
+    raise AssertionError(f"no collision-free goal on the line at inflation {twin.inflation_m}")
 
 
 class Replay:
@@ -338,7 +370,8 @@ def test_pinched_start_plan_passes_the_gate_for_both_arms(twin, speed_scale):
     replay = Replay(twin, SafetyGate(twin, cfg), {"grip": q_start, "view": np.asarray(VIEW_INIT)})
     first = replay.session_start()
     assert [e.kind for e in first] == ["blocked"]  # the cell sat blocked, as in the log
-    assert first[0].pairs == [tuple(sorted(PINCH_PAIR))]
+    # containment: a wider shell also catches the knuckles beside the finger
+    assert tuple(sorted(PINCH_PAIR)) in first[0].pairs
     replay.execute(res, hw_jog(speed_scale))
     assert_clean_replay(replay, res, cleared=1)
     for arm in res.arm_order:
@@ -374,7 +407,10 @@ def test_the_incident_shape_is_held_and_now_refused(twin):
     # executor walks half of it per tick and the held command reads 1.5 mm (the incident's
     # full-tick executor read 1.1 mm in the log: "grip_right_finger / view_link3 at 1.1 mm").
     arm, tick, pairs, dist = replay.holds[0]
-    assert (arm, tick) == ("grip", 2) and pairs == [tuple(sorted(PINCH_PAIR))]
+    # CONTAINMENT, not equality: at a wider inflation the same two links also collide
+    # through their neighbouring geoms (knuckles beside the finger), which is the shell
+    # being more conservative, not a different event.
+    assert (arm, tick) == ("grip", 2) and tuple(sorted(PINCH_PAIR)) in pairs
     assert 0.0 < dist < PINCH_DEPTH_M and dist == pytest.approx(0.0015, abs=0.0002)
     assert len(replay.holds) == 299  # held on every following tick: hold-last-safe forever
     assert np.allclose(replay.q_meas["grip"], q_start)  # never moved
@@ -426,7 +462,8 @@ def test_random_pinches_return_to_the_initial_condition_without_a_hold(twin):
     assert len(refused) <= 1, refused
 
 
-def test_band_pair_gate_history_is_escaped_at_ten_percent(twin):
+def test_band_pair_gate_history_is_escaped_at_ten_percent(twin_delta8):
+    twin = twin_delta8
     """Review item 5 (the author's open item): the gate keeps pairs inside its hysteresis
     band [δ, δ + 2 mm) in ``_block_pairs`` after a block and demands that they OPEN on every
     tick too. A two-pair teleop block followed by a partial retreat leaves P inside the shell
@@ -437,7 +474,9 @@ def test_band_pair_gate_history_is_escaped_at_ten_percent(twin):
     cfg = cell_safety_config()
     q_start = np.asarray(GRIP_BAND_START)
     viol = violating_pairs(twin, {"grip": q_start, "view": VIEW_INIT})
-    assert set(viol) == {BAND_PAIR_P} and 0.0 < viol[BAND_PAIR_P] < twin.inflation_m
+    # containment + every violating pair sub-delta (a wider shell adds neighbouring geoms)
+    assert BAND_PAIR_P in viol and 0.0 < viol[BAND_PAIR_P] < twin.inflation_m
+    assert all(0.0 < d < twin.inflation_m for d in viol.values())
     d_b = twin.pair_distance(BAND_PAIR_B, {"grip": q_start, "view": np.asarray(VIEW_INIT)})
     assert twin.inflation_m <= d_b < twin.inflation_m + cfg.hysteresis_m
     res = twin.plan(

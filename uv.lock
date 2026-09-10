@@ -330,6 +330,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=1.10" },
+    { name = "pupil-apriltags", specifier = ">=1.0.4.post11" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov" },
     { name = "ruff", specifier = ">=0.6" },

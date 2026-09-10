@@ -184,15 +184,29 @@ def cell_safety_config() -> SafetyConfig:
     return SafetyConfig(**doc["workcells"]["hardware"].get("safety", {}))
 
 
+# The shell this fuzz corpus was written for. The cell's own geom_inflation_m was raised
+# 0.008 -> 0.025 on 2026-09-09 evening (03-sim §4.5: the twin disagrees with the real cameras
+# by 15-30 mm, so an 8 mm shell was smaller than the geometry error). This file KEEPS 0.008
+# because its sampler's premise stops existing at 0.025: the "near" and "normal" classes
+# require a start with NO pair inside [0, delta + hysteresis), and with a 27 mm band almost
+# every random far configuration in this tight cell has one, so the rejection search exhausts
+# ("no near start found"). The planner / gate LOGIC it fuzzes is delta-independent; the LIVE
+# shell is exercised by tests/test_plan_passes_gate.py, which reads the config.
+FUZZ_INFLATION_M = 0.008
+
+
 def class_ranges(cfg: SafetyConfig) -> dict[str, tuple[float, float]]:
     """Target CROSS-ARM distance range per class (m), from the gate's own numbers."""
-    delta = cfg.geom_inflation_m
+    delta = FUZZ_INFLATION_M
     band = delta + cfg.hysteresis_m
+    # Expressed relative to the band so the corpus survives a change of FUZZ_INFLATION_M;
+    # at 0.008 these are the original literals exactly (band 0.010 -> near (0.010, 0.020),
+    # normal (0.020, 0.060)).
     return {
         "sub_delta": (0.001, delta),
         "band": (delta, band),
-        "near": (band, 0.020),
-        "normal": (0.020, 0.060),
+        "near": (band, 2.0 * band),
+        "normal": (2.0 * band, 2.0 * band + 0.040),
     }
 
 
@@ -251,7 +265,7 @@ def build_twin(mic: bool) -> DigitalTwin:
     ``configs/mavis_v2.yaml`` (``mic=True``) or the mic-less plain-sim scene."""
     cfg = cell_safety_config()
     scene = REGISTRY.build("mavis_v2", SceneOverrides(microphones={"view": bool(mic)}))
-    twin = DigitalTwin(scene, inflation_m=cfg.geom_inflation_m, hysteresis_m=cfg.hysteresis_m)
+    twin = DigitalTwin(scene, inflation_m=FUZZ_INFLATION_M, hysteresis_m=cfg.hysteresis_m)
     assert (MIC_LABEL in twin._geoms_of_label) == bool(mic)
     return twin
 

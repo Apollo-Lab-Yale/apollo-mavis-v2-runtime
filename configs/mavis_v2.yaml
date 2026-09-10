@@ -112,6 +112,21 @@ workcells:
         intrinsics: {fx: 606.36, fy: 606.38, cx: 311.90, cy: 249.45}
     safety:
       enabled: true               # hardware refuses to start without the safety gate
+      # Gate inflation RAISED 0.008 -> 0.025 m (operator decision 2026-09-09 evening, after a
+      # grazing collision). Rationale, measured the same evening (03-sim §4.5): the twin's
+      # silhouette and the real wrist images disagree by ~18 px on the near/mid structures, and
+      # two structures in ONE frame want shifts that differ by 14-16 px, i.e. 15-30 mm at their
+      # 0.6-1.0 m range. An 8 mm shell is SMALLER than that error, so the gate could report
+      # clearance while metal touched. 0.025 is the largest value already proven audit-clean for
+      # this cell's initial state at both mic states (03-sim §4.3) and is what home_rail already
+      # sweeps at (hardware_session.home_rail_inflation_m). Derived automatically: the IK
+      # min_distance becomes 0.027, the planner's fine/band copies follow, and the driver's
+      # max_cart_step_m 0.004 is now well under HALF the shell (the CLAUDE.md rule holds).
+      # This is a stop-gap for a geometry error, NOT a fix: re-measure the cell instead.
+      geom_inflation_m: 0.025
+      # Amber must stay ABOVE the block threshold or the warning band vanishes: 0.045 leaves a
+      # 20 mm amber band before the 0.025 shell blocks (default 0.025 == the new inflation).
+      warn_clearance_m: 0.045
 # Data + calibration live inside the workspace (${APOLLO_HOME} = ws root, resolved by
 # config.py: $APOLLO_HOME if the launcher/systemd export it, else inferred from this
 # file's location). A fresh clone runs with everything under <ws>/var and no ~/apollo.
