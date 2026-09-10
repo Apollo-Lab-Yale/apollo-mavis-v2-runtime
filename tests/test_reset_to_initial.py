@@ -357,3 +357,72 @@ def test_the_seeded_posture_is_collision_free_and_plannable_in_the_twin():
             )
         )
         assert result.ok, (mic, result.failure, result.failing_pair)
+
+
+def test_seeded_kitchen_interaction_profile(tmp_path):
+    """``profiles.seed_kitchen`` writes the posture the kitchen twin was measured at,
+    with BOTH carriages pinned, and does NOT touch the initial-condition designation
+    (that stays the operator's default posture)."""
+    import math
+
+    from apollo_mavis_v2_core import ProfileStore
+
+    from apollo_mavis_v2_runtime.profiles.seed_initial import seed as seed_initial
+    from apollo_mavis_v2_runtime.profiles.seed_kitchen import (
+        KITCHEN_POSTURE_RAD,
+        KITCHEN_RAIL_M,
+        PROFILE_NAME,
+        seed,
+    )
+
+    # The numbers are the kitchen scene's keyframe (03-sim §4.4): the Perception Arm's
+    # measurement posture, the Manipulation Arm at the cell's factory-zero initial state.
+    assert KITCHEN_POSTURE_RAD == {
+        "view": [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029],
+        "grip": [math.pi, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    assert KITCHEN_RAIL_M == {"view": 0.0, "grip": 0.65}
+
+    store = ProfileStore(tmp_path / "profiles")
+    for kind in ("hardware", "sim"):
+        initial = seed_initial(store, kind)  # the default posture owns the designation
+        profile = seed(store, kind)
+        assert profile.name == PROFILE_NAME and profile.workcell_kind == kind
+        assert not profile.is_initial_condition
+        assert store.initial_for(kind).profile_id == initial.profile_id  # type: ignore[union-attr]
+        assert set(profile.arms) == {"grip", "view"}
+        for arm_id, q in KITCHEN_POSTURE_RAD.items():
+            posture = profile.arms[arm_id]
+            assert posture.q == pytest.approx(q)
+            assert posture.rail_pos_m == pytest.approx(KITCHEN_RAIL_M[arm_id])
+            assert posture.gripper_open_frac == 1.0
+    # Re-running rewrites the same two files instead of accumulating.
+    before = {p.profile_id for p in store.list()}
+    for kind in ("hardware", "sim"):
+        seed(store, kind)
+    assert {p.profile_id for p in store.list()} == before
+    assert len([p for p in store.list() if p.name == PROFILE_NAME]) == 2
+
+
+def test_the_kitchen_interaction_posture_is_collision_free_in_both_twins():
+    """It must be reachable: the operator selects it with "Go to profile", which plans
+    and gates like any other posture. Checked on the KITCHEN twin (the appliances it was
+    built for) and on the bare cell, microphone off and on, at the cell's RAISED gate
+    shell geom_inflation_m = 0.025 (11-safety §6.2)."""
+    pytest.importorskip("mujoco")
+    sim = pytest.importorskip("apollo_mavis_v2_sim")
+    from apollo_mavis_v2_sim.scenes.descriptor import SceneOverrides
+
+    from apollo_mavis_v2_runtime.profiles.seed_kitchen import (
+        KITCHEN_POSTURE_RAD,
+        KITCHEN_RAIL_M,
+    )
+
+    for scene_id in ("mavis_v2_kitchen", "mavis_v2"):
+        for mic in (False, True):
+            scene = sim.REGISTRY.build(scene_id, SceneOverrides(microphones={"view": mic}))
+            twin = sim.DigitalTwin(scene, inflation_m=0.025)
+            report = twin.check(
+                {a: [*q, KITCHEN_RAIL_M[a]] for a, q in KITCHEN_POSTURE_RAD.items()}
+            )
+            assert not report.blocked, (scene_id, mic, report.pairs)
