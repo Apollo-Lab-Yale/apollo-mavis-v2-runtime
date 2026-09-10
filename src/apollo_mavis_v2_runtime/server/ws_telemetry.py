@@ -147,6 +147,11 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
     session = runtime.manager.session
     snap = got[0] if got is not None and session is not None else None
     now = time.monotonic()
+    # 2026-09-09: session identity (a hardware bring-up counts) + the orphaned-session
+    # watch's notice. `getattr` like the overlay / dora blocks above: a stub runtime in a
+    # unit test must still build a frame.
+    identity = runtime.manager.session_identity()
+    watch = getattr(runtime, "orphan_watch", None)
     arms: list[ArmTelemetry] = []
     faults: dict = {}
     if snap is not None:
@@ -191,6 +196,16 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
         inference=snap.session_extra.get("inference") if snap is not None else None,
         session=SessionTelemetry(
             state=runtime.manager.state.value,
+            # 2026-09-09 (04-runtime §13.2 / §13.3): the live session's identity, so the
+            # Welcome page — which never opens /ws/control and has no SessionInfo on a
+            # fresh load — can name the running session and link its Cockpit route
+            # instead of leaving the operator with four disabled launch cards; plus why
+            # the LAST session ended without an operator click (the orphaned-session
+            # watch), which survives until the next session starts.
+            session_id=identity[0],
+            mode=identity[1],
+            kind=identity[2],
+            auto_ended=(watch.notice if watch is not None else None),
             start_from_progress=session.start_from_progress if session else None,
             plan_status=(snap.session_extra.get("plan_status") if snap is not None else None),
             # in-process AsyncTrainer: not "dead"; Online DAgger (phase-14; 15-online-dagger

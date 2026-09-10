@@ -235,6 +235,10 @@ class ControlLoop:
         # this plan's waypoints: every target is deferred and applied when the plan is
         # done (``_finish_plan``), whichever arm carried it.
         self._plan_gripper_on_arrival: dict[str, float] = {}
+        # Episode playback (2026-09-10; 04-runtime §10.8): the recorded gripper opening
+        # per WAYPOINT, followed as the executor retires them. Empty for every other
+        # plan, whose gripper target is a single value applied on arrival.
+        self._playback_gripper: dict[str, list[float]] = {}
         # Arms whose executor returned the GOAL this tick (2026-09-08 review): the plan
         # is finished only once the gated output equals that goal (``_confirm_plan_
         # arrivals``, after the gate); a goal step the gate holds puts the arm back into
@@ -1460,8 +1464,15 @@ class ControlLoop:
         final step the gate held left ``_last_cmd`` one slew step short of the goal with
         ``plan_status done`` and ``plan_cancel_reason None``, the deferred gripper was
         applied on an arm that had not arrived and the gate-held watch never ran."""
+        track = self._playback_gripper.get(arm_id)
+        index = self.plans.index(arm_id) if track else None
         q_next = self.plans.step(arm_id, q_last)
         self._note_source(arm_id, CommandSource.PLANNER)
+        if track is not None and index is not None and index < len(track):
+            # Episode playback: the recorded opening belongs to the frame the arm is AT,
+            # so it is applied per waypoint rather than deferred to the arrival. Read
+            # BEFORE the step so waypoint k's opening goes out with waypoint k.
+            self._apply_gripper_target(arm_id, track[index])
         if q_next is not None and not self.plans.active(arm_id):  # the executor's goal
             self._plan_arriving[arm_id] = np.array(q_next, dtype=np.float64)
         return q_next
@@ -1541,6 +1552,7 @@ class ControlLoop:
                 for other, frac in list(self._plan_gripper_on_arrival.items()):
                     self._apply_gripper_target(other, frac)
                 self._plan_gripper_on_arrival.clear()
+                self._playback_gripper.clear()
                 self._set_plan_status("done", linger=True)
                 self._plan_interruptible = False
                 self._plan_gate_hold_since = None
@@ -1566,6 +1578,7 @@ class ControlLoop:
         self.plan_cancel_reason = reason
         self._plan_interruptible = False
         self._plan_gripper_on_arrival.clear()  # a cancelled return leaves the gripper alone
+        self._playback_gripper.clear()  # ... and a cancelled playback stops following the track
         self._plan_arriving.clear()
         self._plan_gate_hold_since = None
         logger.info("plan cancelled: %s", reason)
@@ -1809,6 +1822,60 @@ class ControlLoop:
             self._plan_state[arm_id] = "executing"
         self._set_plan_status("executing")
         return CommandResult(cmd.corr_id, True, "executing")
+
+    def _op_playback_path(self, cmd: Command) -> CommandResult:
+        """Internal: stream a RECORDED episode trajectory (2026-09-10; 04-runtime §10.8).
+
+        This is the one op that moves several arms AT ONCE, and the reason it may is
+        exactly the reason ``execute_plan`` may not. The 2026-09-08 incident was a
+        SEQUENTIALLY PLANNED motion executed simultaneously: each arm's RRT path had been
+        validated against the other arm standing still, so running them together walked
+        combinations nothing had ever checked and the gate held them at 5.2 mm. A playback
+        is the opposite case - the path is a trajectory the two arms already executed
+        together on the real cell, and the manager re-verifies EVERY posture of it, all
+        arms jointly, in the twin at the resolution it will be commanded, before a single
+        waypoint is sent (``SessionManager._verify_playback``). Splitting it one arm at a
+        time would be the unvalidated thing to do: arm A would walk its whole 37 s path
+        while arm B sat at frame 0, which is a different path through space.
+
+        The waypoint lists must be the same length for every arm - the manager resamples
+        them onto the loop tick so the executor retires exactly one per tick per arm and
+        they stay in lockstep (``recorder/playback.resample``). ``gripper_track`` is the
+        recorded opening per waypoint, followed in :meth:`_plan_step`. Always
+        interruptible: any operator input, driver fault or teardown cancels it, and the
+        arms hold where they are.
+        """
+        waypoints: dict[str, list[list[float]]] = cmd.args["waypoints"]
+        if not waypoints:
+            return CommandResult(cmd.corr_id, False, "playback has no waypoints")
+        lengths = {arm: len(wps) for arm, wps in waypoints.items()}
+        if len(set(lengths.values())) > 1:
+            # Different lengths would desynchronise the arms tick by tick, i.e. silently
+            # replay a path that was never recorded. Refuse rather than interpolate.
+            return CommandResult(
+                cmd.corr_id, False, f"playback waypoint counts differ per arm: {lengths}"
+            )
+        for arm_id in waypoints:
+            if arm_id not in self.session_arms:
+                return CommandResult(cmd.corr_id, False, f"unknown arm {arm_id!r}")
+            if arm_id in self._faulted or arm_id in self._recovering:
+                return CommandResult(cmd.corr_id, False, f"arm {arm_id!r} is faulted")
+        if self.plans.active_arms or "planning" in self._plan_state.values():
+            return CommandResult(cmd.corr_id, False, "plan executing")
+        self.plan_cancel_reason = None
+        self._plan_gate_hold_since = None
+        self._plan_interruptible = True
+        self._plan_gripper_on_arrival.clear()
+        self._playback_gripper.clear()
+        for arm_id, wps in waypoints.items():
+            self.plans.load(arm_id, wps)
+            self._plan_state[arm_id] = "executing"
+        for arm_id, track in (cmd.args.get("gripper_track") or {}).items():
+            if arm_id in self.gripper_arms and arm_id in waypoints:
+                self._playback_gripper[arm_id] = [float(v) for v in track]
+        self._set_plan_status("executing")
+        n = len(next(iter(waypoints.values())))
+        return CommandResult(cmd.corr_id, True, f"playback of {n} waypoints")
 
     def _op_execute_plan(self, cmd: Command) -> CommandResult:
         """Internal: SessionManager hands pre-planned waypoints (start_from §5.2; the

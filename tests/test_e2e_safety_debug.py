@@ -45,7 +45,10 @@ def _debug_config(tmp_path) -> RuntimeConfig:
         # (the runtime default is "world" since 2026-09-08 evening; "camera", where
         # the keys follow the tool, was that morning's). See the note in
         # conftest.make_runtime_config.
-        control=ControlConfig(translate_frame="base"),
+        # `orphan_session_grace_s=0`: this module opens and closes /ws/control several
+        # times around one module-scoped session, which the orphaned-session watch would
+        # read as abandoned (2026-09-09; session/orphan.py).
+        control=ControlConfig(translate_frame="base", orphan_session_grace_s=0.0),
     )
 
 

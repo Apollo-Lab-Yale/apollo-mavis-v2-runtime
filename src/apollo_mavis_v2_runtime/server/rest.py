@@ -14,6 +14,8 @@ from apollo_mavis_v2_core.protocol import (
     DatasetLayoutInfo,
     DoraInfo,
     EpisodeInfo,
+    EpisodePlaybackInfo,
+    EpisodePlaybackRequest,
     KeymapEntry,
     MicrophoneInfo,
     OnlineDaggerSessionInfo,
@@ -40,6 +42,7 @@ from ..errors import (
     SessionNotFoundError,
 )
 from ..recorder.datasets import DatasetError
+from ..recorder.playback import PlaybackError
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +166,30 @@ def list_episodes(
         return _runtime(request).manager.dataset_store.episodes(f"{ns}/{name}")
     except DatasetError as e:
         raise _dataset_error(e) from None
+
+
+@router.get("/datasets/{ns}/{name}/episodes/{episode_id}/playback")
+def episode_playback_info(
+    request: Request,
+    ns: str = Path(pattern=_NAME),
+    name: str = Path(pattern=_NAME),
+    episode_id: str = Path(pattern=_EPISODE_ID),
+) -> EpisodePlaybackInfo:
+    """What a playback of this episode would do (2026-09-10; 04-runtime §10.8, 05-ui §8.1
+    item 7): frame count, fps, duration and the per-arm INITIAL state, plus ``playable`` /
+    ``reason``.
+
+    Session-less by design — the Welcome page's Playback dialog opens and explains itself
+    before anything moves, so a refusal is a sentence in the dialog rather than a 409 the
+    operator has to interpret. 404 for an unknown dataset / episode; 409 for a legacy tree
+    or an unreadable ``frames.parquet``.
+    """
+    try:
+        return _runtime(request).manager.episode_playback_info(f"{ns}/{name}", episode_id)
+    except DatasetError as e:
+        raise _dataset_error(e) from None
+    except PlaybackError as e:
+        raise HTTPException(404 if e.not_found else 409, str(e)) from None
 
 
 @router.delete("/datasets/{ns}/{name}/episodes/{episode_id}", status_code=204)
@@ -304,6 +331,11 @@ def get_session(request: Request) -> SessionInfo:
 @router.post("/session")
 def post_session(request: Request, spec: SessionSpec) -> SessionInfo:
     rt = _runtime(request)
+    # Orphaned-session watch (2026-09-09; 04-runtime §13.2): a session that has just
+    # been created has not had time to open its /ws/control socket, and a hardware
+    # bring-up can take seconds before the Cockpit mounts. Stamp the countdown before
+    # the session exists so the grace period starts from the operator's click.
+    rt.orphan_watch.note_activity("POST /api/session")
     if rt.tracker_calibration.active:  # reader restarts / trigger clicks must not hit a session
         raise HTTPException(409, "tracker calibration in progress")
     # phase-09d: fail fast (before manager._lock, which a rail-homing job holds for up to
@@ -346,7 +378,55 @@ def post_session_return_home(request: Request) -> ReturnHomeResult:
     ``detail`` that the UI shows in a dialog. The ``reset_to_initial`` key (``R``) fires
     the SAME motion over /ws/control, fire-and-forget.
     """
-    return _runtime(request).manager.return_to_initial()
+    rt = _runtime(request)
+    # Orphaned-session watch (2026-09-09; 04-runtime §13.2): this motion is operator
+    # activity and its two gated phases can outlast a short grace period, so it stamps
+    # the countdown both before and after — the watch must never release the arms in
+    # the middle of walking them home.
+    rt.orphan_watch.note_activity("POST /api/session/return_home")
+    try:
+        return rt.manager.return_to_initial()
+    finally:
+        rt.orphan_watch.note_activity("return_home finished")
+
+
+@router.post("/session/playback")
+def post_session_playback(request: Request, body: EpisodePlaybackRequest) -> ReturnHomeResult:
+    """Episode playback motions (2026-09-10; operator request, 04-runtime §10.8).
+
+    ``goto_initial`` walks the arms to the episode's FIRST recorded frame and answers when
+    they are there — SYNCHRONOUS like ``return_home``, because the dialog only enables
+    **Playback** once this succeeded (replaying a trajectory from the wrong place is how an
+    arm gets driven into something). It is an ordinary twin-planned, gated, interruptible
+    profile motion: two separately planned phases (joints with the carriages held, then the
+    carriages), one arm at a time in the planner's ``arm_order``, cancelled by any operator
+    input.
+
+    ``play`` replays the whole episode's MEASURED trajectory, also synchronously (a 37 s
+    episode is a 37 s request): resampled onto the loop tick with one global time scale so
+    the arms keep their recorded relative timing, every posture re-verified in the twin
+    before anything is sent, then streamed through the gate. It refuses when an arm is not
+    at frame 0 — with the distance, rather than quietly re-placing it.
+
+    ``stop`` cancels a replay in flight and is the operator's only stop button here: the
+    Welcome page never opens ``/ws/control``, so there is no key to cancel with.
+    Idempotent.
+
+    Never an error status for an operational refusal — the answer carries ``ok: false``
+    plus a ``detail`` the dialog shows.
+    """
+    rt = _runtime(request)
+    # The Welcome page never opens /ws/control, so a playback is the only operator
+    # activity the orphaned-session watch would see. Stamp it (04-runtime §13.2).
+    rt.orphan_watch.note_activity(f"POST /api/session/playback {body.action}")
+    try:
+        if body.action == "goto_initial":
+            return rt.manager.episode_playback_goto_initial(body.repo_id, body.episode_id)
+        if body.action == "play":
+            return rt.manager.episode_playback_play(body.repo_id, body.episode_id)
+        return rt.manager.episode_playback_stop()
+    finally:
+        rt.orphan_watch.note_activity("playback finished")
 
 
 @router.delete("/session", status_code=204)

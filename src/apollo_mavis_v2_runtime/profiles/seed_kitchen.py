@@ -5,34 +5,50 @@
     ... --dry-run          # print what it would write, touch nothing
     ... --config <path>    # a rendered config (defaults to the repo config)
 
-This is the posture the ``mavis_v2_kitchen`` twin was PREPARED AND MEASURED at
-(03-sim §4.4 and the header of ``assets/scenes/mavis_v2_kitchen.yaml``): the
-Perception Arm frames the fridge / range / counter with its wrist D435i, and the
-Manipulation Arm is parked at the cell's factory-zero posture at the far rail end.
-It was that scene's keyframe; the operator asked on 2026-09-09 for it to become a
-profile of its own after the GELLO mode it was originally built for was cut, so it
-can be reached with "Go to profile" like any other posture.
+The point of this profile is to put the PERCEPTION ARM where the ``mavis_v2_kitchen``
+twin was measured from (03-sim §4.4 and the header of
+``assets/scenes/mavis_v2_kitchen.yaml``): framing the fridge / range / counter with its
+wrist D435i, carriage pinned at its zero end. Every kitchen number in §4.4 was
+deprojected from a frame taken there, so the appliance geometry only lines up with the
+real cameras from THAT carriage position — hence the pin. The operator asked on
+2026-09-09 for the posture to become a profile of its own, reachable with "Go to
+profile", after the GELLO mode it was originally built for was cut.
 
     Perception Arm (view)     [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029] rad
                               = [151.605, -91.559, 1.031, 93.793, 14.324, 114.993, 1.662] deg
-    Manipulation Arm (grip)   [pi, 0, 0, 0, 0, 0, 0] rad — the xArm7 factory zero
-                              with joint 1 = pi, i.e. the cell's own initial state
+                              carriage PINNED at 0.0
+    Manipulation Arm (grip)   exactly its entry in the DEFAULT posture (``seed_initial``),
+                              carriage left unset ("keep it where it is")
 
-Unlike ``seed_initial`` this profile PINS BOTH RAILS (view 0.0, grip 0.65). It has to:
-every kitchen number in 03-sim §4.4 was deprojected from a frame taken with the
-Perception Arm's carriage at its zero end, so the appliance geometry only lines up
-with the real cameras from THIS carriage position. Both values are the rails' homed
-end stops, reached by ``home_rail`` itself, and a goto still goes through the twin
-planner and the gate in two separately planned phases (joints, then carriages).
+**The Manipulation Arm is the operator's default posture, not the scene keyframe**
+(operator request 2026-09-10). Until then this profile carried the kitchen scene's own
+keyframe for the grip arm — the xArm7 factory zero, ``[pi, 0, 0, 0, 0, 0, 0]``, with the
+carriage pinned at 0.65. Both of those cost real motion for nothing:
+
+* joint 1 of the factory zero is ``+pi`` while the default posture's is ``-180 deg`` =
+  ``-pi``. Same physical orientation, DIFFERENT joint value, and the planner walks
+  straight lines in joint space — so every goto between the default posture and this
+  profile rotated joint 1 a full **360 deg** before teleop could start. That is the
+  "turn a full circle" the operator reported.
+* the 0.65 pin added an up-to-0.65 m carriage traverse whose only purpose was parking
+  the arm at the far end, out of the Perception Arm's way.
+
+Neither is needed: the grip arm has nothing to do with the kitchen measurement, so
+parking it at the posture it is ALREADY in makes a goto from the default posture move
+the Perception Arm and NOTHING else. The Manipulation Arm's entry is therefore DERIVED
+from ``seed_initial.default_profile`` rather than copied, so the two can never drift
+apart.
 
 It is deliberately NOT designated the initial condition — that stays the operator's
 default posture from ``seed_initial``, which is what ``R`` and "End session" return to.
 
-Verified 2026-09-09 on both scenes (``mavis_v2_kitchen`` and ``mavis_v2``), microphone
-on and off, at the cell's raised gate shell ``geom_inflation_m = 0.025``: collision
-free, tightest monitored pair ``table <-> grip_*_finger_pad_2`` at 114.7 mm.
+Verified 2026-09-10 in both twins (``mavis_v2_kitchen`` and ``mavis_v2``), microphone on
+and off, at the cell's raised gate shell ``geom_inflation_m = 0.025``: collision free at
+EVERY grip carriage position from 0.000 to 0.650 m (which is why the pin could go),
+tightest monitored pair ``obstacle <-> grip_rail_platform`` at 75.3 mm.
 
-NOT run automatically: writing profiles is an explicit operator action.
+NOT run automatically: writing profiles is an explicit operator action. Re-run it after
+this change — a store seeded before 2026-09-10 still holds the old numbers.
 """
 
 from __future__ import annotations
@@ -44,42 +60,55 @@ from pathlib import Path
 
 from apollo_mavis_v2_core import ArmPosture, ProfileStore, StateProfile
 
+from .seed_initial import DEFAULT_POSTURE_DEG, GRIPPER_OPEN_FRAC, default_profile
+
 PROFILE_NAME = "Kitchen Interaction"
 NOTES = (
-    "The posture the mavis_v2_kitchen twin was measured at (2026-09-09; 03-sim §4.4): "
+    "Where the mavis_v2_kitchen twin was measured FROM (2026-09-09; 03-sim §4.4): "
     "Perception Arm framing the fridge / range / counter with its wrist D435i at "
-    "[2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029] rad, carriage at its zero end; "
-    "Manipulation Arm parked at the cell's factory-zero initial state, carriage at 0.65. "
-    "The carriages are PINNED because the kitchen geometry was deprojected from a frame "
-    "taken at exactly this Perception Arm carriage position. Not an initial condition. "
-    "Seeded by apollo_mavis_v2_runtime.profiles.seed_kitchen."
+    "[2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029] rad, carriage PINNED at its zero "
+    "end because the kitchen geometry was deprojected from a frame taken there. The "
+    "Manipulation Arm is its entry in the DEFAULT posture with the carriage left unset "
+    "(operator request 2026-09-10), so a goto from the default posture moves the "
+    "Perception Arm and nothing else - the old factory-zero entry differed from the "
+    "default only in the SIGN of joint 1 and cost a 360 deg rotation for nothing. "
+    "Not an initial condition. Seeded by apollo_mavis_v2_runtime.profiles.seed_kitchen."
 )
 
-# Radians, as measured / as the kitchen scene's keyframe carries them.
+# The ONE arm whose kitchen posture differs from the default (radians, as measured).
+VIEW_POSTURE_RAD: list[float] = [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029]
+# The Perception Arm's carriage is PINNED: the kitchen numbers only line up from here.
+VIEW_RAIL_M = 0.0
+
+# The whole posture, for tests and tools that want it in one place. The Manipulation Arm
+# is DERIVED from the default posture (never copied) so the two cannot drift apart, and
+# its carriage is None = "keep it where it is", exactly as in seed_initial.
 KITCHEN_POSTURE_RAD: dict[str, list[float]] = {
-    "view": [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029],
-    "grip": [math.pi, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "view": list(VIEW_POSTURE_RAD),
+    "grip": [math.radians(d) for d in DEFAULT_POSTURE_DEG["grip"]],
 }
-# Carriage per arm (m). Pinned, unlike seed_initial — see the module docstring.
-KITCHEN_RAIL_M: dict[str, float] = {"view": 0.0, "grip": 0.65}
-# Gripper open on arrival (the Perception Arm has none; the field is ignored there).
-GRIPPER_OPEN_FRAC = 1.0
+KITCHEN_RAIL_M: dict[str, float | None] = {"view": VIEW_RAIL_M, "grip": None}
 
 
 def kitchen_profile(kind: str) -> StateProfile:
-    """The profile this module writes for ``kind`` (no id / timestamp yet)."""
+    """The profile this module writes for ``kind`` (no id / timestamp yet).
+
+    Built by taking the DEFAULT posture and replacing the Perception Arm's entry: that
+    is the invariant the operator asked for on 2026-09-10 — only the Perception Arm may
+    differ from the default — expressed as code rather than as two lists to keep in
+    step. Any arm ``seed_initial`` gains in future is inherited unchanged.
+    """
+    arms = dict(default_profile(kind).arms)
+    arms["view"] = ArmPosture(
+        q=list(VIEW_POSTURE_RAD),
+        rail_pos_m=VIEW_RAIL_M,
+        gripper_open_frac=GRIPPER_OPEN_FRAC,
+    )
     return StateProfile(
         name=PROFILE_NAME,
         notes=NOTES,
         workcell_kind=kind,  # type: ignore[arg-type]
-        arms={
-            arm_id: ArmPosture(
-                q=list(q),
-                rail_pos_m=KITCHEN_RAIL_M[arm_id],
-                gripper_open_frac=GRIPPER_OPEN_FRAC,
-            )
-            for arm_id, q in KITCHEN_POSTURE_RAD.items()
-        },
+        arms=arms,
     )
 
 

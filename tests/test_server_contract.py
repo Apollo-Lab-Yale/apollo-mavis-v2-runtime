@@ -240,6 +240,11 @@ def test_telemetry_pre_session_idle(client):
         msg = ws.receive_json()
         assert msg["t"] == "telemetry"
         assert msg["session"]["state"] == "idle"
+        # 2026-09-09 (04-runtime §13.2 / §13.3): session identity + the orphaned-session
+        # notice. All four null with no session and none auto-ended in this process.
+        assert msg["session"]["session_id"] is None
+        assert msg["session"]["mode"] is None and msg["session"]["kind"] is None
+        assert msg["session"]["auto_ended"] is None
         assert msg["arms"] == [] and msg["collision"]["severity"] == "ok"
         # Tracker block is populated pre-session (device fields; backend none here).
         trk = msg["tracker"]
@@ -261,6 +266,19 @@ def test_telemetry_pre_session_idle(client):
         ]
         assert msg["external"]["state"] == "disabled"  # dora.enabled false (phase-12)
         assert msg["datasets"] is None  # no export ran in this process
+
+
+def test_telemetry_names_the_live_session(client, session):
+    """2026-09-09 (04-runtime §13.3): the Welcome page never opens /ws/control and has no
+    ``SessionInfo`` on a fresh load, so telemetry is how it learns that a session is
+    running and which Cockpit route to offer. Before this it could only infer "something
+    is wrong" from four disabled launch cards and a `monitor_off` arm gate."""
+    with client.websocket_connect("/ws/telemetry") as ws:
+        msg = ws.receive_json()
+        assert msg["session"]["session_id"] == session["session_id"]
+        assert msg["session"]["mode"] == "teleop"
+        assert msg["session"]["kind"] == "sim"
+        assert msg["session"]["auto_ended"] is None  # ended by DELETE, not by the watch
 
 
 # -- Online DAgger (phase-14; 15-online-dagger §3, §7, §9) --------------------------------------

@@ -78,6 +78,7 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "tests/test_e2e_collect.py" = ["TID251"]
 "tests/test_export_lerobot.py" = ["TID251"]
 "tests/test_episode_dir_recorder.py" = ["TID251"]  # reads the episode frames.parquet (pyarrow)
+"tests/test_episode_playback.py" = ["TID251"]  # writes episode frames.parquet fixtures (pyarrow)
 "tests/test_return_to_start.py" = ["TID251"]
 # The tracker device module is the one sanctioned (lazy) pysurvive import site.
 "src/apollo_mavis_v2_runtime/devices/tracker.py" = ["TID251"]

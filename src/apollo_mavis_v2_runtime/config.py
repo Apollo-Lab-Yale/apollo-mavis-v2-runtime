@@ -162,6 +162,18 @@ class ControlConfig(BaseModel):
     # with tick rate / overruns / clutch / tracker ages / gate / IK slip counters /
     # servo-stream stats. 0 disables it.
     health_log_every_s: float = Field(default=1.0, ge=0.0)
+    # Orphaned-session watch (2026-09-09 evening; 04-runtime §13.2 "orphaned session",
+    # session/orphan.py): how long the runtime keeps a session alive with NO controller
+    # /ws/control connection — the socket that carries the key heartbeat, the actions and
+    # the deadman, so without it nobody can drive — and no session-scoped REST activity,
+    # before it ends the session ITSELF. The end is the DELETE teardown: the arms stop and
+    # brake where they stand, NO motion, and the reason rides
+    # telemetry.session.auto_ended so the Welcome page can say the cell was released.
+    # The grace period is what tells "the Cockpit tab was closed for good" apart from
+    # "the operator pressed F5" (a reload re-opens the socket within a second).
+    # 0 DISABLES the watch: the runtime's own test suites and any REST-only driver of a
+    # session must not be ended out from under them.
+    orphan_session_grace_s: float = Field(default=30.0, ge=0.0)
 
 
 class VideoConfig(BaseModel):

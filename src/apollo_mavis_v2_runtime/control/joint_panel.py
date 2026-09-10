@@ -146,6 +146,19 @@ class PlanExecutor:
     def active_arms(self) -> list[str]:
         return list(self._waypoints)
 
+    def index(self, arm_id: str) -> int | None:
+        """Which waypoint this arm is heading for, ``None`` when idle (2026-09-10).
+
+        Episode playback needs it twice: to follow the recorded GRIPPER track (the
+        opening belongs to the frame the arm is at, not to the plan's arrival) and to
+        report progress. Read-only — the executor still owns the index.
+        """
+        return self._index.get(arm_id) if arm_id in self._waypoints else None
+
+    def length(self, arm_id: str) -> int:
+        """How many waypoints this arm was loaded with (0 when idle)."""
+        return len(self._waypoints.get(arm_id, ()))
+
     def step(self, arm_id: str, q_last: np.ndarray) -> np.ndarray | None:
         """One slew-limited step along the waypoint stream; None when idle.
 

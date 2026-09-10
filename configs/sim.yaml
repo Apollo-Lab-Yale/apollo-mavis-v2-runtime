@@ -39,6 +39,15 @@ control:
   dq_max_rad: 0.04
   jog: {slew_rad_per_tick: 0.02, rail_m_per_tick: 0.002}   # joint panel: constant-speed approach, any delta
   watchdog: {stale_s: 0.2, ramp_s: 0.1}
+  # Orphaned-session watch (2026-09-09 evening; 04-runtime §13.2, session/orphan.py): a session
+  # whose controller /ws/control connection has been gone this long - and which no session REST
+  # call has touched meanwhile - is ended by the runtime ITSELF, because the control socket is
+  # what carries the key heartbeat, the actions and the deadman, so without it nobody can drive.
+  # The end is the DELETE teardown: the arms stop and brake WHERE THEY STAND, no motion, no
+  # replanned return; the reason rides telemetry.session.auto_ended and the Welcome page shows it.
+  # Long enough that an F5 in the Cockpit (socket back within a second) is not an orphan.
+  # 0 = disabled.
+  orphan_session_grace_s: 30
 telemetry_hz: 25
 video: {preview_fps: 15, session_fps: 30, jpeg_quality: 80}
 egl_device_id: 0

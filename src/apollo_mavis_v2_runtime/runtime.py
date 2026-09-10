@@ -21,6 +21,7 @@ from .devices.tracker_calibration import TrackerCalibration, apply_persisted_yaw
 from .dora_bridge.wiring import DoraWiring
 from .errors import MaintenanceUnavailableError
 from .session.manager import SessionManager
+from .session.orphan import OrphanSessionWatch
 from .streams.hub import VideoHub
 from .streams.twin_overlay import TwinOverlayRenderer
 
@@ -134,6 +135,17 @@ class Runtime:
             lambda: self.manager.session_active,  # True during bringup too (rest.py re-checks)
         )
         self.controller_connected = False  # maintained by server/ws_control
+        # Orphaned-session watch (2026-09-09 evening; 04-runtime §13.2): a session whose
+        # controller /ws/control connection has been gone for
+        # control.orphan_session_grace_s is ended by the runtime itself through the
+        # no-motion teardown, and why is published on telemetry.session.auto_ended.
+        # `controller_connected` is read live rather than mirrored, so there is only ever
+        # one copy of the connection state (ws_control's).
+        self.orphan_watch = OrphanSessionWatch(
+            self.manager,
+            cfg.control.orphan_session_grace_s,
+            lambda: self.controller_connected,
+        )
 
     # -- lifecycle (server lifespan) ------------------------------------------
     def start(self) -> None:
@@ -157,10 +169,15 @@ class Runtime:
         # phase-12: after the previews exist (camera taps attach to their encoders) and
         # the monitor is up (the hardware idle reader re-publishes its samples).
         self.dora.start()
+        # 2026-09-09: last, so nothing can be orphaned before the process can serve
+        # the Welcome page that explains it (no-op when the grace period is 0).
+        self.orphan_watch.start()
 
     def stop(self) -> None:
-        # Reverse of start(): dora (idle reader -> dora stop -> dora down -> reap) ->
+        # Reverse of start(): the orphan watch first (its teardown must never race the
+        # one below) -> dora (idle reader -> dora stop -> dora down -> reap) ->
         # overlay (renderers closed on its thread) -> monitor (boxes released) -> the rest.
+        self.orphan_watch.stop()
         self.dora.stop()
         if self.twin_overlay is not None:
             self.twin_overlay.stop()

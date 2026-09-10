@@ -63,7 +63,13 @@ def make_runtime_config(
         # at every test scene's folded start posture, where the gate legitimately
         # stops it). The frame itself is covered by tests/test_teleop_math.py and
         # tests/test_camera_frame.py.
-        control=ControlConfig(translate_frame="base"),
+        # `orphan_session_grace_s=0` DISABLES the orphaned-session watch for every test
+        # (2026-09-09; session/orphan.py, 04-runtime §13.2). The suites here drive sessions
+        # over REST and the bus without ever opening a controller /ws/control socket, which
+        # is exactly what the watch reads as abandoned — with the shipped 30 s default a
+        # long e2e test would have its session torn down under its assertions. The watch
+        # itself is covered by tests/test_orphan_session.py with an injected clock.
+        control=ControlConfig(translate_frame="base", orphan_session_grace_s=0.0),
         tracker=tracker or TrackerConfig(),
         # tests run against fakes only: arm the (fake) hardware paths so home_rail jobs and
         # hardware sessions can be exercised; the real-SDK path stays behind the conftest

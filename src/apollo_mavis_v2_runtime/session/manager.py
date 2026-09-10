@@ -105,6 +105,7 @@ arm, so the incident can not recur through ``execute_plan`` either.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -116,9 +117,11 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from apollo_mavis_v2_core import (
     ArmConfig,
+    ArmPosture,
     Command,
     ProfileNotFoundError,
     ProfileStore,
+    StateProfile,
     WorkcellConfig,
 )
 from apollo_mavis_v2_core.protocol import (
@@ -143,7 +146,7 @@ from ..control.tracker_teleop import TrackerTeleop
 from ..devices.hardware_monitor import CONNECTED_STATUSES, MONITOR_JOIN_TIMEOUT_S
 from ..devices.tracker import TrackerSettings
 from ..errors import MaintenanceUnavailableError, SessionError, SessionNotFoundError
-from ..recorder.datasets import DatasetStore
+from ..recorder.datasets import DatasetError, DatasetStore
 from ..safety.gate import NullGate, SafetyGate
 from ..safety.supervisor import SafetySupervisor
 from ..safety.watchdog import ArmReportWatchdog, InputWatchdog
@@ -268,10 +271,23 @@ PLAN_ARRIVAL_GRACE_S = 2.0
 PLAN_ARRIVAL_POLL_S = 0.02
 
 
+PLAYBACK_INITIAL_LABEL = "episode_playback_initial"
+PLAYBACK_LABEL = "episode_playback"
+#: How far an arm may be from the episode's first frame and still be replayed from
+#: there (rad, per joint). 1 deg: tight enough that a drifted cell is caught, loose
+#: enough that a settled arm is not refused for a tenth of a degree.
+PLAYBACK_START_TOL_RAD = math.radians(1.0)
+#: Playback deadline = its own length x this + the grace, so a gate hold has room.
+PLAYBACK_BUDGET_FACTOR = 3.0
+PLAYBACK_BUDGET_GRACE_S = 20.0
+
+
 def _motion_title(label: str, profile) -> str:
     """How the Cockpit names the profile motion whose outcome it reports."""
     if label == "goto_profile":
         return f"Go to profile '{profile.name}'"
+    if label == PLAYBACK_INITIAL_LABEL:
+        return f"Return to {profile.name}"  # "... episode <id>'s initial state"
     return "Return to the initial condition"
 
 
@@ -593,6 +609,24 @@ class SessionManager:
         bp = self._bringup
         return bp.snapshot() if bp is not None else None
 
+    def session_identity(self) -> tuple[str | None, str | None, str | None]:
+        """``(session_id, mode, kind)`` of the live session, ``(None, None, None)``
+        with none (2026-09-09; ``SessionTelemetry.session_id`` / ``mode`` / ``kind``).
+
+        A hardware bring-up counts, exactly as it does for ``GET /api/session``: the
+        session object does not exist until :meth:`_bringup_hardware` returns, and a
+        Welcome page that offered a launcher during that window would 409. This is
+        how a freshly loaded Welcome page — which never opens ``/ws/control`` and so
+        has no ``SessionInfo`` — learns that a session is running and which Cockpit
+        route to offer instead of a disabled launch card."""
+        s = self.session
+        if s is not None:
+            return s.session_id, s.spec.mode, s.spec.kind
+        bp = self._bringup
+        if bp is not None and bp.spec is not None:
+            return bp.session_id, bp.spec.mode, bp.spec.kind
+        return None, None, None
+
     def _tracker_provider(self) -> TrackerTeleop:
         """Per-session clutch/anchor state over the process-wide tracker slot
         (13-tracker §4); built for every session so ``tracker_settings`` and
@@ -718,7 +752,8 @@ class SessionManager:
         from ..recorder.features import ArmMeta, build_repo_id
 
         scene_id = (
-            spec.sim_scene or wc.sim_scene if spec.kind == "sim"
+            spec.sim_scene or wc.sim_scene
+            if spec.kind == "sim"
             else spec.digital_twin_scene or wc.digital_twin_scene
         )
         if not scene_id:
@@ -1729,9 +1764,7 @@ class SessionManager:
                 )
                 rig.loop.recorder = recorder_thread
                 for a in spec.arms:
-                    progress.set(
-                        a, "recorder", "ok", f"recording into {recorder_thread.repo_id}"
-                    )
+                    progress.set(a, "recorder", "ok", f"recording into {recorder_thread.repo_id}")
             rig.loop.start()
             if recorder_thread is not None:
                 recorder_thread.start()
@@ -2596,9 +2629,7 @@ class SessionManager:
             else:
                 rt.set_returning(False, "")
                 session.motion_detail = ""  # arrived at the return profile: notice resolved
-                logger.info(
-                    "return-to-start after %s complete (profile %r)", outcome, profile.name
-                )
+                logger.info("return-to-start after %s complete (profile %r)", outcome, profile.name)
         except Exception as e:
             logger.exception("return-to-start worker failed")
             try:
@@ -2829,6 +2860,369 @@ class SessionManager:
         finally:
             self._release_profile_motion(token)
 
+    # -- episode playback (2026-09-10; 04-runtime §10.8, 05-ui §8.1 item 7) ------------
+    # Operator request: a Playback button on every episode row of the Welcome page's
+    # Datasets panel, opening a dialog with "return to this episode's initial state" and
+    # "play back the whole episode", the second disabled until the first has run. Both
+    # motions are ordinary twin-planned, gated, interruptible profile motions - the
+    # trajectory replay is built on top of the same machinery, so nothing here can move
+    # an arm the gate has not approved.
+    def _playback_trajectory(self, repo_id: str, episode_id: str):
+        """Read one episode's measured trajectory; ``DatasetError`` / ``PlaybackError``
+        carry an operator-facing reason for the REST layer to turn into 404 / 409."""
+        from ..recorder.playback import PlaybackError, load_trajectory
+
+        layout = self.dataset_store.layout_of(repo_id)
+        if layout is None:
+            raise DatasetError(f"unknown dataset {repo_id!r}", not_found=True)
+        if layout != "episode_dirs":  # the only other value is "lerobot_v3" (legacy)
+            raise PlaybackError(
+                f"dataset {repo_id!r} is a legacy LeRobot tree - playback needs the "
+                "episode-directory layout (10-frames §11)"
+            )
+        return load_trajectory(repo_id, self.dataset_store.root_of(repo_id), episode_id)
+
+    def _playback_refusal(self, traj) -> str:
+        """Why this episode cannot be replayed onto the LIVE cell right now; "" = it can.
+
+        Deliberately NOT a check of the workcell kind: the sim twin and the real cell
+        share their kinematics, so replaying a hardware recording in sim (the sensible
+        way to preview one before it touches the arms) is allowed. What must match is the
+        ARM SET - an episode that names an arm this session does not drive cannot be
+        placed at all.
+        """
+        session = self.session
+        if session is None:
+            return (
+                "Start a session first - playback drives the arms through the twin "
+                "planner and the safety gate, which only exist inside a session"
+            )
+        missing = [a for a in traj.arm_ids if a not in session.spec.arms]
+        if missing:
+            names = " / ".join(arm_label(a) for a in missing)
+            return f"the episode was recorded with {names}, which this session does not drive"
+        return ""
+
+    def episode_playback_info(self, repo_id: str, episode_id: str):
+        """``GET /api/datasets/{ns}/{name}/episodes/{id}/playback``: what a playback of
+        this episode would do, plus whether it can run right now and why not.
+
+        Session-less on purpose - the dialog opens and explains itself before anything
+        moves, so the operator never meets a bare 409.
+        """
+        from apollo_mavis_v2_core.protocol import EpisodePlaybackInfo
+
+        traj = self._playback_trajectory(repo_id, episode_id)
+        reason = self._playback_refusal(traj)
+        return EpisodePlaybackInfo(
+            repo_id=repo_id,
+            episode_id=episode_id,
+            frames=traj.frames,
+            fps=traj.fps,
+            duration_s=traj.duration_s,
+            arms=list(traj.initial_state().values()),
+            playable=not reason,
+            reason=reason,
+        )
+
+    def _episode_initial_profile(self, session: ActiveSession, traj) -> StateProfile:
+        """A TRANSIENT profile holding the episode's first frame.
+
+        It is never saved: giving the goto a ``StateProfile`` is what lets it reuse the
+        whole return-to-initial path unchanged - two separately planned and gated phases
+        (joints with the carriages held, then the carriages), one arm at a time in the
+        planner's ``arm_order``, cancelled by any operator input.
+        """
+        state = traj.initial_state()
+        return StateProfile(
+            name=f"episode {traj.episode_id}'s initial state",
+            notes=(
+                f"Frame 0 of {traj.repo_id} episode {traj.episode_id} "
+                f"({traj.frames} frames at {traj.fps:g} fps). Transient - never stored."
+            ),
+            workcell_kind=session.spec.kind,  # type: ignore[arg-type]
+            arms={
+                arm_id: ArmPosture(
+                    q=list(st.q),
+                    rail_pos_m=st.rail_pos_m,
+                    gripper_open_frac=(
+                        1.0
+                        if st.gripper_open_frac is None
+                        else min(1.0, max(0.0, st.gripper_open_frac))
+                    ),
+                )
+                for arm_id, st in state.items()
+                if arm_id in session.spec.arms
+            },
+        )
+
+    def episode_playback_goto_initial(self, repo_id: str, episode_id: str) -> ReturnHomeResult:
+        """``POST /api/session/playback {action: "goto_initial"}``: walk the arms to the
+        episode's FIRST recorded frame, SYNCHRONOUSLY.
+
+        Synchronous like ``return_home`` because the dialog awaits it and only then
+        enables **Playback** - the operator's rule, and the right one: replaying a
+        trajectory from the wrong place is exactly how you drive an arm into something.
+        Every refusal is ``ok: false`` + ``detail``, never an exception.
+        """
+        from ..recorder.playback import PlaybackError
+
+        session = self.session
+        if session is None:
+            return ReturnHomeResult(ok=False, status="refused", detail="no active session")
+        try:
+            traj = self._playback_trajectory(repo_id, episode_id)
+        except (DatasetError, PlaybackError) as e:
+            return ReturnHomeResult(ok=False, status="refused", detail=str(e))
+        reason = self._playback_refusal(traj)
+        if reason:
+            return ReturnHomeResult(ok=False, status="refused", detail=reason)
+        profile = self._episode_initial_profile(session, traj)
+        blocked = self._reset_blockers(session, profile)
+        if blocked is not None:
+            return blocked
+        token = self._claim_profile_motion(PLAYBACK_INITIAL_LABEL)
+        if token is None:
+            return ReturnHomeResult(ok=False, status="refused", detail=MOTION_BUSY)
+        try:
+            session.motion_detail = ""
+            return self._profile_motion_reported(session, profile, PLAYBACK_INITIAL_LABEL)
+        finally:
+            self._release_profile_motion(token)
+
+    def _verify_playback(self, session: ActiveSession, plan) -> str:
+        """Check EVERY posture of a resampled playback in the twin, all arms jointly; ""
+        = clear, else the operator-facing reason naming the first violating waypoint.
+
+        This is what earns :meth:`ControlLoop._op_playback_path` the right to move both
+        arms at once (see its docstring). It is checked at the resolution the postures
+        will be COMMANDED - one waypoint per tick - not at the recorded frame rate, so
+        there is no un-checked interpolation between two approved postures. The model's
+        own inflation applies, i.e. the cell's raised 25 mm shell on hardware: this is
+        the same twin the gate uses, so it cannot disagree with it.
+
+        **It must NOT touch the twin's own ``MjData``** (2026-09-10, learned the hard
+        way): that belongs to the 100 Hz control loop, which is gating ticks through
+        ``twin.check`` while this runs on a REST thread. Writing qpos and running
+        ``mj_collision`` on it from here corrupts MuJoCo's contact bookkeeping and
+        raises ``mujoco.FatalError: collisionTask: collision function returned 0
+        contacts for geom pair (22, 24), expected at most -75 from mj_maxContact`` - a
+        negative budget, i.e. an inconsistent contact buffer, and the reason a real
+        hardware playback died at waypoint 244. So the whole verification runs on a
+        PRIVATE ``MjData`` (``twin.new_data()``), the same way every planner worker
+        does, and reads shared state exactly once: one snapshot of the measured qpos for
+        the non-arm degrees of freedom (props), whose slots nothing else writes.
+
+        A recorded trajectory can legitimately fail this: the episode was recorded with
+        the objects present, and the twin does not model them (03-sim §4.5), so a grasp
+        that was safe in the room may read as a collision against a bare table - and the
+        reverse, which is why the live gate stays the authority per tick.
+        """
+        twin = session.twin
+        if twin is None:
+            return ""  # sim NullGate session: no twin to verify against (11-safety §5)
+        try:
+            data = twin.new_data()
+            base = np.array(twin.data.qpos, dtype=np.float64)
+        except Exception as e:  # noqa: BLE001 - an older sim without new_data(): say so
+            logger.exception("playback verification could not take a private twin data")
+            return f"the digital twin could not be prepared for verification: {e}"
+        slots = {}
+        for arm_id in plan.waypoints:
+            try:
+                slots[arm_id] = twin.addr[arm_id].qpos_adr
+            except Exception:  # noqa: BLE001
+                return f"the digital twin does not model arm {arm_id!r}"
+            want, got = len(slots[arm_id]), len(plan.waypoints[arm_id][0])
+            if want != got:
+                return (
+                    f"the episode gives {got} values for {arm_label(arm_id)} but the twin "
+                    f"needs {want} (a recording made with a different rail fitment?)"
+                )
+        rate = max(1.0, float(session.loop.cfg.rate_hz))
+        for k, posture in plan.postures():
+            q_full = base.copy()
+            for arm_id, q in posture.items():
+                q_full[slots[arm_id]] = q
+            try:
+                violations = twin.check_config_violations(q_full, data=data)
+            except Exception as e:  # noqa: BLE001 - a twin problem is a refusal, not a 500
+                logger.exception("playback verification failed at waypoint %d", k)
+                return f"the digital twin could not check waypoint {k}: {e}"
+            if violations:
+                pairs = ", ".join(" <-> ".join(p) for p, _ in violations[:2])
+                # Waypoint -> seconds: the resampler emits one waypoint per loop tick.
+                return (
+                    f"the digital twin blocks this episode {k / rate:.1f} s in "
+                    f"(waypoint {k} of {plan.length}): {pairs}. The twin does not model "
+                    "the objects the episode was recorded with, so a grasp can read as a "
+                    "collision here - re-measure the cell or replay it in sim first"
+                )
+        return ""
+
+    def episode_playback_play(self, repo_id: str, episode_id: str) -> ReturnHomeResult:
+        """``POST /api/session/playback {action: "play"}``: replay the whole episode.
+
+        SYNCHRONOUS, like ``goto_initial`` and ``return_home``: the dialog awaits it and
+        shows the outcome. What is replayed is the MEASURED joint / rail / gripper
+        trajectory (``observation.state``), resampled onto the loop tick with ONE global
+        time scale so the arms keep their recorded relative timing, verified posture by
+        posture in the twin, then streamed through the gated executor as one
+        ``playback_path`` command. Interruptible throughout - any operator input, a driver
+        fault or a teardown cancels it and the arms hold where they are.
+
+        It deliberately does NOT re-place the arms first: the operator's dialog requires
+        "return to the initial state" to have run, and doing it again silently here would
+        hide a cell that has drifted since. The starting posture is instead CHECKED
+        against frame 0 below, and a mismatch is refused with the distance.
+        """
+        from ..recorder.playback import ExecutorCaps, PlaybackError, resample
+
+        session = self.session
+        if session is None:
+            return ReturnHomeResult(ok=False, status="refused", detail="no active session")
+        try:
+            traj = self._playback_trajectory(repo_id, episode_id)
+        except (DatasetError, PlaybackError) as e:
+            return ReturnHomeResult(ok=False, status="refused", detail=str(e))
+        reason = self._playback_refusal(traj)
+        if reason:
+            return ReturnHomeResult(ok=False, status="refused", detail=reason)
+        profile = self._episode_initial_profile(session, traj)
+        blocked = self._reset_blockers(session, profile)
+        if blocked is not None:
+            return blocked
+        arms = [a for a in traj.arm_ids if a in session.spec.arms]
+        states = session.workcell.states()
+        # An arm whose recording has no rail column keeps its carriage where it is.
+        rail_hold = {
+            a: float(getattr(states[a], "rail_pos_m", 0.0) or 0.0) for a in arms if a in states
+        }
+        # The arms must already BE at frame 0 (the dialog's rule). Refuse with the
+        # distance rather than quietly walking there: a drifted cell is news.
+        start = traj.initial_state()
+        for arm_id in arms:
+            measured = np.asarray(states[arm_id].q, dtype=np.float64)[:7]
+            want = np.asarray(start[arm_id].q, dtype=np.float64)
+            off = float(np.max(np.abs(measured - want)))
+            if off > PLAYBACK_START_TOL_RAD:
+                return ReturnHomeResult(
+                    ok=False,
+                    status="refused",
+                    detail=(
+                        f"{arm_label(arm_id)} is {math.degrees(off):.1f}deg away from the "
+                        "episode's first frame - run 'Return to the initial state' first"
+                    ),
+                )
+        try:
+            plan = resample(
+                traj,
+                ExecutorCaps.from_jog(session.loop.cfg.jog),
+                loop_hz=session.loop.cfg.rate_hz,
+                arms=arms,
+                rail_hold=rail_hold,
+            )
+        except PlaybackError as e:
+            return ReturnHomeResult(ok=False, status="refused", detail=str(e))
+        token = self._claim_profile_motion(PLAYBACK_LABEL)
+        if token is None:
+            return ReturnHomeResult(ok=False, status="refused", detail=MOTION_BUSY)
+        try:
+            session.motion_detail = ""
+            result = self._playback_motion(session, traj, plan)
+        except Exception as e:  # noqa: BLE001 - a worker bug must not kill the session
+            logger.exception("episode playback failed")
+            result = ReturnHomeResult(ok=False, status="failed", detail=repr(e))
+        finally:
+            self._release_profile_motion(token)
+        session.motion_detail = (
+            "" if result.status == "done" else f"Playback of episode {episode_id}: {result.detail}"
+        )
+        log = logger.info if result.ok else logger.warning
+        log("episode playback %s: %s - %s", episode_id, result.status, result.detail)
+        return result
+
+    def _playback_motion(self, session: ActiveSession, traj, plan) -> ReturnHomeResult:
+        """Verify, submit and wait; the status vocabulary of :meth:`_execute_arms`."""
+        arms = sorted(plan.waypoints)
+        base = ReturnHomeResult(ok=False, status="failed", detail="", arms=arms)
+        blocked = self._verify_playback(session, plan)
+        if blocked:
+            return base.model_copy(update={"status": "refused", "detail": blocked})
+        loop, plans = session.loop, session.loop.plans
+        ack = self.bus.commands.submit(
+            Command(
+                op="playback_path",
+                args={"waypoints": plan.waypoints, "gripper_track": plan.gripper},
+                source="internal",
+            )
+        ).result(timeout=5.0)
+        if not ack.ok:
+            return base.model_copy(update={"status": "refused", "detail": ack.detail})
+        # Budget: the replay's own length plus generous slack for gate holds. `slowdown`
+        # is already folded into the waypoint count, so this scales with the real motion.
+        expected_s = plan.length / max(1.0, session.loop.cfg.rate_hz)
+        budget = expected_s * PLAYBACK_BUDGET_FACTOR + PLAYBACK_BUDGET_GRACE_S
+        deadline = time.monotonic() + budget
+        timed_out = False
+        while plans.active_arms:
+            if session.state is not SessionState.RUNNING:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.02)
+        if plans.active_arms:
+            why = f"budget {budget:.0f} s" if timed_out else f"session {session.state.value}"
+            self._cancel_plan_via_loop(f"playback: {why}")
+        if timed_out:
+            return base.model_copy(update={"status": "timeout", "detail": f"budget {budget:.0f} s"})
+        cancel = loop.plan_cancel_reason
+        if cancel:
+            if cancel.startswith(GATE_HOLD_PREFIX):
+                pair = cancel[len(GATE_HOLD_PREFIX) :].lstrip(": ")
+                return base.model_copy(update={"status": "held", "detail": pair})
+            return base.model_copy(update={"status": "cancelled", "detail": cancel})
+        # The command reached the last waypoint; now the ARM has to be there — the same
+        # rule _execute_arms follows, because the executor retiring waypoints only says
+        # the COMMAND arrived, and a carriage trails its latest-wins targets at the
+        # track's own speed. Without this a replay reports "done" while an arm still moves.
+        for arm_id in arms:
+            status, detail = self._await_arrival(
+                session,
+                arm_id,
+                plan.waypoints[arm_id][-1],
+                running=lambda: session.state is SessionState.RUNNING,
+                deadline=time.monotonic() + max(PLAN_ARRIVAL_GRACE_S, expected_s),
+            )
+            if status != "done":
+                return base.model_copy(
+                    update={"status": status, "detail": f"{arm_label(arm_id)}: {detail}"}
+                )
+        slower = f" ({plan.slowdown:.1f}x slower than recorded)" if plan.slowdown > 1.05 else ""
+        return base.model_copy(
+            update={
+                "ok": True,
+                "status": "done",
+                "detail": (f"replayed {traj.frames} frames in {expected_s:.1f} s{slower}"),
+            }
+        )
+
+    def episode_playback_stop(self) -> ReturnHomeResult:
+        """``POST /api/session/playback {action: "stop"}``: cancel a replay in flight.
+
+        The Welcome page's dialog never opens ``/ws/control``, so the operator has no key
+        to cancel with — this is their stop button. Idempotent: nothing in flight is a
+        success, because the wanted state (no replay running) already holds.
+        """
+        session = self.session
+        if session is None:
+            return ReturnHomeResult(ok=False, status="refused", detail="no active session")
+        if not session.loop.plans.active_arms:
+            return ReturnHomeResult(ok=True, status="skipped", detail="nothing is playing")
+        self._cancel_plan_via_loop("playback stopped by the operator")
+        return ReturnHomeResult(ok=True, status="done", detail="playback stopped; the arms hold")
+
     def _return_to_initial_motion(
         self, session: ActiveSession, profile, *, label: str = "reset_to_initial"
     ) -> ReturnHomeResult:
@@ -2940,10 +3334,7 @@ class SessionManager:
                 "The arms have not moved."
             )
         if status == "timeout":
-            return (
-                f"the motion was held by the safety gate{where} and stopped part-way "
-                f"({detail})."
-            )
+            return f"the motion was held by the safety gate{where} and stopped part-way ({detail})."
         if status == "held":  # the loop's gate-held abort (plan_gate_hold_s)
             return (
                 f"the motion was held by the safety gate{where} and stopped ({detail}). "
@@ -3251,9 +3642,7 @@ class SessionManager:
         online_dagger = None
         if spec.online_dagger is not None:
             online_dagger = self._build_online_dagger(spec, session_id, run_id, ann, hub, dora)
-            dagger_ctx.update(
-                repo_id=online_dagger.repo_id, coordinator=online_dagger.coordinator
-            )
+            dagger_ctx.update(repo_id=online_dagger.repo_id, coordinator=online_dagger.coordinator)
         try:
             recorder_thread = self._build_collect_recorder(
                 spec, session_cfg, workcell, scene, session_id, dagger_ctx=dagger_ctx

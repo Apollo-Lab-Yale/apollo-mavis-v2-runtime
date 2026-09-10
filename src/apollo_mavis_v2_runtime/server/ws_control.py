@@ -30,6 +30,14 @@ async def endpoint(websocket: WebSocket) -> None:
     is_controller = not runtime.controller_connected
     if is_controller:
         runtime.controller_connected = True
+        # Orphaned-session watch (2026-09-09; 04-runtime §13.2): the watch polls the
+        # flag above, so a controller that connects and drops again BETWEEN two polls
+        # would leave no trace and its session would stay exempt for good. Record the
+        # attendance here so however brief it counts. Observers deliberately do not:
+        # they cannot send keys or actions, so they cannot keep a session alive.
+        watch = getattr(runtime, "orphan_watch", None)
+        if watch is not None:
+            watch.note_controller_connected()
     role = "controller" if is_controller else "observer"
     session = runtime.manager.session
     await websocket.send_text(

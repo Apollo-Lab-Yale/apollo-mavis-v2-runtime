@@ -223,8 +223,13 @@ def test_returns_the_joints_then_the_carriage_and_is_cancelled_by_a_key(server, 
 
 
 def test_the_r_key_fires_the_same_motion_and_is_refused_while_recording(server, api):
-    spec = {**BASE, "mode": "collect", "task": "reset key e2e", "dataset": "reset_key",
-            "return_to_start": False}
+    spec = {
+        **BASE,
+        "mode": "collect",
+        "task": "reset key e2e",
+        "dataset": "reset_key",
+        "return_to_start": False,
+    }
     assert api.post("/api/session", json=spec).status_code == 200, "collect session"
     wait_running(api)
     ctl, tele = PulsingCtl(server), Tele(server)
@@ -360,28 +365,31 @@ def test_the_seeded_posture_is_collision_free_and_plannable_in_the_twin():
 
 
 def test_seeded_kitchen_interaction_profile(tmp_path):
-    """``profiles.seed_kitchen`` writes the posture the kitchen twin was measured at,
-    with BOTH carriages pinned, and does NOT touch the initial-condition designation
-    (that stays the operator's default posture)."""
-    import math
-
+    """``profiles.seed_kitchen`` puts the PERCEPTION ARM where the kitchen twin was
+    measured from, leaves the Manipulation Arm at its default-posture entry, and does
+    NOT touch the initial-condition designation (that stays the default posture)."""
     from apollo_mavis_v2_core import ProfileStore
 
+    from apollo_mavis_v2_runtime.profiles.seed_initial import default_profile
     from apollo_mavis_v2_runtime.profiles.seed_initial import seed as seed_initial
     from apollo_mavis_v2_runtime.profiles.seed_kitchen import (
         KITCHEN_POSTURE_RAD,
         KITCHEN_RAIL_M,
         PROFILE_NAME,
+        VIEW_POSTURE_RAD,
+        VIEW_RAIL_M,
         seed,
     )
 
-    # The numbers are the kitchen scene's keyframe (03-sim §4.4): the Perception Arm's
-    # measurement posture, the Manipulation Arm at the cell's factory-zero initial state.
-    assert KITCHEN_POSTURE_RAD == {
-        "view": [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029],
-        "grip": [math.pi, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    }
-    assert KITCHEN_RAIL_M == {"view": 0.0, "grip": 0.65}
+    # The Perception Arm's measurement posture, carriage pinned at its zero end: every
+    # kitchen number in 03-sim §4.4 was deprojected from a frame taken there.
+    assert VIEW_POSTURE_RAD == [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029]
+    assert VIEW_RAIL_M == 0.0
+    # The Manipulation Arm is the DEFAULT posture with the carriage kept (2026-09-10).
+    assert KITCHEN_POSTURE_RAD["grip"] == pytest.approx(
+        [v for v in default_profile("sim").arms["grip"].q]
+    )
+    assert KITCHEN_RAIL_M == {"view": 0.0, "grip": None}
 
     store = ProfileStore(tmp_path / "profiles")
     for kind in ("hardware", "sim"):
@@ -394,7 +402,7 @@ def test_seeded_kitchen_interaction_profile(tmp_path):
         for arm_id, q in KITCHEN_POSTURE_RAD.items():
             posture = profile.arms[arm_id]
             assert posture.q == pytest.approx(q)
-            assert posture.rail_pos_m == pytest.approx(KITCHEN_RAIL_M[arm_id])
+            assert posture.rail_pos_m == KITCHEN_RAIL_M[arm_id]
             assert posture.gripper_open_frac == 1.0
     # Re-running rewrites the same two files instead of accumulating.
     before = {p.profile_id for p in store.list()}
@@ -404,25 +412,55 @@ def test_seeded_kitchen_interaction_profile(tmp_path):
     assert len([p for p in store.list() if p.name == PROFILE_NAME]) == 2
 
 
+def test_going_to_the_kitchen_profile_moves_only_the_perception_arm():
+    """The operator's request of 2026-09-10, pinned as an invariant.
+
+    Before it, the profile carried the kitchen SCENE's keyframe for the Manipulation
+    Arm — the xArm7 factory zero, whose joint 1 is ``+pi`` where the default posture's
+    is ``-pi``. Same physical orientation, different joint value, and the planner walks
+    straight lines in joint space, so every goto between the default posture and this
+    profile rotated joint 1 a full 360 deg before teleop could start. The grip entry is
+    now DERIVED from ``seed_initial`` rather than copied, so it cannot drift back.
+    """
+    from apollo_mavis_v2_runtime.profiles.seed_initial import default_profile
+    from apollo_mavis_v2_runtime.profiles.seed_kitchen import kitchen_profile
+
+    for kind in ("hardware", "sim"):
+        default, kitchen = default_profile(kind), kitchen_profile(kind)
+        assert set(default.arms) == set(kitchen.arms)
+        moved = [a for a in default.arms if default.arms[a] != kitchen.arms[a]]
+        assert moved == ["view"], f"{kind}: a goto must move the Perception Arm only"
+        grip = kitchen.arms["grip"]
+        assert grip.q == pytest.approx(default.arms["grip"].q)
+        assert grip.rail_pos_m is None  # no carriage traverse either
+        # And specifically: no 360 deg joint-1 rotation left anywhere.
+        assert abs(grip.q[0] - default.arms["grip"].q[0]) < 1e-9
+
+
 def test_the_kitchen_interaction_posture_is_collision_free_in_both_twins():
     """It must be reachable: the operator selects it with "Go to profile", which plans
     and gates like any other posture. Checked on the KITCHEN twin (the appliances it was
     built for) and on the bare cell, microphone off and on, at the cell's RAISED gate
-    shell geom_inflation_m = 0.025 (11-safety §6.2)."""
+    shell geom_inflation_m = 0.025 (11-safety §6.2).
+
+    The Manipulation Arm's carriage is UNPINNED since 2026-09-10, so it is swept across
+    the whole 0.65 m travel — that sweep is what allowed the pin to be dropped.
+    """
     pytest.importorskip("mujoco")
     sim = pytest.importorskip("apollo_mavis_v2_sim")
     from apollo_mavis_v2_sim.scenes.descriptor import SceneOverrides
 
     from apollo_mavis_v2_runtime.profiles.seed_kitchen import (
         KITCHEN_POSTURE_RAD,
-        KITCHEN_RAIL_M,
+        VIEW_RAIL_M,
     )
 
+    grip_rails = (0.0, 0.2, 0.325, 0.45, 0.65)
     for scene_id in ("mavis_v2_kitchen", "mavis_v2"):
         for mic in (False, True):
             scene = sim.REGISTRY.build(scene_id, SceneOverrides(microphones={"view": mic}))
             twin = sim.DigitalTwin(scene, inflation_m=0.025)
-            report = twin.check(
-                {a: [*q, KITCHEN_RAIL_M[a]] for a, q in KITCHEN_POSTURE_RAD.items()}
-            )
-            assert not report.blocked, (scene_id, mic, report.pairs)
+            for grip_rail in grip_rails:
+                rails = {"view": VIEW_RAIL_M, "grip": grip_rail}
+                report = twin.check({a: [*q, rails[a]] for a, q in KITCHEN_POSTURE_RAD.items()})
+                assert not report.blocked, (scene_id, mic, grip_rail, report.pairs)
