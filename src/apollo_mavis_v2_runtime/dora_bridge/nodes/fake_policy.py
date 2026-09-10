@@ -537,13 +537,8 @@ class FakePolicyNode:
         s = self.session or {}
         frame = self.a.action_frame
         if frame is None:
-            # 14-dora §5 / 16-gello §7 (2026-09-09 review): with `external_arms` set the
-            # node's frame MUST be the frame of external_arms[0] (a gello session announces
-            # the Manipulation Arm first but accepts actions for the Perception Arm only);
-            # otherwise the first announced arm's frame, as before
             frames = s.get("frames") or {}
-            ext = [a for a in (s.get("external_arms") or []) if a in frames]
-            frame = frames[ext[0]] if ext else next(iter(frames.values()), "arm_base:grip")
+            frame = next(iter(frames.values()), "arm_base:grip")
         return json.dumps(
             {
                 "mavis_schema": MAVIS_SCHEMA,

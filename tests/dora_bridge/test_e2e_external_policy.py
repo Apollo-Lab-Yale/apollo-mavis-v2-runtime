@@ -79,17 +79,13 @@ def external(api: httpx.Client, srv) -> dict:
 class FakePolicy:
     """A ``fake_policy`` subprocess bound to the server's private daemon."""
 
-    def __init__(
-        self, server, *args: str, wait_spec: bool = True, frame_from_announce: bool = False
-    ) -> None:
+    def __init__(self, server, *args: str, wait_spec: bool = True) -> None:
         srv, cfg = server
         self.srv = srv
         info = httpx.get(f"{srv.http}/api/dora", timeout=10).json()
         # a real policy knows its training frame; the fake is told (the session's frames only
-        # reach the node through the `session` announce AFTER the session exists) - unless the
-        # test wants the node's own derivation from the announce (`external_arms`, 14-dora §5;
-        # the GELLO viewpoint e2e), in which case no --action-frame is passed at all
-        if "--action-frame" not in args and not frame_from_announce:
+        # reach the node through the `session` announce AFTER the session exists)
+        if "--action-frame" not in args:
             args = (*args, "--action-frame", SPEC["frames"]["arm0"])
         args = (*args, "--stats-out", str(cfg.dora.var_dir / "fake_stats.json"))
         self.proc = subprocess.Popen(

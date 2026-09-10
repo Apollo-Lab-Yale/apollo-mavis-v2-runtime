@@ -28,9 +28,6 @@ trainer = []
 # Microphone preview (phase-11): PortAudio over the ALSA `pulse` plugin; lazy-imported
 # in devices/microphone.py only. Needs apt libportaudio2 on the host.
 audio = ["sounddevice>=0.5"]
-# GELLO leader arm (phase-15; 16-gello D2): Dynamixel protocol 2.0 over the FT232H serial
-# adapter; lazy-imported in devices/gello.py only. Without it GET /api/gello says no_backend.
-gello = ["dynamixel-sdk>=3.7", "pyserial>=3.5"]
 dora = [
     "dora-rs>=1.0.1,<1.1",
     "dora-rs-cli>=1.0.1,<1.1",
@@ -71,8 +68,6 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "lerobot".msg = "lerobot is imported lazily inside apollo_mavis_v2_runtime.recorder only"
 "pysurvive".msg = "pysurvive is imported lazily inside apollo_mavis_v2_runtime.devices.tracker only"
 "sounddevice".msg = "sounddevice is imported lazily inside apollo_mavis_v2_runtime.devices.microphone only"
-"dynamixel_sdk".msg = "dynamixel_sdk is imported lazily inside apollo_mavis_v2_runtime.devices.gello only (16-gello D2)"
-"serial".msg = "pyserial is imported lazily inside apollo_mavis_v2_runtime.devices.gello only (16-gello D2)"
 "dora".msg = "dora is imported lazily inside apollo_mavis_v2_runtime.dora_bridge only (14-dora §1)"
 "pyarrow".msg = "pyarrow is imported inside apollo_mavis_v2_runtime.dora_bridge, the dagger spool and the recorder (episode frames.parquet) only"
 
@@ -88,8 +83,6 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "src/apollo_mavis_v2_runtime/devices/tracker.py" = ["TID251"]
 # The microphone device module is the one sanctioned (lazy) sounddevice import site.
 "src/apollo_mavis_v2_runtime/devices/microphone.py" = ["TID251"]
-# The GELLO leader device module is the one sanctioned (lazy) dynamixel_sdk / serial import site.
-"src/apollo_mavis_v2_runtime/devices/gello.py" = ["TID251"]
 # The dagger package owns the live Policy object (12-dagger §1) and the
 # trainer process; torch (and spool parquet reads) are sanctioned here.
 "src/apollo_mavis_v2_runtime/dagger/*" = ["TID251"]

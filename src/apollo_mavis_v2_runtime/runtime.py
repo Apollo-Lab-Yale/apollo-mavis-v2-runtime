@@ -6,26 +6,12 @@ import time
 import uuid
 from concurrent.futures import Future
 
-import numpy as np
 from apollo_mavis_v2_core import Command, CommandResult, HeldState, ProfileStore
-from apollo_mavis_v2_core.protocol import (
-    ArmMaintenanceResult,
-    GelloCalibrateRequest,
-    GelloCalibrateResult,
-    GelloInfo,
-    GelloPreviewRequest,
-    GelloPreviewResult,
-    MicrophoneInfo,
-)
+from apollo_mavis_v2_core.protocol import ArmMaintenanceResult, MicrophoneInfo
 
 from .bus import RuntimeBus
 from .config import RuntimeConfig
-from .devices.gello import GelloReader, device_telemetry_fields
-from .devices.hardware_monitor import (
-    CONNECTED_STATUSES,
-    MAINTENANCE_TIMEOUT_S,
-    HardwareStateMonitor,
-)
+from .devices.hardware_monitor import MAINTENANCE_TIMEOUT_S, HardwareStateMonitor
 from .devices.hardware_probe import HardwareProbe
 from .devices.microphone import MicrophoneReader, to_info
 from .devices.rail_homing import RailHomingService
@@ -33,10 +19,7 @@ from .devices.rail_sweep import RailSweepChecker
 from .devices.tracker import TrackerReader, TrackerSettings
 from .devices.tracker_calibration import TrackerCalibration, apply_persisted_yaw
 from .dora_bridge.wiring import DoraWiring
-from .errors import GelloUnavailableError, MaintenanceUnavailableError
-from .gello import FOLLOWER_ARM_ID
-from .gello.calibration import GelloCalibrationStore, match_arm_offsets
-from .gello.preview import GelloPreviewService
+from .errors import MaintenanceUnavailableError
 from .session.manager import SessionManager
 from .streams.hub import VideoHub
 from .streams.twin_overlay import TwinOverlayRenderer
@@ -44,9 +27,8 @@ from .streams.twin_overlay import TwinOverlayRenderer
 
 class Runtime:
     """Process-singleton: bus, video hub, profile store, tracker reader,
-    microphone reader, GELLO leader reader (phase-15), hardware probe, read-only
-    hardware monitor + twin alignment overlays (phase-09a), tracker calibration
-    FSM, session manager."""
+    microphone reader, hardware probe, read-only hardware monitor + twin
+    alignment overlays (phase-09a), tracker calibration FSM, session manager."""
 
     def __init__(self, cfg: RuntimeConfig, *, monitor_factory=None) -> None:
         """``monitor_factory`` is the phase-09a test seam: replaces the hardware
@@ -72,16 +54,6 @@ class Runtime:
             cfg.microphone, self.bus.microphone, frame_hz=cfg.telemetry_hz
         )
         self.microphone.start()  # no-op unless enabled with a backend
-        # GELLO leader arm (phase-15; 16-gello §4 / D2): Runtime-owned like the tracker so
-        # GET /api/gello and telemetry.gello show the leader before any session exists.
-        # Started iff backend != none; the calibration store is the file the session-less
-        # POST /api/gello/calibrate ops write and the reader maps with.
-        self.gello_calibration = GelloCalibrationStore(cfg.gello.calibration_path)
-        self.gello = GelloReader(
-            cfg.gello, self.bus.gello, calibration_store=self.gello_calibration
-        )
-        if cfg.gello.backend != "none":
-            self.gello.start()
         # Hardware reachability probe (phase-11): TCP 502 connect-and-close per
         # configured hardware arm; paused while a hardware session runs.
         hw = cfg.workcell_config("hardware")
@@ -125,15 +97,6 @@ class Runtime:
         # Data collection (04-runtime §10.5, D8): the recorder builds its per-episode
         # audio sink from THIS reader; without this line no episode ever gets audio.
         self.manager.microphone = self.microphone
-        # GELLO Manipulation (phase-15; 16-gello §5): the manager's launch check and the
-        # session-less POST /api/gello/preview share ONE cached kitchen twin per (kind,
-        # scene) and the leader reader; the hardware posture comes from the read-only
-        # monitor's sample (rail flip / fallback like the frozen twin arms).
-        self.gello_preview = GelloPreviewService(
-            cfg, self.gello, hardware_arm_q=self._gello_hardware_arm_q
-        )
-        self.manager.gello_reader = self.gello
-        self.manager.gello_preview = self.gello_preview
         # phase-09d: home_rail with a planned pre-positioning motion. The service decides
         # dry-run / synchronous 09c homing / asynchronous RailHomingJob (202) / refused,
         # registers itself as the monitor's ``jobs`` (maintenance_busy + progress) and
@@ -142,16 +105,13 @@ class Runtime:
             cfg, self.hardware_monitor, self.rail_sweep, self.manager
         )
         # Twin alignment overlays (phase-09a): <camera_id>_align streams built from
-        # the manager's hardware camera previews + the monitor's samples. phase-15
-        # (16-gello D6 / §10): ``twin_overlay.scene`` overrides the workcell's twin scene
-        # (the lab render points it at ``mavis_v2_kitchen`` so the appliance outlines can
-        # be aligned session-less); the gate / sweep twins are NOT affected.
+        # the manager's hardware camera previews + the monitor's samples.
         self.twin_overlay: TwinOverlayRenderer | None = None
         if hw is not None:
             self.twin_overlay = TwinOverlayRenderer(
                 cfg.twin_overlay,
                 hw,
-                cfg.twin_overlay.scene or hw.digital_twin_scene,
+                hw.digital_twin_scene,
                 self.hardware_monitor,
                 self.manager.hardware_camera_frame,
                 self.hub,
@@ -214,8 +174,6 @@ class Runtime:
         self.tracker.stop()
         self.hardware_probe.stop()
         self.microphone.stop()
-        self.gello_preview.close()  # the render thread's GL contexts, closed in-thread
-        self.gello.stop()
 
     def _hardware_session_active(self) -> bool:
         """Hand-over predicate for the monitor / probe / overlay: a hardware
@@ -312,202 +270,6 @@ class Runtime:
         if not self.cfg.microphone.enabled:
             return []
         return [to_info(self.microphone.status())]
-
-    # -- GELLO leader (REST; phase-15, 16-gello §4 / §9.2 / D10) ----------------------------
-    def gello_scene_label(self) -> str:
-        """Title of ``gello.scene_id`` from the sim registry (``mavis_v2_kitchen`` ->
-        "APOLLO MAVIS V2 Kitchen (GELLO)"); the id itself when the sim extra / scene is
-        missing."""
-        scene_id = self.cfg.gello.scene_id
-        try:
-            from apollo_mavis_v2_sim import REGISTRY
-
-            meta = REGISTRY.meta(scene_id)
-        except Exception:  # noqa: BLE001 - no sim extra / unknown id: never a 500
-            return scene_id
-        return getattr(meta, "title", None) or getattr(meta, "description", None) or scene_id
-
-    def gello_info(self) -> GelloInfo:
-        """``GET /api/gello``: the device half of the GELLO block (16-gello §8.3) plus the
-        launch-sheet facts - the twin scene the GELLO card launches, the Perception Arm's
-        hold posture, the calibration file and its echo, ``hardware_admitted`` (D8)."""
-        st = self.gello.status()
-        g = self.cfg.gello
-        return GelloInfo(
-            **device_telemetry_fields(st),
-            scene_id=g.scene_id,
-            scene_label=self.gello_scene_label(),
-            view_posture_rad=[float(x) for x in g.view_posture_rad],
-            view_rail_m=float(g.view_rail_m),
-            calibration_path=str(g.calibration_path),
-            hardware_admitted=True,  # 16-gello D8: gello is admitted on hardware
-            gripper_open_rad=st.gripper_open_rad,
-            gripper_closed_rad=st.gripper_closed_rad,
-        )
-
-    def _gello_monitor_sample(self, arm: str):
-        """The read-only monitor's FRESH sample of ``arm`` for the GELLO preview / launch
-        check / ``match_arm`` on the hardware kind: ``(sample, "")`` only while the monitor
-        reports a connected status (``CONNECTED_STATUSES``, the ``_validate_hardware`` rule)
-        AND the sample is younger than ``hardware_monitor.stale_s``; else ``(None, why)``.
-        2026-09-09 review: the hardware ``ArmStateMonitor`` never clears its last sample,
-        so after a lost box / a paused monitor ``snapshot()`` kept returning an OUTDATED
-        posture and the preview said ``clear`` while the launch 409'd (``match_arm`` would
-        have stored offsets against a stale posture)."""
-        monitor = self.hardware_monitor
-        status, detail = monitor.status_of(arm)
-        sample = monitor.snapshot().get(arm)
-        t_mono = getattr(sample, "t_mono", None) if sample is not None else None
-        age = None if t_mono is None else time.monotonic() - float(t_mono)
-        stale_s = float(self.cfg.hardware_monitor.stale_s)
-        if (
-            status not in CONNECTED_STATUSES
-            or sample is None
-            or getattr(sample, "q", None) is None
-            or age is None
-            or age > stale_s
-        ):
-            if sample is not None and age is not None and age > stale_s:
-                detail = (detail + "; " if detail else "") + f"sample {age:.1f} s old"
-            return None, (
-                "no fresh monitor sample of the Manipulation Arm "
-                f"(monitor {status}{': ' + detail if detail else ''})"
-            )
-        return sample, ""
-
-    def _gello_hardware_arm_q(self) -> tuple[np.ndarray | None, str]:
-        """The Manipulation Arm's CURRENT joints + rail slot (twin convention) from the
-        read-only monitor's newest FRESH sample (:meth:`_gello_monitor_sample`), for the
-        GELLO launch check / preview on the hardware kind (16-gello §5.1 / §5.4);
-        ``(None, why)`` when unknown - the preview then reports ``no_workcell``."""
-        from .session.hardware import frozen_state
-
-        arm = FOLLOWER_ARM_ID
-        hw = self.cfg.workcell_config("hardware")
-        if hw is None:
-            return None, "no hardware workcell is configured"
-        sample, why = self._gello_monitor_sample(arm)
-        if sample is None:
-            return None, why
-        has_rail = True
-        scene_id = self.cfg.gello.scene_id
-        try:
-            from apollo_mavis_v2_sim import REGISTRY
-
-            has_rail = bool(REGISTRY.meta(scene_id).rail.get(arm, True))
-        except Exception:  # noqa: BLE001 - no sim extra: assume the lab's railed arm
-            pass
-        state, _note = frozen_state(
-            arm,
-            sample,
-            has_rail=has_rail,
-            rail_fallback_m=self.cfg.twin_overlay.rail_fallback_m,
-            rail_flip=self.cfg.hardware_session.rail_flip,
-        )
-        return np.asarray(state.q, dtype=np.float64), ""
-
-    def gello_preview_result(self, req: GelloPreviewRequest) -> GelloPreviewResult:
-        """``POST /api/gello/preview`` (16-gello §5.4): the launch check on the cached kitchen
-        twin + the PNG; 200 with the status for every posture, :class:`GelloUnavailableError`
-        (409) only when the runtime has no workcell of ``req.kind``. Never moves anything."""
-        return self.gello_preview.preview(req)
-
-    def _gello_arm_joints(self, kind: str) -> np.ndarray:
-        """The Manipulation Arm's CURRENT 7 joints for ``match_arm``: the read-only
-        monitor's newest FRESH sample on hardware (:meth:`_gello_monitor_sample`), the
-        parked / idle sim posture the previews show in sim. Raises
-        :class:`GelloUnavailableError` when unknown."""
-        arm = FOLLOWER_ARM_ID
-        if kind == "hardware":
-            if self.cfg.workcell_config("hardware") is None:
-                raise GelloUnavailableError("no hardware workcell is configured")
-            sample, why = self._gello_monitor_sample(arm)
-            if sample is None:
-                raise GelloUnavailableError(f"{why} - nothing to match against")
-            return np.asarray(sample.q, dtype=np.float64)[:7]
-        if self.cfg.workcell_config("sim") is None:
-            raise GelloUnavailableError("no sim workcell is configured")
-        q = self.manager.idle_sim_q().get(arm)
-        if q is None:
-            raise GelloUnavailableError(
-                "the sim workcell has no Manipulation Arm posture to match against "
-                f"(arm {arm!r} not in the preview scene, or the previews are not running)"
-            )
-        return np.asarray(q, dtype=np.float64)[:7]
-
-    def gello_calibrate(self, req: GelloCalibrateRequest) -> GelloCalibrateResult:
-        """``POST /api/gello/calibrate`` (16-gello §4 / D10), session-less.
-
-        Refused (:class:`GelloUnavailableError`, 409) while a session exists or is
-        starting, and - for the three reading ops - when the leader has no fresh sample
-        (``clear`` needs no leader). The reading ops accept an UNCALIBRATED sample
-        (``fresh_sample(require_calibrated=False)``: they exist to create the calibration
-        - 2026-09-09 review; a stale or jump-flagged sample still 409s). ``match_arm`` stores
-        ``round((raw - sign * q_arm) / (pi/2)) * pi/2`` per joint from the leader's raw
-        joints and the Manipulation Arm's current joints (``kind`` picks the source);
-        ``gripper_open`` / ``gripper_closed`` store the raw gripper reading; ``clear``
-        deletes the file. The reader reloads the file at once; the result echoes the
-        calibration now in force (also in ``GET /api/gello``)."""
-        if self.manager.session_active:
-            raise GelloUnavailableError(
-                "GELLO calibration is not available while a session is active or starting - "
-                "end the session first"
-            )
-        store = self.gello_calibration
-        if req.op == "clear":
-            existed = store.clear()
-            self.gello.reload_calibration()
-            return GelloCalibrateResult(
-                ok=True,
-                detail=(
-                    f"calibration cleared ({store.path})"
-                    if existed
-                    else f"no calibration file to clear ({store.path})"
-                ),
-            )
-        sample = self.gello.fresh_sample(require_calibrated=False)
-        if sample is None:
-            st = self.gello.status()
-            raise GelloUnavailableError(
-                f"no fresh GELLO leader sample (status {st.status}"
-                f"{': ' + st.detail if st.detail else ''})"
-            )
-        if req.op == "match_arm":
-            q_arm = self._gello_arm_joints(req.kind)
-            offsets = match_arm_offsets(sample.q_raw, q_arm, self.cfg.gello.joint_signs)
-            cal = store.update(joint_offsets_rad=tuple(float(x) for x in offsets))
-            self.gello.reload_calibration()
-            residual = np.asarray(self.cfg.gello.joint_signs, dtype=np.float64) * (
-                sample.q_raw - offsets
-            ) - q_arm
-            detail = (
-                f"joint offsets stored ({store.path}); residual vs the {req.kind} Manipulation "
-                f"Arm max {float(np.max(np.abs(residual))):.3f} rad"
-            )
-            if self.cfg.gello.joint_offsets_rad is not None:
-                detail += (
-                    " - NOTE gello.joint_offsets_rad is set in the config and overrides the file"
-                )
-        else:  # gripper_open / gripper_closed
-            if sample.gripper_raw is None:
-                raise GelloUnavailableError(
-                    "the leader has no gripper channel (gello.gripper_id is null)"
-                )
-            field = "gripper_open_rad" if req.op == "gripper_open" else "gripper_closed_rad"
-            cal = store.update(**{field: float(sample.gripper_raw)})
-            self.gello.reload_calibration()
-            detail = f"{field} = {float(sample.gripper_raw):.4f} rad stored ({store.path})"
-        return GelloCalibrateResult(
-            ok=True,
-            detail=detail,
-            joint_offsets_rad=(
-                [float(x) for x in cal.joint_offsets_rad]
-                if cal.joint_offsets_rad is not None
-                else None
-            ),
-            gripper_open_rad=cal.gripper_open_rad,
-            gripper_closed_rad=cal.gripper_closed_rad,
-        )
 
     # -- control-WS plumbing (no motion work here; 04-runtime §13.2) -------------
     def on_keys(self, seq: int, held: list[str]) -> None:

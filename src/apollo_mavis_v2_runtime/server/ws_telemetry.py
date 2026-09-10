@@ -11,8 +11,6 @@ from apollo_mavis_v2_core.protocol import (
     ClearanceItem,
     ControllerTelemetry,
     DatasetsTelemetry,
-    GelloTelemetry,
-    GelloViewpointTelemetry,
     HardwareMonitorTelemetry,
     MicrophoneTelemetry,
     PoseMsg,
@@ -24,7 +22,6 @@ from apollo_mavis_v2_core.protocol import (
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ..control.tracker_teleop import align_pose
-from ..devices.gello import device_telemetry_fields
 from ..devices.microphone import to_telemetry
 from ..devices.tracker import ControllerState
 
@@ -110,47 +107,6 @@ def build_microphone_telemetry(runtime, now: float) -> MicrophoneTelemetry | Non
     if not runtime.cfg.microphone.enabled:
         return None
     return to_telemetry(runtime.microphone.status(now))
-
-
-def build_gello_telemetry(runtime, snap, now: float) -> GelloTelemetry | None:
-    """``gello`` block (phase-15; 16-gello §8.3): the device half from the Runtime-owned
-    ``GelloReader`` (pre-session too, like ``tracker`` / ``microphone``; the same status
-    feeds ``GET /api/gello``) + the session half from ``session_extra["gello"]`` (written by
-    the gello loop: ``state``, ``state_detail``, ``lag_rad``, ``max_lag_rad``,
-    ``engaged_arm``, ``viewpoint {mode, attached, policy_id, detail, paused}``,
-    ``paused_latched`` - the last two since the 2026-09-09 review) - None-valued without a
-    gello session. ``None`` only when the runtime has no reader."""
-    reader = getattr(runtime, "gello", None)
-    if reader is None:
-        return None
-    dev = reader.status(now)
-    extra = (snap.session_extra.get("gello") if snap is not None else None) or {}
-    vp = extra.get("viewpoint")
-    viewpoint = (
-        GelloViewpointTelemetry(
-            mode=vp["mode"],
-            attached=bool(vp.get("attached", False)),
-            policy_id=vp.get("policy_id"),
-            detail=str(vp.get("detail", "") or ""),
-            paused=bool(vp.get("paused", False)),
-        )
-        if isinstance(vp, dict) and "mode" in vp
-        else None
-    )
-    latched = extra.get("paused_latched")
-    lag = extra.get("lag_rad")
-    return GelloTelemetry(
-        **device_telemetry_fields(dev),
-        state=extra.get("state"),
-        state_detail=str(extra.get("state_detail", "") or ""),
-        lag_rad=[float(x) for x in lag] if lag is not None else None,
-        max_lag_rad=(
-            float(extra["max_lag_rad"]) if extra.get("max_lag_rad") is not None else None
-        ),
-        engaged_arm=extra.get("engaged_arm"),
-        viewpoint=viewpoint,
-        paused_latched=None if latched is None else bool(latched),
-    )
 
 
 def build_hardware_monitor_telemetry(runtime) -> HardwareMonitorTelemetry:
@@ -265,7 +221,6 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
         external=build_external_telemetry(runtime, now),
         hardware_monitor=build_hardware_monitor_telemetry(runtime),
         datasets=build_datasets_telemetry(runtime),
-        gello=build_gello_telemetry(runtime, snap, now),
     )
 
 
@@ -294,5 +249,4 @@ __all__ = [
     "build_external_telemetry",
     "build_hardware_monitor_telemetry",
     "build_datasets_telemetry",
-    "build_gello_telemetry",
 ]

@@ -10,7 +10,7 @@ from typing import Literal
 
 import yaml
 from apollo_mavis_v2_core import ConfigError, WorkcellConfig
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 # -- self-contained paths (04-runtime §14) --------------------------------------------
 # Every filesystem path in the config resolves inside the workspace so a fresh
@@ -273,11 +273,6 @@ class TwinOverlayConfig(BaseModel):
     )  # used while the track is not homed
     principal_offset_px: dict[str, tuple[float, float]] = Field(default_factory=dict)
     stream_suffix: str = "_align"
-    # phase-15 (16-gello D6 / §9.1): the twin scene the overlays render. None = the
-    # hardware workcell's ``digital_twin_scene`` (today's behaviour); the lab render may
-    # set ``mavis_v2_kitchen`` so the ``*_align`` streams draw the appliance outlines and
-    # the kitchen's alignment against the real wrist cameras can be checked session-less.
-    scene: str | None = None
 
 
 class HardwareSessionConfig(BaseModel):
@@ -642,101 +637,6 @@ class TrackerConfig(BaseModel):
         )
 
 
-GELLO_BAUD_SCAN: tuple[int, ...] = (57_600, 1_000_000, 2_000_000, 3_000_000, 4_000_000)
-# GELLO hold posture of the Perception Arm (16-gello §0 item 3): J1-J7 rad, the posture the
-# arm stood in on 2026-09-09 when the kitchen was measured (identical to the controller
-# reading to 1e-3 rad). DIFFERENT from the seeded initial condition of Teleop / Collect.
-GELLO_VIEW_POSTURE_RAD: tuple[float, ...] = (2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029)
-
-
-class GelloConfig(BaseModel):
-    """GELLO leader arm (phase-15; 16-gello §4 / §9.1): the passive xArm7-shaped leader
-    whose Dynamixel servos are read over one USB serial adapter and drive the
-    Manipulation Arm in joint space in the ``gello`` session mode.
-
-    ``backend``: ``none`` (repo default; ``GET /api/gello`` says ``no_backend``), ``fake``
-    (scripted posture at ``poll_hz``, moved by ``GelloReader.fake_set`` - tests, sim) or
-    ``dynamixel`` (the real bus; needs the ``[gello]`` extra). ``port`` is the serial node
-    (a ``/dev/serial/by-id/...`` symlink is fine); when ``usb_serial`` is set the
-    ``ttyUSB*`` node whose sysfs USB parent carries that serial wins (the cameras'
-    by-serial precedent; the lab adapter is ``FTAKROCJ``). ``baud`` None = scan
-    :data:`GELLO_BAUD_SCAN` with a broadcast ping per rate at connect.
-
-    ``joint_ids`` / ``gripper_id`` are the servo ids read in one ``GroupSyncRead``
-    (``gripper_id`` None = no gripper channel). ``joint_signs`` (operator-owned once set)
-    and ``joint_offsets_rad`` map the raw reading: ``q = sign * (raw - offset)``;
-    ``joint_offsets_rad`` None = read ``calibration_path`` (written by
-    ``POST /api/gello/calibrate {op: match_arm}``); a config value overrides the file.
-
-    Engagement (16-gello §6.1): ``stale_s`` (sample older -> ``no_leader``),
-    ``max_jump_rad`` (consecutive raw jump above this -> invalid sample),
-    ``engage_tol_rad`` (leader within this of the measured arm -> ``tracking``),
-    ``leash_rad`` (leader farther than this from the command while tracking ->
-    ``out_of_sync``), ``gripper_quantum`` (gripper fraction rounding),
-    ``max_joint_vel_rad_s`` (the follower's per-joint cap in SIM too; hardware already
-    has it in ``ServoLimits``). ``view_posture_rad`` / ``view_rail_m`` is the Perception
-    Arm's GELLO hold posture; ``scene_id`` the twin the GELLO card launches (hidden
-    ``mavis_v2_kitchen``, sim and hardware).
-    """
-
-    backend: Literal["none", "fake", "dynamixel"] = "none"
-    port: str = "/dev/ttyUSB0"
-    usb_serial: str | None = None  # e.g. FTAKROCJ -> resolve the ttyUSB node by sysfs USB serial
-    baud: int | None = Field(default=None, gt=0)  # None = scan GELLO_BAUD_SCAN
-    joint_ids: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
-    gripper_id: int | None = 8  # None = no gripper channel
-    joint_signs: list[int] = Field(default_factory=lambda: [1] * 7)  # operator-owned once set
-    joint_offsets_rad: list[float] | None = None  # None = calibration file
-    poll_hz: float = Field(default=100.0, gt=0.0, le=1000.0)
-    stale_s: float = Field(default=0.2, gt=0.0)
-    max_jump_rad: float = Field(default=0.5, gt=0.0)
-    engage_tol_rad: float = Field(default=0.10, gt=0.0)
-    leash_rad: float = Field(default=0.80, gt=0.0)
-    gripper_quantum: float = Field(default=0.01, gt=0.0, le=1.0)
-    max_joint_vel_rad_s: float = Field(default=0.6, gt=0.0)
-    view_posture_rad: list[float] = Field(default_factory=lambda: list(GELLO_VIEW_POSTURE_RAD))
-    view_rail_m: float = Field(default=0.0, ge=0.0, le=0.65)
-    scene_id: str = "mavis_v2_kitchen"
-    calibration_path: Path = Path("${APOLLO_HOME}/var/gello_calibration.json")
-
-    @field_validator("joint_ids")
-    @classmethod
-    def _seven_unique_ids(cls, v: list[int]) -> list[int]:
-        if len(v) != 7 or len(set(v)) != 7 or any(i < 0 or i > 252 for i in v):
-            raise ValueError("joint_ids must be 7 distinct Dynamixel ids (0..252)")
-        return v
-
-    @field_validator("gripper_id")
-    @classmethod
-    def _gripper_id_range(cls, v: int | None) -> int | None:
-        if v is not None and (v < 0 or v > 252):
-            raise ValueError("gripper_id must be a Dynamixel id (0..252) or null")
-        return v
-
-    @field_validator("joint_signs")
-    @classmethod
-    def _seven_signs(cls, v: list[int]) -> list[int]:
-        if len(v) != 7 or any(x not in (1, -1) for x in v):
-            raise ValueError("joint_signs must be 7 entries of +1 / -1")
-        return v
-
-    @field_validator("joint_offsets_rad", "view_posture_rad")
-    @classmethod
-    def _seven_floats(cls, v: list[float] | None) -> list[float] | None:
-        if v is not None and len(v) != 7:
-            raise ValueError("expected 7 joint values (J1-J7, rad)")
-        return v
-
-    @model_validator(mode="after")
-    def _gripper_id_distinct(self) -> GelloConfig:
-        if self.gripper_id is not None and self.gripper_id in self.joint_ids:
-            raise ValueError("gripper_id must not be one of joint_ids")
-        return self
-
-    def model_post_init(self, __context) -> None:
-        object.__setattr__(self, "calibration_path", _resolve_path(self.calibration_path))
-
-
 class LoggingConfig(BaseModel):
     """Process logging (2026-09-07; 04-runtime §14 "Logging").
 
@@ -923,7 +823,6 @@ class RuntimeConfig(BaseModel):
     dora: DoraConfig = DoraConfig()  # phase-12 (14-dora §12); enabled: false by default
     online_dagger: OnlineDaggerRuntimeConfig = OnlineDaggerRuntimeConfig()  # phase-14
     #   (15-online-dagger §7)
-    gello: GelloConfig = GelloConfig()  # phase-15 (16-gello §9.1); backend none by default
 
     def model_post_init(self, __context) -> None:
         for name in ("profiles_dir", "datasets_root", "checkpoints_root", "calibration_dir"):

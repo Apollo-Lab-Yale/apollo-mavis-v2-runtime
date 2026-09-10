@@ -105,9 +105,7 @@ def test_core_spellings_match_the_shared_contract_golden():
         "session_name", "session_dir", "rollouts_dir",
     ]
     assert golden["policy_spec_announce_fields"][-1] == "capabilities"
-    # phase-15 (16-gello D5 / §7): `external_arms` (the arms this session accepts policy_action
-    # for; [] = every session arm) is appended LAST, after the phase-14 `online_dagger`
-    assert golden["session_announce_fields"][-2:] == ["online_dagger", "external_arms"]
+    assert golden["session_announce_fields"][-1] == "online_dagger"
     assert golden["runtime_inputs"][-1] == "policy_trainer_status"
     assert golden["policy_outputs"][-1] == "trainer_status"
     assert golden["event_kinds"][-1] == "train_now" and len(golden["event_kinds"]) == 10

@@ -207,8 +207,7 @@
     "dataset_root",
     "run_id",
     "deprecated_keys",
-    "online_dagger",
-    "external_arms"
+    "online_dagger"
   ],
   "tick_timer": "dora/timer/hz/10"
 }

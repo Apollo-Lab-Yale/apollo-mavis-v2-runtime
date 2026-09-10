@@ -256,16 +256,11 @@ def test_telemetry_pre_session_idle(client):
         assert msg["hardware_monitor"] == {
             "enabled": False, "paused": False, "arms": [], "overlays": [],
         }
-        # phase-15 (16-gello §8.3): the gello block is appended LAST and always present -
-        # the device half (backend none here -> no_backend) with a None-valued session half
-        assert list(msg)[-7:] == [
+        assert list(msg)[-6:] == [
             "session", "tracker", "microphone", "external", "hardware_monitor", "datasets",
-            "gello",
         ]
         assert msg["external"]["state"] == "disabled"  # dora.enabled false (phase-12)
         assert msg["datasets"] is None  # no export ran in this process
-        assert msg["gello"]["backend"] == "none" and msg["gello"]["status"] == "no_backend"
-        assert msg["gello"]["state"] is None and msg["gello"]["viewpoint"] is None
 
 
 # -- Online DAgger (phase-14; 15-online-dagger §3, §7, §9) --------------------------------------
@@ -447,14 +442,6 @@ def test_gate_ops_and_train_now_are_nacked_outside_their_sessions(client, sessio
             assert ws.receive_json() == {
                 "t": "ack", "name": name, "ok": False,
                 "detail": "takeover not available in teleop",
-            }
-        # phase-15 (16-gello §8.2; 2026-09-09 review): the GELLO Cockpit buttons outside a
-        # gello session nack with the documented mode reason, not "unknown op"
-        for name in ("gello_pause", "gello_resume"):
-            ws.send_json({"t": "action", "name": name})
-            assert ws.receive_json() == {
-                "t": "ack", "name": name, "ok": False,
-                "detail": "not a GELLO Manipulation session",
             }
         ws.send_json({"t": "action", "name": "train_now", "args": {"x": 1}})
         ack = ws.receive_json()

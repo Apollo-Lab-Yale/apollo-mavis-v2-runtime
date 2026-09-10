@@ -100,27 +100,6 @@ speed, so the manager waits until ``workcell.states()[arm].q`` is within
 (:meth:`SessionManager._await_arrival`) before the next arm is submitted - and reports
 ``stalled`` when it never gets there. The loop refuses a plan carrying more than one
 arm, so the incident can not recur through ``execute_plan`` either.
-
-GELLO MANIPULATION (phase-15, 2026-09-09; 16-gello §5): ``mode: gello`` on both workcells
-(D8 admits it on hardware; Online DAgger / inference stay refused there). ``create()``
-runs :meth:`SessionManager._check_gello` BEFORE any side effect — both arms in the
-session, a fresh calibrated leader sample, ``q_goal = {grip: unwrap(leader) + the measured
-rail, view: the GELLO hold posture}`` inside the joint limits and collision-free on the
-kitchen twin (``GelloPreviewService.evaluate``, the same check ``POST /api/gello/preview``
-runs), the viewpoint node when ``viewpoint: external`` — and the bring-up builds a
-``GelloLoop`` (sim: the mode branch of ``_bringup_sim``; hardware: ``connect_hardware_rig``
-with ``tracker=False`` and a loop factory) over a twin whose ``graspable`` handles are
-whitelisted against the Manipulation Arm's gripper (D7). The START MOTION replaces
-``start_from`` (which must be ``keep_current``): planned on the session twin (hardware:
-inside bring-up like ``_plan_profile_start``; sim: in ``_start_from_worker``) and executed
-through the same ``_start_from_worker`` -> ``_execute_arms`` path, one arm at a time in
-``arm_order``, inside the loop's ``gello_motion`` window so the engage machine reads
-``motion`` for the whole sequence and the engage rule runs once on arrival; a plan failure
-leaves the arms where they are, the session RUNNING, GELLO ``out_of_sync`` and the reason
-in ``fault_detail``. ``R`` / ``goto_profile`` / the exit return force ``paused`` first
-(:meth:`_return_to_initial_motion`) and leave it paused. The viewpoint node
-(``gello/viewpoint.py``) is announced as ``external_arms: ["view"]`` with a view-only
-action layout (``_session_facts``) and stopped at teardown.
 """
 
 from __future__ import annotations
@@ -164,7 +143,6 @@ from ..control.tracker_teleop import TrackerTeleop
 from ..devices.hardware_monitor import CONNECTED_STATUSES, MONITOR_JOIN_TIMEOUT_S
 from ..devices.tracker import TrackerSettings
 from ..errors import MaintenanceUnavailableError, SessionError, SessionNotFoundError
-from ..gello import FOLLOWER_ARM_ID, VIEW_ARM_ID
 from ..recorder.datasets import DatasetStore
 from ..safety.gate import NullGate, SafetyGate
 from ..safety.supervisor import SafetySupervisor
@@ -191,8 +169,6 @@ if TYPE_CHECKING:
     from ..devices.hardware_monitor import HardwareStateMonitor
     from ..devices.hardware_probe import HardwareProbe
     from ..dora_bridge.wiring import DoraWiring
-    from ..gello.preview import Evaluation, GelloPreviewService
-    from ..gello.viewpoint import ViewpointSource
     from ..streams.twin_overlay import TwinOverlayRenderer
 
 logger = logging.getLogger(__name__)
@@ -337,8 +313,6 @@ class ActiveSession:
     planned_start: tuple[dict, dict] | None = None
     # phase-14: the Online DAgger coordinator + its serial I/O worker (None otherwise)
     online_dagger: _OnlineDagger | None = None
-    # phase-15 (16-gello §5): what a GELLO Manipulation session owns beyond the loop
-    gello: _GelloSession | None = None
 
     def notice(self, arms_carry_faults: bool = False) -> str:
         """``SessionTelemetry.fault_detail`` / ``SessionInfo.fault_detail``: the
@@ -357,28 +331,6 @@ class _ProfileMotion:
     (:meth:`SessionManager._claim_profile_motion`)."""
 
     label: str
-
-
-@dataclass
-class _GelloSession:
-    """What a GELLO Manipulation session owns beyond its ``GelloLoop`` (16-gello §5): the
-    launch goals the twin check passed (``q_goal`` per arm, rail slot last), the viewpoint
-    source of the Perception Arm (None for ``viewpoint: hold`` — it never polls the bus)
-    and, when the hardware bring-up could not plan the launch motion, the reason (the
-    worker reports it and moves nothing)."""
-
-    scene_id: str
-    q_goal: dict[str, list[float]]
-    viewpoint: ViewpointSource | None = None
-    plan_failure: str | None = None
-
-    def close(self) -> None:
-        """Teardown: detach a live viewpoint source (``policy_reset{session_stop}``)."""
-        if self.viewpoint is not None:
-            try:
-                self.viewpoint.stop()
-            except Exception:  # noqa: BLE001
-                logger.exception("gello viewpoint stop failed")
 
 
 @dataclass
@@ -564,11 +516,6 @@ class SessionManager:
         self._parked_scene: str | None = None
         self._preview_scene_cache: dict[str, Any] = {}  # scene_id -> BuiltScene (previews)
         self._pending_preview: Any = None  # (RenderService, scene, cameras) warmed in teardown
-        # phase-15 (16-gello §5): the Runtime-owned leader reader and the launch-check /
-        # preview service (assigned after construction by ``Runtime.__init__``); None = a
-        # bare manager (unit tests): a gello POST is 409 "GELLO leader not available".
-        self.gello_reader: Any = None
-        self.gello_preview: GelloPreviewService | None = None
 
     # -- info ------------------------------------------------------------------
     @property
@@ -624,7 +571,6 @@ class SessionManager:
                     speed_scale=bp.spec.speed_scale,
                     policy_source=bp.spec.policy_source,
                     online_dagger=bp.spec.online_dagger,
-                    gello=bp.spec.gello,
                 )
             raise SessionNotFoundError("no active session")
         return SessionInfo(
@@ -639,7 +585,6 @@ class SessionManager:
             policy_source=s.spec.policy_source,  # phase-12 echo
             fault_detail=s.notice(),  # 2026-09-08: refused start_from / Go-to outcome
             online_dagger=s.spec.online_dagger,  # phase-14 echo
-            gello=s.spec.gello,  # phase-15 echo (16-gello §8.1)
         )
 
     def bringup_telemetry(self) -> list[ArmBringupTelemetry] | None:
@@ -720,18 +665,11 @@ class SessionManager:
                         f"rail homing in progress on the {arm_label(busy_arm)} - wait for it "
                         "to finish"
                     )
-                if spec.mode == "gello":  # 16-gello §5.1 item 1: one default scene everywhere
-                    spec = self._gello_spec_with_scene(spec)
                 wc = self._validate(spec)
                 if spec.mode in ("collect", "dagger"):
                     self._check_dataset_spec(spec, wc)  # before any box / camera is touched
                 if spec.kind == "hardware":
                     twin_scene, samples = self._validate_hardware(spec, wc)
-                gello_check = None
-                if spec.mode == "gello":  # 16-gello §5.1 / §9.2: before any side effect
-                    gello_check = self._check_gello(
-                        spec, wc, samples if spec.kind == "hardware" else None
-                    )
                 if spec.online_dagger is not None:
                     self._check_online_dagger(spec)  # 15-online-dagger §3/§7: before side effects
                 if spec.mode in ("collect", "dagger"):  # D6: dagger rollouts return too
@@ -747,21 +685,9 @@ class SessionManager:
                         # hardware_session_active from here on (monitor hand-over): after the
                         # refusal matrix, before the first side effect (monitor.pause())
                         self._creating_kind = spec.kind
-                        # the bring-up seams keep their pre-phase-15 signature for every other
-                        # mode (tests monkeypatch `_bringup_sim(spec, wc)`)
-                        session = (
-                            self._bringup_hardware(spec, wc, twin_scene, samples)
-                            if gello_check is None
-                            else self._bringup_hardware(
-                                spec, wc, twin_scene, samples, gello_check=gello_check
-                            )
-                        )
+                        session = self._bringup_hardware(spec, wc, twin_scene, samples)
                     else:
-                        session = (
-                            self._bringup_sim(spec, wc)
-                            if gello_check is None
-                            else self._bringup_sim(spec, wc, gello_check=gello_check)
-                        )
+                        session = self._bringup_sim(spec, wc)
                 except Exception:
                     if dora is not None:
                         dora.after_teardown()  # nothing came up: idle publishing resumes
@@ -1116,9 +1042,7 @@ class SessionManager:
             return None
         return session.recorder_thread.status()
 
-    def _bringup_sim(
-        self, spec: SessionSpec, wc: WorkcellConfig, gello_check: Evaluation | None = None
-    ) -> ActiveSession:
+    def _bringup_sim(self, spec: SessionSpec, wc: WorkcellConfig) -> ActiveSession:
         from apollo_mavis_v2_sim import (
             REGISTRY,
             DigitalTwin,
@@ -1162,8 +1086,6 @@ class SessionManager:
             allowed_pairs_extra=safety.allowed_pairs_extra,
             hysteresis_m=safety.hysteresis_m,  # the planner escapes the gate's band too
         )
-        if spec.mode == "gello":
-            self._whitelist_graspable(twin, scene)  # 16-gello D7: the handles vs the gripper
         if safety.safety_debug:
             gate = SafetyGate(twin, safety)
             pairs = default_collision_pairs(twin.scene, twin.allowed)
@@ -1190,31 +1112,13 @@ class SessionManager:
         session_id = uuid.uuid4().hex
         recorder_thread = None
         policy_session = None
-        gello_session: _GelloSession | None = None
         started: list = []  # what to stop, in reverse, if the bring-up fails after a start()
         try:
             if spec.mode == "collect":
                 recorder_thread = self._build_collect_recorder(
                     spec, session_cfg, workcell, scene, session_id
                 )
-            if spec.mode == "gello":
-                assert gello_check is not None
-                loop, gello_session = self._build_gello_loop(
-                    spec,
-                    workcell,
-                    scene,
-                    session_id,
-                    ik,
-                    kin,
-                    twin,
-                    supervisor,
-                    gello_check,
-                    kind="sim",
-                    control_cfg=self.cfg.control,
-                    bus=self.bus,
-                    gripper_arms=_gripper_arms(scene, spec.arms),
-                )
-            elif spec.mode in ("dagger", "inference"):
+            if spec.mode in ("dagger", "inference"):
                 loop, recorder_thread, policy_session = self._build_policy_stack(
                     spec,
                     session_cfg,
@@ -1263,8 +1167,6 @@ class SessionManager:
             online_dagger = getattr(policy_session, "online_dagger", None)
             if online_dagger is not None:
                 online_dagger.abandon()  # a fresh name stays usable (15-online-dagger §3)
-            if gello_session is not None:
-                gello_session.close()
             workcell.stop()
             rs.stop()
             self.start_previews()
@@ -1283,7 +1185,6 @@ class SessionManager:
             recorder_thread=recorder_thread,
             policy_session=policy_session,
             online_dagger=getattr(policy_session, "online_dagger", None),
-            gello=gello_session,
         )
         self.attach_fault_state(session)
         fps = self.cfg.video.session_fps
@@ -1308,9 +1209,8 @@ class SessionManager:
         """The hardware refusal matrix (409 via :class:`SessionError`), evaluated
         BEFORE anything is touched; returns ``(twin_scene, monitor samples)``.
 
-        teleop, collect or gello (phase-09c; data collection since 2026-09-07; GELLO
-        Manipulation since phase-15, 16-gello D8 - DAgger / Online DAgger / inference on
-        hardware stay 409) -> at least one arm, every arm in the hardware
+        teleop or collect (phase-09c; data collection since 2026-09-07 - DAgger /
+        inference on hardware stay 409) -> at least one arm, every arm in the hardware
         config AND in the twin scene, and - phase-09d - EVERY configured arm in
         the session ("hardware sessions include every configured arm") -> a
         resolvable ``digital_twin_scene`` -> no rail homing in flight on ANY arm
@@ -1322,9 +1222,9 @@ class SessionManager:
         -> ``start_from`` profile covers the arms.
         """
         self._require_armed()
-        if spec.mode not in ("teleop", "collect", "gello"):  # phase-15 D8 admits gello
+        if spec.mode not in ("teleop", "collect"):
             raise SessionError(
-                "hardware sessions support teleop, data collection and GELLO Manipulation only "
+                "hardware sessions support teleop and data collection only "
                 f"({spec.mode} on hardware: not yet)"
             )
         if not spec.arms:
@@ -1497,8 +1397,6 @@ class SessionManager:
         allow_unhomed_rail: bool = False,
         rail_hold: bool = False,
         status_cb: Callable | None = None,
-        loop_factory: Callable[..., ControlLoop] | None = None,
-        grasp_whitelist: bool = False,
     ) -> HardwareRig:
         """Connect ``arms`` of the hardware workcell and build the gated control
         stack around them (04-runtime §5 steps 2-11; the loop is NOT started).
@@ -1512,14 +1410,9 @@ class SessionManager:
         commands the carriage). Twin arms NOT in ``arms`` are frozen at their
         last monitor sample (09c D1). ``bus`` defaults to the runtime bus (the
         job passes a private one so no WS input can reach its loop);
-        ``tracker=False`` builds the loop without the tracker provider.
-        ``loop_factory(workcell, control_cfg, bus, supervisor, arms, **common)``
-        (phase-15) replaces the plain ``ControlLoop`` - the GELLO bring-up passes one
-        building a ``GelloLoop``; ``grasp_whitelist`` whitelists the twin scene's
-        ``graspable`` geoms against the Manipulation Arm's gripper (16-gello D7) before
-        the gate / IK pairs are derived. The monitor is paused + joined here; on ANY
-        failure the workcell is stopped again and the exception propagates - the caller
-        resumes the monitor.
+        ``tracker=False`` builds the loop without the tracker provider. The
+        monitor is paused + joined here; on ANY failure the workcell is stopped
+        again and the exception propagates - the caller resumes the monitor.
         """
         self._require_armed()
         from apollo_mavis_v2_sim import (
@@ -1641,8 +1534,6 @@ class SessionManager:
                 )
             except Exception as e:  # noqa: BLE001 - TwinAuditError / scene build
                 raise SessionError(f"digital twin {twin_scene!r} unavailable: {e}") from e
-            if grasp_whitelist:
-                self._whitelist_graspable(twin, twin.scene)  # 16-gello D7
             # 7. the gate is UNCONDITIONAL on hardware (11-safety §4; ControlLoop re-checks)
             gate = SafetyGate(twin, safety)
             pairs = default_collision_pairs(twin.scene, twin.allowed)
@@ -1720,7 +1611,12 @@ class SessionManager:
                     unscaled.target_rate.w_radps,
                     unscaled.dq_max_rad,
                 )
-            common = dict(
+            loop = ControlLoop(
+                workcell,
+                control_cfg,
+                bus or self.bus,
+                supervisor,
+                list(arms),
                 ik=ik,
                 kin=kin,
                 planner=twin,
@@ -1730,10 +1626,6 @@ class SessionManager:
                 tracker=self._tracker_provider() if tracker else None,
                 plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
                 speed_scale=scale,
-            )
-            make_loop = loop_factory or ControlLoop
-            loop = make_loop(
-                workcell, control_cfg, bus or self.bus, supervisor, list(arms), **common
             )
             return HardwareRig(
                 arms=list(arms),
@@ -1773,12 +1665,7 @@ class SessionManager:
             logger.exception("hardware rig: workcell.stop failed")
 
     def _bringup_hardware(
-        self,
-        spec: SessionSpec,
-        wc: WorkcellConfig,
-        twin_scene: str,
-        samples: dict,
-        gello_check: Evaluation | None = None,
+        self, spec: SessionSpec, wc: WorkcellConfig, twin_scene: str, samples: dict
     ) -> ActiveSession:
         """Mirror of :meth:`_bringup_sim` for the real cell (module docstring;
         04-runtime §5): :meth:`connect_hardware_rig` for every configured arm,
@@ -1803,34 +1690,7 @@ class SessionManager:
         rig: HardwareRig | None = None
         session: ActiveSession | None = None
         recorder_thread = None
-        gello_session: _GelloSession | None = None
         try:
-            loop_factory = None
-            if spec.mode == "gello":  # 16-gello §5.2: GelloLoop, no tracker provider (D9)
-                assert gello_check is not None
-                session_id_ref = session_id
-
-                def loop_factory(workcell, control_cfg, bus, supervisor, arms, **common):
-                    nonlocal gello_session
-                    common.pop("tracker", None)
-                    loop, gello_session = self._build_gello_loop(
-                        spec,
-                        workcell,
-                        common["planner"].scene,
-                        session_id_ref,
-                        common.pop("ik"),
-                        common.pop("kin"),
-                        common.pop("planner"),
-                        supervisor,
-                        gello_check,
-                        kind="hardware",
-                        control_cfg=control_cfg,
-                        bus=bus,
-                        gripper_arms=common.pop("gripper_arms"),
-                        **common,
-                    )
-                    return loop
-
             rig = self.connect_hardware_rig(
                 arms=list(spec.arms),
                 wc=wc,
@@ -1838,22 +1698,12 @@ class SessionManager:
                 samples=samples,
                 speed_scale=scale,
                 progress=progress,
-                tracker=spec.mode != "gello",
-                loop_factory=loop_factory,
-                grasp_whitelist=spec.mode == "gello",
             )
             # 11. start_from=profile: plan on the gate twin NOW (measured start, frozen
             #     arms as obstacles); the worker executes the waypoints (§5.2 path)
             planned = None
             if spec.start_from.startswith("profile:"):
                 planned = self._plan_profile_start(spec, rig, progress)
-            elif spec.mode == "gello":
-                # 16-gello §5.2: the launch motion to the GELLO posture, planned on the gate
-                # twin like a profile start - but a plan failure is NOT a 409: the arms stay
-                # where they are, the session runs, GELLO reads out_of_sync and the worker
-                # puts the reason on the wire (session.fault_detail)
-                assert gello_session is not None
-                planned = self._plan_gello_start(rig, progress, gello_session)
             # 11b. data collection (2026-09-07, §10.5): the recorder reads the ADOPTED
             #      preview cameras (the UVC nodes are open exactly once) and the twin's
             #      kinematics; built before the loop starts so a dataset refusal (409)
@@ -1899,7 +1749,6 @@ class SessionManager:
                 frozen_arms=sorted(rig.frozen),
                 inner_workcell=rig.inner,
                 planned_start=planned,
-                gello=gello_session,
             )
             self.attach_fault_state(session)
 
@@ -1932,8 +1781,6 @@ class SessionManager:
                     recorder_thread.stop()  # finalize the (empty) dataset, never half-open
                 except Exception:  # noqa: BLE001
                     logger.exception("hardware bring-up abort: recorder stop failed")
-            if gello_session is not None:
-                gello_session.close()
             self._abort_hardware_bringup(
                 rig.loop if rig is not None else None,
                 rig.workcell if rig is not None else None,
@@ -1992,283 +1839,6 @@ class SessionManager:
                 f"{len(result.waypoints.get(a, ()))} waypoints planned to profile {pid!r}",
             )
         return self._ordered_waypoints(result), grippers
-
-    # -- GELLO Manipulation (phase-15; 16-gello §5) ----------------------------------------------
-    @staticmethod
-    def _whitelist_graspable(twin, scene) -> None:
-        """16-gello D7: the scene's ``graspable`` world geoms (the kitchen handles) are
-        whitelisted against the Manipulation Arm's gripper, so the fingers may touch a
-        handle while every arm link stays gated against every appliance body."""
-        graspable = list(getattr(scene.meta, "graspable", ()) or ())
-        if not graspable or FOLLOWER_ARM_ID not in twin.addr.arms:
-            return
-        if not twin.addr[FOLLOWER_ARM_ID].has_gripper:
-            return
-        twin.set_grasp_whitelist(FOLLOWER_ARM_ID, graspable)
-        logger.info("gello: grasp whitelist %s for %s", graspable, arm_label(FOLLOWER_ARM_ID))
-
-    def _gello_scene_id(self, spec: SessionSpec, wc: WorkcellConfig | None = None) -> str:
-        """The twin a GELLO session runs on: the spec's scene, else ``gello.scene_id`` (the
-        kitchen) for BOTH kinds - the same default the session-less preview uses. Before
-        the 2026-09-09 review a scene-less spec fell back to the workcell's bare-cell twin
-        while the preview judged the kitchen, so the two disagreed on the same posture;
-        :meth:`_gello_spec_with_scene` writes the resolved id into the spec at ``create()``
-        so the validation, the bring-up twin and the announce all see the same one."""
-        explicit = spec.sim_scene if spec.kind == "sim" else spec.digital_twin_scene
-        return str(explicit or self.cfg.gello.scene_id)
-
-    def _gello_spec_with_scene(self, spec: SessionSpec) -> SessionSpec:
-        """``spec`` with ``sim_scene`` / ``digital_twin_scene`` filled from
-        :meth:`_gello_scene_id` when the client left it out (16-gello §5.1 item 1)."""
-        field = "sim_scene" if spec.kind == "sim" else "digital_twin_scene"
-        if getattr(spec, field):
-            return spec
-        return spec.model_copy(update={field: self._gello_scene_id(spec)})
-
-    def _check_gello(self, spec: SessionSpec, wc: WorkcellConfig, samples: dict | None):
-        """The GELLO launch check (16-gello §5.1, in the §9.2 409 order), evaluated at
-        ``create()`` BEFORE any side effect, after ``_validate`` / ``_validate_hardware``:
-
-        1. both arms in the session (the Perception Arm is the viewpoint), ``start_from``
-           ``keep_current`` (the launch motion IS the GELLO posture);
-        2. the leader: reader present, ``connected``, a fresh valid calibrated sample ->
-           else 409 ``GELLO leader not available (<status / detail>)``;
-        3. ``q_goal["grip"] = unwrap(sample.q, q_meas)`` + the measured rail inside the
-           joint limits -> 409 ``GELLO posture outside the Manipulation Arm's joint limits
-           (joint N = x.xx rad, limit ±y.yy)``;
-        4. the kitchen twin at the full goal -> 409 ``GELLO posture collides: <a> / <b> at
-           <mm> mm[, …] - move GELLO and retry`` (every pair, tightest first);
-        5. ``viewpoint: external`` -> a fresh COMPATIBLE viewpoint node on the hub -> 409
-           ``no external viewpoint node attached (…)`` / ``viewpoint node action_names …
-           != view layout …``.
-
-        Returns the :class:`Evaluation` (the goals the bring-up plans to)."""
-        from ..gello.preview import launch_collision_409, launch_joint_limit_409
-        from ..gello.viewpoint import compatibility
-
-        assert spec.gello is not None
-        missing = [a for a in (FOLLOWER_ARM_ID, VIEW_ARM_ID) if a not in spec.arms]
-        if missing:
-            names = " + ".join(arm_label(a) for a in (FOLLOWER_ARM_ID, VIEW_ARM_ID))
-            raise SessionError(
-                f"GELLO Manipulation needs both arms in the session ({names}) - missing "
-                f"{missing} (the Perception Arm is the viewpoint)"
-            )
-        if spec.start_from != "keep_current":
-            raise SessionError(
-                "mode 'gello' requires start_from 'keep_current' (the launch motion is the "
-                "GELLO posture)"
-            )
-        reader = self.gello_reader
-        service = self.gello_preview
-        if reader is None or service is None:
-            raise SessionError("GELLO leader not available (no leader reader in this runtime)")
-        now = time.monotonic()
-        st = reader.status(now)
-        why = None
-        if st.status != "connected":
-            why = f"{st.status}{': ' + st.detail if st.detail else ''}"
-        elif not st.calibrated:
-            why = "not calibrated - POST /api/gello/calibrate {op: match_arm} first"
-        sample = reader.fresh_sample(now) if why is None else None
-        if why is None and sample is None:
-            last = reader.latest()
-            why = (
-                "no valid sample (jump rejected / uncalibrated)"
-                if last is not None and not last.valid
-                else f"sample stale (> {self.cfg.gello.stale_s:g} s)"
-            )
-        if why is not None:
-            raise SessionError(f"GELLO leader not available ({why})")
-        scene_id = self._gello_scene_id(spec, wc)
-        q_meas = None
-        if spec.kind == "hardware":
-            sample_hw = (samples or {}).get(FOLLOWER_ARM_ID)
-            if sample_hw is None:
-                raise SessionError(
-                    f"{arm_label(FOLLOWER_ARM_ID)}: no monitor sample - the GELLO posture "
-                    "cannot be unwrapped against the arm"
-                )
-            from apollo_mavis_v2_sim import REGISTRY
-
-            meta = REGISTRY.meta(scene_id)
-            state, _note = frozen_state(
-                FOLLOWER_ARM_ID,
-                sample_hw,
-                has_rail=bool(meta.rail.get(FOLLOWER_ARM_ID, False)),
-                rail_fallback_m=self.cfg.twin_overlay.rail_fallback_m,
-                rail_flip=self.cfg.hardware_session.rail_flip,
-            )
-            q_meas = np.asarray(state.q, dtype=np.float64)
-        ev, _pt = service.evaluate(spec.kind, scene_id, wc, sample=sample, q_meas=q_meas, now=now)
-        if ev.status == "scene_error":
-            raise SessionError(ev.detail)
-        if ev.status in ("no_leader", "not_calibrated", "no_workcell"):
-            raise SessionError(f"GELLO leader not available ({ev.detail})")
-        if ev.status == "joint_limit":
-            assert ev.joint_limit is not None
-            raise SessionError(launch_joint_limit_409(ev.joint_limit))
-        if ev.status == "collision":
-            raise SessionError(launch_collision_409(ev.pairs))
-        if spec.gello.viewpoint == "external":
-            dora = self.dora
-            hub = dora.policy_hub if dora is not None else None
-            if hub is None or not dora.bridge.attached:
-                raise SessionError(
-                    "no external viewpoint node attached (dora bridge is not attached)"
-                )
-            ann = hub.spec()
-            if ann is None:
-                raise SessionError(
-                    "no external viewpoint node attached (no policy_spec heartbeat within "
-                    f"{self.cfg.dora.policy.spec_stale_s:g} s)"
-                )
-            from apollo_mavis_v2_sim import REGISTRY
-
-            has_rail = bool(REGISTRY.meta(scene_id).rail.get(VIEW_ARM_ID, False))
-            frame = str(spec.frames.get(VIEW_ARM_ID, f"arm_base:{VIEW_ARM_ID}"))
-            bad = compatibility(ann, frame, has_rail)
-            if bad is not None:
-                raise SessionError(bad)
-        return ev
-
-    def _build_gello_loop(
-        self,
-        spec: SessionSpec,
-        workcell,
-        scene,
-        session_id: str,
-        ik,
-        kin,
-        twin,
-        supervisor,
-        gello_check,
-        *,
-        kind: str,
-        control_cfg,
-        bus,
-        gripper_arms,
-        **extra,
-    ):
-        """The ``GelloLoop`` + its viewpoint source (16-gello §6 / §7) for either kind.
-        ``extra`` carries the hardware rig's ``plan_gate_hold_s`` / ``speed_scale`` /
-        ``profile_store``; the sim path takes the config values."""
-        from ..dagger.policy_runner import ActionAnchor, SlewLimits
-        from ..gello.loop import GelloLoop
-        from ..gello.viewpoint import ViewpointSource
-
-        assert spec.gello is not None
-        has_rail = bool(scene.meta.rail.get(VIEW_ARM_ID, False))
-        dora = self.dora if (self.dora is not None and self.dora.enabled) else None
-        viewpoint = ViewpointSource(
-            dora.policy_hub if dora is not None else None,
-            dora.publisher if dora is not None else None,
-            session_id=session_id,
-            view_frame=str(spec.frames.get(VIEW_ARM_ID, f"arm_base:{VIEW_ARM_ID}")),
-            mode=spec.gello.viewpoint,
-            cfg=self.cfg.dora.policy,
-            rate_hz_default=self.cfg.dagger.policy_rate_hz,
-            has_rail=has_rail,
-        )
-        anchor = ActionAnchor(
-            ik, kin, SlewLimits(window_s=self.cfg.dagger.slew_window_s), action_space="delta_ee"
-        )
-        kwargs = dict(
-            ik=ik,
-            kin=kin,
-            planner=twin,
-            profile_store=self.profile_store,
-            workcell_kind=kind,
-            recorder=None,
-            gripper_arms=gripper_arms,
-            plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
-            speed_scale=spec.speed_scale,
-        )
-        kwargs.update(extra)
-        loop = GelloLoop(
-            workcell,
-            control_cfg,
-            bus,
-            supervisor,
-            list(spec.arms),
-            gello_cfg=self.cfg.gello,
-            reader=self.gello_reader,
-            viewpoint=viewpoint,
-            anchor=anchor,
-            launch_pending=True,  # the launch motion window: released by the worker
-            **kwargs,
-        )
-        gello_session = _GelloSession(
-            scene_id=self._gello_scene_id(spec, self.cfg.workcell_config(spec.kind)),
-            q_goal={a: [float(x) for x in q] for a, q in gello_check.q_goal.items()},
-            viewpoint=viewpoint,
-        )
-        return loop, gello_session
-
-    def _plan_gello_start(
-        self, rig: HardwareRig, progress: _BringupProgress, gello: _GelloSession
-    ) -> tuple[dict, dict] | None:
-        """The GELLO launch motion on hardware (16-gello §5.2), planned on the gate twin
-        inside bring-up like :meth:`_plan_profile_start` (measured start, the checked goals,
-        the rail slots as checked); ``(waypoints in arm_order, {})`` for the worker, or None
-        when the twin found no path - the reason lands in ``gello.plan_failure`` and the
-        worker reports it (the arms stay, the session runs, GELLO reads out_of_sync)."""
-        from apollo_mavis_v2_core import PlanRequest
-
-        states = rig.workcell.states()
-        q_start = {a: [float(x) for x in states[a].q] for a in rig.arms if a in gello.q_goal}
-        q_goal = {a: list(gello.q_goal[a]) for a in q_start}
-        for a in rig.arms:
-            progress.set(a, "start_from", "pending", "planning the motion to the GELLO posture")
-        rig.twin.sync({a: states[a] for a in rig.arms})
-        result = rig.twin.plan(
-            PlanRequest(q_start=q_start, q_goal=q_goal, speed_scale=rig.speed_scale)
-        )
-        if not result.ok:
-            failure = self._plan_failure_text(result)
-            gello.plan_failure = failure
-            for a in rig.arms:
-                progress.set(
-                    a, "start_from", "warning", f"GELLO launch motion not planned: {failure}"
-                )
-            logger.warning("gello launch motion not planned: %s", failure)
-            return None
-        for a in rig.arms:
-            progress.set(
-                a,
-                "start_from",
-                "ok",
-                f"{len(result.waypoints.get(a, ()))} waypoints planned to the GELLO posture",
-            )
-        return self._ordered_waypoints(result), {}
-
-    def _gello_motion(self, session: ActiveSession, active: bool, reason: str) -> None:
-        """Open / close the ``GelloLoop``'s motion window through the bus (thread-safe: the
-        loop applies it at a tick boundary). No-op on a non-gello session."""
-        if getattr(session, "gello", None) is None:
-            return
-        try:
-            self.bus.commands.submit(
-                Command(
-                    op="gello_motion", args={"active": active, "reason": reason}, source="internal"
-                )
-            ).result(timeout=2.0)
-        except Exception:  # noqa: BLE001 - the loop may already be stopping
-            logger.warning(
-                "gello_motion(active=%s, %s) did not complete within 2 s", active, reason
-            )
-
-    def _gello_force_pause(self, session: ActiveSession, reason: str) -> None:
-        """16-gello §5.3: a planned in-session motion first forces ``paused`` (the follower
-        stops following before the plan is submitted); the operator presses Resume after."""
-        if getattr(session, "gello", None) is None:
-            return
-        try:
-            self.bus.commands.submit(
-                Command(op="gello_pause", args={"reason": reason}, source="internal")
-            ).result(timeout=2.0)
-        except Exception:  # noqa: BLE001
-            logger.warning("gello_pause(%s) did not complete within 2 s", reason)
 
     def _freeze_unselected_arms(
         self, twin, meta, arms: list[str], samples: dict, progress: _BringupProgress
@@ -3277,28 +2847,7 @@ class SessionManager:
         (:meth:`_execute_arms`; 2026-09-08 evening - the first live run of this
         motion executed both arms' sequentially planned paths simultaneously and the
         gate held them at 5.2 mm).
-
-        GELLO (phase-15, 16-gello §5.3): the follower is forced ``paused`` before the first
-        plan is submitted and the loop's motion window stays open across both phases and
-        both arms; the state stays ``paused`` afterwards until the operator's Resume.
         """
-        gello = getattr(session, "gello", None)  # hand-built test sessions lack the field
-        if gello is not None:
-            # 16-gello §5.3: the follower stops following BEFORE the plan is submitted and
-            # stays paused afterwards (the operator's Resume re-engages); the motion window
-            # keeps the state `motion` across both phases and both arms
-            self._gello_force_pause(session, f"paused: {_motion_title(label, profile)}")
-            self._gello_motion(session, True, label)
-        try:
-            return self._return_to_initial_phases(session, profile, label=label)
-        finally:
-            if gello is not None:
-                self._gello_motion(session, False, f"{label} over")
-
-    def _return_to_initial_phases(
-        self, session: ActiveSession, profile, *, label: str
-    ) -> ReturnHomeResult:
-        """The two phases of :meth:`_return_to_initial_motion` (its docstring)."""
         import numpy as np
 
         _states, q_start, q_joint, q_full, grippers = self._return_goals(
@@ -3766,20 +3315,14 @@ class SessionManager:
 
     # -- START_FROM (background; progress via telemetry) ----------------------------
     def _start_from_worker(self, session: ActiveSession) -> None:
-        gello = getattr(session, "gello", None)  # hand-built test sessions lack the field
         try:
-            if not session.spec.start_from.startswith("profile:") and gello is None:
+            if not session.spec.start_from.startswith("profile:"):
                 if session.state is SessionState.BRINGUP:  # a fault may already hold it
                     session.state = SessionState.RUNNING  # keep_current: no motion
                     self._bringup = None  # hardware bring-up rows shown until running
                 return
             if session.state is SessionState.TEARDOWN:
                 return  # ended before the motion started
-            if gello is not None and gello.plan_failure is not None:
-                # hardware (16-gello §5.2): the gate twin found no path inside bring-up - the
-                # arms stay where they are, the session runs, GELLO reads out_of_sync
-                self._gello_launch_unplanned(session, gello.plan_failure)
-                return
             # 2026-09-08: an arm can be RECOVERING for a tick or two right after the
             # driver enabled it (controller state 4, transient). Give such a fault
             # ``start_from_fault_grace_s`` to clear BEFORE the plan is handed to the loop
@@ -3802,24 +3345,6 @@ class SessionManager:
                 waypoints, grippers = session.planned_start
                 q_goal = dict(waypoints)
                 result = None
-            elif gello is not None:
-                # sim (16-gello §5.2): the launch motion from the measured posture to the
-                # checked GELLO goals (Manipulation Arm = the unwrapped leader + its rail,
-                # Perception Arm = the GELLO hold posture), planned on the session twin
-                from apollo_mavis_v2_core import PlanRequest
-
-                states = session.workcell.states()
-                q_goal = {a: list(gello.q_goal[a]) for a in session.spec.arms if a in gello.q_goal}
-                q_start = {a: [float(x) for x in states[a].q] for a in q_goal}
-                grippers = {}
-                if session.supervisor.twin is None:  # plain sim: keep the plan twin fresh
-                    session.twin.sync(states)
-                result = session.twin.plan(
-                    PlanRequest(
-                        q_start=q_start, q_goal=q_goal, speed_scale=session.spec.speed_scale
-                    )
-                )
-                waypoints = self._ordered_waypoints(result)  # executed in arm_order
             else:
                 pid = session.spec.start_from.split(":", 1)[1]
                 profile = self.profile_store.get(pid)
@@ -3850,9 +3375,6 @@ class SessionManager:
                 waypoints = self._ordered_waypoints(result)  # executed in arm_order
             if result is not None and not result.ok:
                 logger.error("start_from plan failed: %s %s", result.failure, result.failing_pair)
-                if gello is not None:
-                    self._gello_launch_unplanned(session, self._plan_failure_text(result))
-                    return
                 session.motion_detail = (
                     f"start_from plan failed: {self._plan_failure_text(result)} - the arms have "
                     "not moved; Go to profile retries it"
@@ -3892,26 +3414,20 @@ class SessionManager:
             # keyed on the state this used to exit at once, leaving
             # ``start_from_progress`` None and the bring-up rows on screen for good.
             # ``start_from_progress`` counts over ALL arms' waypoints.
-            tag = "gello launch" if gello is not None else "start_from"
-            try:
-                status, detail = self._execute_arms(
-                    session,
-                    waypoints,
-                    grippers,
-                    interruptible=False,
-                    running=lambda: session.state is not SessionState.TEARDOWN,
-                    budget_s=lambda arm_id, wps: max(
-                        120.0, self._return_budget_s(session, {arm_id: wps})
-                    ),
-                    tag=tag,
-                    timeout_reason="timed out",
-                    submit=submit,
-                    on_progress=progress,
-                )
-            finally:
-                # 16-gello §5.2: close the motion window whatever happened - the engage rule
-                # runs once on the next tick (tracking within tolerance, else out_of_sync)
-                self._gello_motion(session, False, "launch motion over")
+            status, detail = self._execute_arms(
+                session,
+                waypoints,
+                grippers,
+                interruptible=False,
+                running=lambda: session.state is not SessionState.TEARDOWN,
+                budget_s=lambda arm_id, wps: max(
+                    120.0, self._return_budget_s(session, {arm_id: wps})
+                ),
+                tag="start_from",
+                timeout_reason="timed out",
+                submit=submit,
+                on_progress=progress,
+            )
             if status == "refused":  # a faulted arm refuses the plan: say so, never a silent hold
                 detail = self._start_from_refusal(session, detail)
                 logger.warning("start_from refused by the loop: %s", detail)
@@ -3924,8 +3440,8 @@ class SessionManager:
                     "timeout": "timed out",
                     "stalled": "stalled (the arm did not settle at its goal)",
                 }.get(status, status)
-                session.motion_detail = f"{tag} {verb}: {detail} (Go to profile retries it)"
-                logger.warning("%s %s: %s", tag, verb, detail)
+                session.motion_detail = f"start_from {verb}: {detail} (Go to profile retries it)"
+                logger.warning("start_from %s: %s", verb, detail)
             session.start_from_progress = None
             if session.state is SessionState.START_FROM:  # a driver fault may own it now
                 session.state = SessionState.RUNNING
@@ -3935,21 +3451,6 @@ class SessionManager:
             session.fault_detail = repr(e)
             session.state = SessionState.FAULT
             self._bringup = None
-
-    def _gello_launch_unplanned(self, session: ActiveSession, failure: str) -> None:
-        """16-gello §5.2: the launch motion could not be planned - the arms stay where they
-        are, the session RUNS, GELLO reads ``out_of_sync`` (the leader is not where the arm
-        is) and the reason is the session notice (``session.fault_detail``)."""
-        session.motion_detail = (
-            f"GELLO launch motion not planned: {failure} - the arms have not moved; move GELLO "
-            "toward the arm (or Go to profile) and Resume"
-        )
-        logger.warning("gello launch motion not planned: %s", failure)
-        self._gello_motion(session, False, "launch motion not planned")
-        session.start_from_progress = None
-        if session.state in (SessionState.BRINGUP, SessionState.START_FROM):
-            session.state = SessionState.RUNNING
-        self._bringup = None
 
     START_FROM_FAULT_POLL_S = 0.05
 
@@ -4018,8 +3519,6 @@ class SessionManager:
         session.loop.on_fault_state = lambda state, s=session: self._on_arm_fault_state(s, state)
         session.loop.on_reset_to_initial = self.request_reset_to_initial
         session.loop.on_goto_profile = self.request_goto_profile
-        if hasattr(session.loop, "session_running"):  # GelloLoop (16-gello §7): attach rule
-            session.loop.session_running = lambda s=session: s.state is SessionState.RUNNING
 
     def _on_arm_fault_state(self, session: ActiveSession, state: str | None) -> None:
         """Control-loop callback (loop thread): the aggregate per-arm fault state
@@ -4170,8 +3669,6 @@ class SessionManager:
                 if session.recorder_thread is not None:
                     session.recorder_thread.stop()  # discard + finalize (§10.4)
                 session.loop.stop()
-                if session.gello is not None:  # phase-15: the viewpoint source detaches
-                    session.gello.close()
                 if session.online_dagger is not None:  # phase-14: last session.json, sink off
                     try:
                         session.online_dagger.close()
@@ -4301,28 +3798,6 @@ class SessionManager:
         runner = getattr(loop, "runner", None)
         gate = getattr(loop, "gate", None)
         recorder = session.recorder_thread
-        # phase-15 (16-gello D5 / §7): a gello session accepts policy_action for the
-        # Perception Arm ONLY - external_arms names it and the action / state layout is the
-        # view block alone (arm_ids still lists both arms: obs_state carries both). With
-        # viewpoint `hold` nothing is accepted: external_arms stays [] like every other mode
-        # and the layout is the full one (a node cannot attach anyway).
-        layout_arms = arms
-        external_arms: list[str] = []
-        viewpoint = getattr(loop, "viewpoint", None)
-        if spec.mode == "gello" and spec.gello is not None and spec.gello.viewpoint != "hold":
-            layout_arms = [a for a in arms if a == VIEW_ARM_ID]
-            external_arms = list(layout_arms)
-        # obs_state still carries EVERY session arm (§7): its metadata names that vector,
-        # whatever the announced (view-only) layout says the node may consume
-        obs_state_names = [n for a in arms for n in arm_state_names(a, has_rail[a])]
-
-        def policy_version() -> int | None:
-            src = runner if runner is not None else viewpoint
-            if src is None or not hasattr(src, "current_version"):
-                return None
-            v = src.current_version()
-            return None if v is None else int(v)
-
         return SessionFacts(
             session_id=session.session_id,
             spec=spec,
@@ -4331,10 +3806,8 @@ class SessionManager:
             arm_ids=arms,
             has_rail=has_rail,
             frames=frames,
-            action_names=[
-                n for a in layout_arms for n in arm_action_names(a, has_rail[a], "delta_ee")
-            ],
-            state_names=[n for a in layout_arms for n in arm_state_names(a, has_rail[a])],
+            action_names=[n for a in arms for n in arm_action_names(a, has_rail[a], "delta_ee")],
+            state_names=[n for a in arms for n in arm_state_names(a, has_rail[a])],
             camera_ids=cams,
             cameras=announces,
             policy_source=spec.policy_source,
@@ -4345,14 +3818,16 @@ class SessionManager:
             converter=RecordingFrameConverter(frames, {}),
             engaged_arm=(lambda: gate.engaged_arm()) if gate is not None else (lambda: None),
             gate_events=lambda: list(session.supervisor.events),
-            policy_version=policy_version,
+            policy_version=(
+                (lambda: int(runner.current_version()))
+                if runner is not None and hasattr(runner, "current_version")
+                else (lambda: None)
+            ),
             online_dagger=(
                 session.online_dagger.coordinator.announce()
                 if session.online_dagger is not None
                 else None
             ),
-            external_arms=external_arms,
-            obs_state_names=obs_state_names,
         )
 
     # -- pre-session camera previews (~15 fps, 04-runtime §13.4) --------------------

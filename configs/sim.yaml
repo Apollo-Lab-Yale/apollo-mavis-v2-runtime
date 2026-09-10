@@ -42,34 +42,3 @@ control:
 telemetry_hz: 25
 video: {preview_fps: 15, session_fps: 30, jpeg_quality: 80}
 egl_device_id: 0
-# GELLO leader arm (phase-15; 16-gello §4 / §9.1). The passive xArm7-shaped leader whose
-# Dynamixel servos are read over one USB serial adapter (FTDI FT232H 0403:6014,
-# /dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAKROCJ-if00-port0 on the lab
-# machine) and drive the Manipulation Arm in joint space in the `gello` session mode.
-# backend: none | fake | dynamixel - this shipped file keeps `none` (GET /api/gello says
-# no_backend); the lab render sets `dynamixel` (GELLO_BACKEND / GELLO_USB_SERIAL / GELLO_BAUD)
-# and needs the runtime's [gello] extra (dynamixel-sdk + pyserial, imported only in
-# devices/gello.py). `fake` publishes a scripted posture (the mavis_v2 keyframe of the
-# Manipulation Arm, gripper open) at poll_hz so a sim GELLO session launches already synced;
-# tests move it with GelloReader.fake_set. This single-arm example workcell cannot launch
-# gello (both arms are required); the block is here so the shipped defaults are stated. The reader never enables torque or writes a goal.
-gello:
-  backend: none
-  port: /dev/ttyUSB0            # serial node (a /dev/serial/by-id symlink is fine)
-  usb_serial: null              # e.g. FTAKROCJ -> the ttyUSB node whose sysfs USB parent has that serial wins
-  baud: null                    # null = scan 57600 / 1M / 2M / 3M / 4M with a broadcast ping per rate
-  joint_ids: [1, 2, 3, 4, 5, 6, 7]
-  gripper_id: 8                 # null = no gripper channel
-  joint_signs: [1, 1, 1, 1, 1, 1, 1]        # OPERATOR-OWNED once set (one manual check per joint)
-  joint_offsets_rad: null       # null = var/gello_calibration.json (POST /api/gello/calibrate match_arm)
-  poll_hz: 100.0
-  stale_s: 0.2                  # sample older than this -> no_leader (hold)
-  max_jump_rad: 0.5             # consecutive raw jump above this -> invalid sample (never a target)
-  engage_tol_rad: 0.10          # leader within this of the measured arm -> tracking
-  leash_rad: 0.80               # leader farther than this from the command while tracking -> out_of_sync
-  gripper_quantum: 0.01
-  max_joint_vel_rad_s: 0.6      # the follower's per-joint cap in SIM too (hardware has it in ServoLimits)
-  view_posture_rad: [2.646, -1.598, 0.018, 1.637, 0.25, 2.007, 0.029]   # Perception Arm GELLO hold posture (J1-J7)
-  view_rail_m: 0.0              # ... and its rail slot (twin convention)
-  scene_id: mavis_v2_kitchen    # the twin the GELLO card launches (sim and hardware; hidden from GET /api/scenes)
-  calibration_path: ${APOLLO_HOME}/var/gello_calibration.json

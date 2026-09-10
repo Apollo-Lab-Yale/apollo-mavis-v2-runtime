@@ -14,11 +14,6 @@ from apollo_mavis_v2_core.protocol import (
     DatasetLayoutInfo,
     DoraInfo,
     EpisodeInfo,
-    GelloCalibrateRequest,
-    GelloCalibrateResult,
-    GelloInfo,
-    GelloPreviewRequest,
-    GelloPreviewResult,
     KeymapEntry,
     MicrophoneInfo,
     OnlineDaggerSessionInfo,
@@ -39,7 +34,6 @@ import apollo_mavis_v2_runtime
 
 from ..devices.tracker_calibration import CalibrationError
 from ..errors import (
-    GelloUnavailableError,
     MaintenanceUnavailableError,
     SafetyConfigError,
     SessionError,
@@ -470,67 +464,6 @@ def get_online_dagger_skill_tgz(request: Request) -> Response:
 @router.get("/online_dagger/sessions")
 def list_online_dagger_sessions(request: Request) -> list[OnlineDaggerSessionInfo]:
     return _runtime(request).manager.online_dagger_sessions()
-
-
-# -- GELLO leader arm (phase-15; 16-gello §4, §9.2, D10) -----------------------------------------
-# Session-less device management rides REST (addendum above). Route table:
-#   GET  /api/gello            -> GelloInfo: the device half of telemetry.gello (backend /
-#                                 status / port / baud / rate / raw + mapped joints / gripper /
-#                                 calibration echo) + the twin scene the GELLO card launches
-#                                 (scene_id / scene_label), the Perception Arm's hold posture,
-#                                 calibration_path, hardware_admitted (D8). Never 409.
-#   POST /api/gello/calibrate  GelloCalibrateRequest{op: match_arm | gripper_open |
-#                                 gripper_closed | clear, kind: hardware | sim} ->
-#                                 GelloCalibrateResult{ok, detail, joint_offsets_rad,
-#                                 gripper_open_rad, gripper_closed_rad}. 409 while a session
-#                                 exists / is starting ("end the session first"), when the
-#                                 leader has no fresh valid sample (reading ops), when the
-#                                 Manipulation Arm's current joints are unknown for `kind`
-#                                 (no monitor sample on hardware / no preview posture in sim)
-#                                 or when the leader has no gripper channel (gripper ops).
-#                                 match_arm = round((raw - sign*q_arm) / (pi/2)) * pi/2 per
-#                                 joint -> var/gello_calibration.json; the result is echoed
-#                                 in GET /api/gello.
-#   POST /api/gello/preview    GelloPreviewRequest{kind, scene?, speed_scale?} ->
-#                                 GelloPreviewResult{status: clear | collision | joint_limit |
-#                                 no_leader | not_calibrated | no_workcell | scene_error, ok,
-#                                 detail, pairs[{a, b, dist_m}], q_goal{grip[8], view[8]},
-#                                 leader_q[7], image_png_b64, camera} (16-gello §5.4): the
-#                                 §5.1 launch check on a cached kitchen twin (gello/preview.py)
-#                                 + a PNG of cam_kitchen with the colliding bodies tinted red.
-#                                 200 for every posture (the status says); 409 only when the
-#                                 runtime has no workcell of `kind`. Never moves anything; the
-#                                 GELLO sheet polls it at 2 Hz. POST /api/session {mode: gello}
-#                                 runs the same check and 409s in the order: existing guards
-#                                 -> "GELLO leader not available (...)" -> "GELLO posture
-#                                 outside the Manipulation Arm's joint limits (...)" -> "GELLO
-#                                 posture collides: <a> / <b> at <mm> mm - move GELLO and
-#                                 retry" -> the viewpoint node (viewpoint: external only).
-@router.get("/gello")
-def get_gello(request: Request) -> GelloInfo:
-    return _runtime(request).gello_info()
-
-
-@router.post("/gello/calibrate")
-def post_gello_calibrate(request: Request, body: GelloCalibrateRequest) -> GelloCalibrateResult:
-    rt = _runtime(request)
-    who = request.client.host if request.client is not None else "unknown"
-    try:
-        result = rt.gello_calibrate(body)
-    except GelloUnavailableError as e:
-        logger.info("gello calibrate %s (%s) from %s: refused - %s", body.op, body.kind, who, e)
-        raise HTTPException(409, str(e)) from None
-    logger.info("gello calibrate %s (%s) from %s: %s", body.op, body.kind, who, result.detail)
-    return result
-
-
-@router.post("/gello/preview")
-def post_gello_preview(request: Request, body: GelloPreviewRequest) -> GelloPreviewResult:
-    rt = _runtime(request)
-    try:
-        return rt.gello_preview_result(body)
-    except GelloUnavailableError as e:
-        raise HTTPException(409, str(e)) from None
 
 
 # -- external interface over dora (phase-12; 14-dora §2.6, §9) -----------------------------

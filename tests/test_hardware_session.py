@@ -1061,16 +1061,8 @@ def test_refusal_matrix_details(client, rt, factory):
         assert r.status_code == 409, r.text
         assert needle in r.json()["detail"], (needle, r.json()["detail"])
 
-    # phase-15 (16-gello D8): gello is admitted beside teleop / collect; dagger / inference stay 409
-    refused(
-        spec(mode="dagger", task="t"),
-        "hardware sessions support teleop, data collection and GELLO Manipulation only "
-        "(dagger on hardware: not yet)",
-    )
-    refused(
-        spec(mode="inference"),
-        "hardware sessions support teleop, data collection and GELLO Manipulation only",
-    )
+    refused(spec(mode="dagger", task="t"), "hardware sessions support teleop and data collection")
+    refused(spec(mode="inference"), "hardware sessions support teleop and data collection")
     # collect is admitted (2026-09-07); its own contract still refuses before any box is touched
     refused(spec(mode="collect", task="t", dataset="x"), "return_to_start needs a start_from")
     refused(spec(mode="collect", task="t", dataset="x", return_to_start=False, dataset_resume=True),

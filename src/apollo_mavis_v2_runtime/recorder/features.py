@@ -23,15 +23,12 @@ ActionSpace = Literal["delta_ee", "abs_ee", "joint"]
 # int8 codes mirror core CommandSource string values (10-frames §7.3, binding).
 # 2 (joint_jog) and 4 (planner) are reserved: they NEVER appear in recorded
 # frames (joint_target is nacked while recording; planner motion not recorded).
-# 5 (gello, phase-15; 16-gello §8.2 / §12.2) is reserved too: GELLO does not record in
-# v1, the label exists so a later collect-like variant can append it without renumbering.
 ACTION_SOURCE_LABELS: dict[str, str] = {
     "0": CommandSource.POLICY.value,
     "1": CommandSource.TELEOP.value,
     "2": CommandSource.JOINT_JOG.value,
     "3": CommandSource.TAKEOVER.value,
     "4": CommandSource.PLANNER.value,
-    "5": CommandSource.GELLO.value,
 }
 
 _DELTA_EE_DIMS = ["ee.dx", "ee.dy", "ee.dz", "ee.drx", "ee.dry", "ee.drz", "gripper.pos"]

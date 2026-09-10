@@ -25,7 +25,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -327,13 +327,6 @@ class SessionFacts:
     policy_version: Callable[[], int | None] = lambda: None
     gate_events: Callable[[], list] = list  # the supervisor's CollisionEvents (with `source`)
     online_dagger: Any = None  # OnlineDaggerAnnounce (phase-14; 15-online-dagger §6) or None
-    # phase-15 (16-gello D5 / §7): the arms this session accepts policy_action for; [] =
-    # every session arm (every mode but gello, and gello with viewpoint hold); ["view"] in
-    # a gello session whose Perception Arm follows the viewpoint node
-    external_arms: list[str] = field(default_factory=list)
-    # the names of the obs_state vector when they differ from the announced ``state_names``
-    # (gello: the vector carries both arms, the announced layout is the view block only)
-    obs_state_names: list[str] | None = None
 
 
 class SnapshotPublisher:
@@ -604,9 +597,7 @@ class SnapshotPublisher:
         if facts is None:
             return
         mode = facts.spec.mode
-        # dagger / inference, gello (phase-15: the viewpoint node reads obs_state, 16-gello
-        # §7) and collect when publish.obs_in_collect
-        if mode not in ("dagger", "inference", "gello") and not (
+        if mode not in ("dagger", "inference") and not (
             mode == "collect" and self.cfg.publish.obs_in_collect
         ):
             return
@@ -633,7 +624,7 @@ class SnapshotPublisher:
         meta = {
             "observation_id": oid,
             "tick": int(snap.tick),
-            "state_names": list(facts.obs_state_names or facts.state_names),
+            "state_names": list(facts.state_names),
             "arm_ids": list(arm_ids),
             "frames": [facts.frames.get(a, f"arm_base:{a}") for a in arm_ids],
             "has_rail": [int(bool(facts.has_rail.get(a, False))) for a in arm_ids],
@@ -770,7 +761,6 @@ class SnapshotPublisher:
             dataset_root=facts.dataset_root,
             run_id=facts.run_id,
             online_dagger=facts.online_dagger,
-            external_arms=list(facts.external_arms),
         )
 
 
