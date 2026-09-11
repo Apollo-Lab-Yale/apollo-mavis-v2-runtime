@@ -151,7 +151,9 @@
     "action_names",
     "state_names",
     "camera_keys",
-    "version"
+    "version",
+    "arms",
+    "action_frames"
   ],
   "pose_sources": [
     "loop",
@@ -209,5 +211,7 @@
     "deprecated_keys",
     "online_dagger"
   ],
-  "tick_timer": "dora/timer/hz/10"
+  "tick_timer": "dora/timer/hz/10",
+  "arm_action_output_prefix": "action_",
+  "policy_arm_action_input_prefix": "policy_action_"
 }

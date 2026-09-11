@@ -402,11 +402,23 @@ def post_session_playback(request: Request, body: EpisodePlaybackRequest) -> Ret
     carriages), one arm at a time in the planner's ``arm_order``, cancelled by any operator
     input.
 
-    ``play`` replays the whole episode's MEASURED trajectory, also synchronously (a 37 s
-    episode is a 37 s request): resampled onto the loop tick with one global time scale so
-    the arms keep their recorded relative timing, every posture re-verified in the twin
-    before anything is sent, then streamed through the gate. It refuses when an arm is not
-    at frame 0 — with the distance, rather than quietly re-placing it.
+    ``play`` replays the whole episode, also synchronously (a 37 s episode is a 37 s
+    request), from the ``source`` the body names (2026-09-11):
+
+    * ``state`` (the default) — the MEASURED joint trajectory (``observation.state``),
+      resampled onto the loop tick with one global time scale so the arms keep their
+      recorded relative timing, every posture re-verified in the twin before anything is
+      sent, then streamed through the gate by the plan executor;
+    * ``delta_ee`` / ``abs_ee`` — the recorded ``action`` / ``action.abs_ee`` column
+      replayed through the policy's own per-tick executor path (``dagger/step.policy_step``)
+      inside the current session's control loop: gated per tick, NO whole-path twin
+      verification, and the outcome reports the terminal residual against the last
+      measured frame (the executor-fidelity metric). Refused with ``ok: false`` on
+      hardware sessions until the operator admits it, and when the episode lacks the
+      column (``GET .../playback`` lists the ``sources`` an episode offers).
+
+    Every source refuses when an arm is not at frame 0 — with the distance, rather than
+    quietly re-placing it.
 
     ``stop`` cancels a replay in flight and is the operator's only stop button here: the
     Welcome page never opens ``/ws/control``, so there is no key to cancel with.
@@ -423,7 +435,7 @@ def post_session_playback(request: Request, body: EpisodePlaybackRequest) -> Ret
         if body.action == "goto_initial":
             return rt.manager.episode_playback_goto_initial(body.repo_id, body.episode_id)
         if body.action == "play":
-            return rt.manager.episode_playback_play(body.repo_id, body.episode_id)
+            return rt.manager.episode_playback_play(body.repo_id, body.episode_id, body.source)
         return rt.manager.episode_playback_stop()
     finally:
         rt.orphan_watch.note_activity("playback finished")
@@ -455,11 +467,16 @@ def post_tracker_calibration(
 
 
 # -- arm maintenance (phase-09b/09c/09d; 04-runtime §13.1 / §15) ---------------------------
-# Session-less device management rides REST (addendum above). Three of the four ops
+# Session-less device management rides REST (addendum above). Four of the five ops
 # produce no motion: clear_errors = clean_error + clean_warn (monitor path, no enable);
 # apply_backstops = the ArmConfig safety parameters (monitor path; 409 in a session);
 # recover = the driver's user recovery incl. enable + servo mode + re-seed from the
-# measured position (session path; 409 without one). home_rail (phase-09c) is THE
+# measured position (session path; 409 without one); set_collision_sensitivity
+# (2026-09-11) = ONE write of body.collision_sensitivity (1..3, required for this op -
+# pydantic 422 otherwise) on EITHER path: the read-only monitor's poll thread without a
+# session (judged by read-back), the session driver's monitor thread inside one (the
+# Cockpit control) - volatile, the config value returns at the next connect, and the
+# runtime remembers the level per arm for telemetry. home_rail (phase-09c) is THE
 # ONE op that moves a mechanical part - the linear-track carriage drives to the
 # zero end - so it is session-less only (409 "end the session first") and twin-gated:
 # dry_run = the sweep verdict + pre_position plan only (zero writes); a sweep-clear
@@ -476,10 +493,19 @@ def post_arm_maintenance(
     rt = _runtime(request)
     who = request.client.host if request.client is not None else "unknown"
     label = f"{body.op}{' (dry run)' if body.dry_run else ''}"
+    if body.op == "set_collision_sensitivity":
+        label = f"{body.op} {body.collision_sensitivity}"
     try:
-        result = rt.arm_maintenance(arm_id, body.op, dry_run=body.dry_run)
+        result = rt.arm_maintenance(
+            arm_id,
+            body.op,
+            dry_run=body.dry_run,
+            collision_sensitivity=body.collision_sensitivity,
+        )
     except KeyError:
         raise HTTPException(404, f"unknown hardware arm {arm_id!r}") from None
+    except ValueError as e:  # a level outside 1..3 / missing for set_collision_sensitivity
+        raise HTTPException(422, str(e)) from None
     except MaintenanceUnavailableError as e:
         logger.info("maintenance %s on arm %s from %s: refused - %s", label, arm_id, who, e)
         raise HTTPException(409, str(e)) from None

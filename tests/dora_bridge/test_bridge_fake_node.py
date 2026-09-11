@@ -38,7 +38,12 @@ def make_bridge(tmp_path, *, cfg=None, plane_kwargs=None, node=None, versions=la
         holder["plane"] = FakeControlPlane(c, var_dir, arm_ips, **(plane_kwargs or {}))
         return holder["plane"]
 
-    fake_node = node or FakeNode()
+    # v1.3: the rendered dataflow carries a policy_action_<arm> input per configured arm and
+    # the bridge's attach check expects exactly those rows (FakeNode mirrors them)
+    arm_ids = ["view", "grip"]
+    fake_node = node or FakeNode(
+        inputs=[*ext.RUNTIME_INPUTS, *(ext.policy_arm_action_input_id(a) for a in arm_ids)]
+    )
     holder["node"] = fake_node
     bridge = DoraBridge(
         cfg,
@@ -49,7 +54,7 @@ def make_bridge(tmp_path, *, cfg=None, plane_kwargs=None, node=None, versions=la
         clock=clock,
         barrier_probe=lambda timeout: holder["plane"].barrier_open,
     )
-    bridge.set_outputs(["view_wrist_cam"], ["view_wrist_cam"], "mic_view")
+    bridge.set_outputs(["view_wrist_cam"], ["view_wrist_cam"], "mic_view", arm_ids)
     holder["clock"] = clock
     return bridge, holder
 
@@ -221,6 +226,24 @@ def test_inbound_validation_and_dispatch(tmp_path):
         assert wait(lambda: len(got) == 5 and b.dropped_inputs == 3)
         node.push({"type": "INPUT_CLOSED", "id": ext.IN_POLICY_ACTION})
         assert wait(lambda: any(g["type"] == "INPUT_CLOSED" for g in got))
+        # v1.3: a per-arm input is just another registered id (its own seq counter per
+        # client); an unregistered per-arm id is dropped like any unknown input
+        per_arm = []
+        b.register_input(ext.policy_arm_action_input_id("grip"), lambda ev: per_arm.append(ev))
+        dropped = b.dropped_inputs
+        node.push_input(
+            ext.policy_arm_action_input_id("grip"),
+            pa.array([0.0] * 8),
+            {"mavis_schema": 1, "seq": 1, "client": "c"},
+        )
+        node.push_input(
+            ext.policy_arm_action_input_id("nope"),
+            pa.array([0.0] * 8),
+            {"mavis_schema": 1, "seq": 1, "client": "c"},
+        )
+        assert wait(lambda: len(per_arm) == 1 and b.dropped_inputs == dropped + 1)
+        assert per_arm[0]["id"] == "policy_action_grip"
+        assert b.detail == "" or "inputs" not in b.detail  # the attach check knows the per-arm rows
     finally:
         b.stop()
 

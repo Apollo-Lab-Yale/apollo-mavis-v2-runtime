@@ -18,6 +18,13 @@ from apollo_mavis_v2_core import CommandSource, FrameRef, parse_frame, se3
 APOLLO_SCHEMA_VERSION = 1
 RAIL_AXIS = "y"  # rail translates along +Y of the rail-origin frame (10-frames §2.2)
 
+# The second, always-present action column (10-frames §6 / §11.4, 2026-09-11): the
+# COMMANDED TCP at frame k+1 as an absolute pose in the arm's recording frame, r6
+# rotation, absolute gripper + rail. ``action`` stays the canonical delta_ee column.
+ABS_EE_KEY = "action.abs_ee"
+ABS_EE_LABEL = "commanded_tcp_at_next_frame"
+ABS_EE_ROTATION = "rot6d_first_two_columns"
+
 ActionSpace = Literal["delta_ee", "abs_ee", "joint"]
 
 # int8 codes mirror core CommandSource string values (10-frames §7.3, binding).
@@ -32,7 +39,16 @@ ACTION_SOURCE_LABELS: dict[str, str] = {
 }
 
 _DELTA_EE_DIMS = ["ee.dx", "ee.dy", "ee.dz", "ee.drx", "ee.dry", "ee.drz", "gripper.pos"]
-_ABS_EE_DIMS = ["ee.x", "ee.y", "ee.z", "ee.qw", "ee.qx", "ee.qy", "ee.qz", "gripper.pos"]
+# abs_ee (10-frames §6, 2026-09-11): the TCP position + the first two COLUMNS of its
+# rotation matrix in column-major order [R00, R10, R20, R01, R11, R21] (Zhou et al. 2019,
+# Gram-Schmidt decode: se3.rot6d_to_mat) + the absolute gripper open fraction; 11 dims with
+# the rail (rail.pos = absolute carriage position), 10 without. Names are matrix row-col
+# indices: column 0 = the tool x-axis in the recording frame, column 1 = the tool y-axis.
+_ABS_EE_DIMS = [
+    "ee.x", "ee.y", "ee.z",
+    "ee.r00", "ee.r10", "ee.r20", "ee.r01", "ee.r11", "ee.r21",
+    "gripper.pos",
+]
 _JOINT_DIMS = [f"joint{i}.pos" for i in range(1, 8)] + ["gripper.pos"]
 _STATE_EE_DIMS = ["ee.x", "ee.y", "ee.z", "ee.qw", "ee.qx", "ee.qy", "ee.qz"]
 
@@ -76,17 +92,23 @@ def build_features(
 ) -> dict[str, dict]:
     """The full LeRobot features dict (10-frames §7; 04-runtime §10.2).
 
-    The five lerobot bookkeeping features are auto-added by the library —
-    never included here or in ``add_frame`` dicts.
+    ``action`` is the primary column in ``action_space`` (delta_ee, canonical);
+    ``action.abs_ee`` (:data:`ABS_EE_KEY`) is ALWAYS emitted next to it — the
+    commanded TCP at frame k+1 as an absolute r6 pose, so a dataset carries both
+    labels and a policy picks its space at training time. The five lerobot
+    bookkeeping features are auto-added by the library — never included here or
+    in ``add_frame`` dicts.
     """
     if not arms:
         raise ValueError("need at least one arm")
     action_names: list[str] = []
+    abs_names: list[str] = []
     state_names: list[str] = []
     for arm in arms:
         if arm.arm_id not in frames:
             raise ValueError(f"frames map missing arm {arm.arm_id!r}")
         action_names += arm_action_names(arm.arm_id, arm.has_rail, action_space)
+        abs_names += arm_action_names(arm.arm_id, arm.has_rail, "abs_ee")
         state_names += arm_state_names(arm.arm_id, arm.has_rail)
     frames_map = {a.arm_id: str(frames[a.arm_id]) for a in arms}
     rail_info = {
@@ -104,6 +126,23 @@ def build_features(
                 "action_space": action_space,
                 "frames": frames_map,
                 "rail": rail_info,
+            },
+        },
+        # The absolute companion of ``action`` (always emitted; the backfill tool
+        # ``tools/backfill_abs_ee.py`` adds it to datasets recorded before 2026-09-11).
+        # ``_feature_signature`` compares only the four convention keys; ``label`` and
+        # ``rotation`` are informative.
+        ABS_EE_KEY: {
+            "dtype": "float32",
+            "shape": (len(abs_names),),
+            "names": abs_names,
+            "info": {
+                "apollo_schema": APOLLO_SCHEMA_VERSION,
+                "action_space": "abs_ee",
+                "frames": dict(frames_map),
+                "rail": dict(rail_info),
+                "label": ABS_EE_LABEL,
+                "rotation": ABS_EE_ROTATION,
             },
         },
         "observation.state": {
@@ -179,6 +218,9 @@ def build_robot_type(n_arms: int, sim: bool) -> str:
 
 
 __all__ = [
+    "ABS_EE_KEY",
+    "ABS_EE_LABEL",
+    "ABS_EE_ROTATION",
     "APOLLO_SCHEMA_VERSION",
     "ACTION_SOURCE_LABELS",
     "RAIL_AXIS",

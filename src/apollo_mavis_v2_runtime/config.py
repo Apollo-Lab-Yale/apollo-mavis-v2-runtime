@@ -490,6 +490,10 @@ class DaggerConfig(BaseModel):
     policy_rate_hz: float = Field(default=15.0, ge=10.0, le=30.0)
     policy_device: str = "cuda:0"  # runtime-side inference; falls back to cpu
     slew_window_s: float = Field(default=0.4, ge=0.3, le=0.5)
+    # Leash of the policy's integrated delta_ee command to the MEASURED pose (the anchor
+    # integrates on the last gated command, 12-dagger §6 as amended 2026-09-11). None =
+    # ControlConfig.leash, the teleop leash (see dagger.policy_runner.anchor_leash_kwargs).
+    anchor_leash: LeashConfig | None = None
     trainer: TrainerSettings = TrainerSettings()
 
 

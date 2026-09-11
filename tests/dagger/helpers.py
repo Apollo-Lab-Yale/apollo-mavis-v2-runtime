@@ -13,6 +13,7 @@ from apollo_mavis_v2_core.dagger import CheckpointInfo
 
 STATE_DIM = 16  # 1 arm + rail: 7 joints + grip + rail + ee pos3 + quat4
 ACTION_DIM = 8  # [dx dy dz drx dry drz grip rail.dpos]
+ABS_ACTION_DIM = 11  # [x y z r00 r10 r20 r01 r11 r21 grip rail.pos] (action.abs_ee, 2026-09-11)
 FRAME = "arm_base:arm0"
 
 
@@ -121,6 +122,11 @@ def make_spool(
         "intervention": pa.array([bool(m != 0) for m in modes]),
         "action_source": pa.array([3 if m else 0 for m in modes]),
         "wallclock_ns": pa.array(list(range(n_frames))),
+        # the recorder's spool carries the absolute column too (appended last); the
+        # trainer reads by name and never touches it
+        "action.abs_ee": pa.array(
+            rng.standard_normal((n_frames, ABS_ACTION_DIM)).astype(np.float32).tolist()
+        ),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table(pa_cols), path)

@@ -333,6 +333,12 @@ class FakeArmMonitor:
     scripted_outcome: object | None = None
     join_result: bool = True  # phase-09c: False = poll thread still inside the SDK
     homing_calls: list[tuple[float, ...]] = field(default_factory=list)  # expected_q per homing
+    # 2026-09-11 set_collision_sensitivity: the levels written, the SDK code to answer with
+    # (0 clean; 1 / 2 / 9 = a status echo the hardware half treats as ok; anything else
+    # fails and leaves the read-back unchanged) and a read-back override (None = obey)
+    sensitivity_calls: list[int] = field(default_factory=list)
+    sensitivity_code: int = 0
+    sensitivity_readback: int | None = None
     _status: str = "off"
 
     def start(self) -> None:
@@ -362,12 +368,32 @@ class FakeArmMonitor:
         *,
         expected_q=None,
         q_tol_rad: float = 0.02,
+        level: int | None = None,
     ):
         self.maintenance_calls.append((op, driver_cfg, timeout_s))
-        if op not in ("clear_errors", "apply_backstops", "recover", "home_rail"):
+        if op not in (
+            "clear_errors",
+            "apply_backstops",
+            "recover",
+            "home_rail",
+            "set_collision_sensitivity",
+        ):
             raise ValueError(f"unknown maintenance op {op!r}")
         if op == "recover":
             return FakeMaintenanceOutcome(self.arm_id, op, False, "recover needs a session")
+        if op == "set_collision_sensitivity" and (
+            level is None
+            or isinstance(level, bool)
+            or int(level) != level
+            or level not in (1, 2, 3)
+        ):
+            return FakeMaintenanceOutcome(
+                self.arm_id,
+                op,
+                False,
+                f"set_collision_sensitivity needs a level of 1, 2 or 3 (got {level!r}); 0 turns "
+                "detection off and 4 / 5 false-trigger under payload",
+            )
         if op == "apply_backstops" and driver_cfg is None:
             return FakeMaintenanceOutcome(
                 self.arm_id, op, False, "apply_backstops needs the arm's driver config"
@@ -393,6 +419,8 @@ class FakeArmMonitor:
         before = self.sample
         if op == "home_rail":
             return self._home_rail(before, driver_cfg, tuple(expected_q), q_tol_rad)
+        if op == "set_collision_sensitivity":
+            return self._set_collision_sensitivity(before, driver_cfg, int(level))
         if op == "clear_errors":
             codes = {"clean_error": 0, "clean_warn": 0}
             err = getattr(before, "error_code", 0) if before is not None else 0
@@ -427,6 +455,56 @@ class FakeArmMonitor:
             )
         if after is not None:
             self.sample = after  # the monitor's newest sample reflects the op
+        return FakeMaintenanceOutcome(self.arm_id, op, True, detail, codes, (), before, after)
+
+    def _set_collision_sensitivity(self, before, driver_cfg, level: int):
+        """Mirror of the hardware monitor's ``set_collision_sensitivity`` branch: ONE
+        write, judged by the after-sample read-back (a 1 / 2 / 9 status echo is ok
+        and noted; any other non-zero code fails and the value stays)."""
+        op = "set_collision_sensitivity"
+        self.sensitivity_calls.append(level)
+        code = int(self.sensitivity_code)
+        codes = {"set_collision_sensitivity": code}
+        if code != 0 and code not in (1, 2, 9):
+            return FakeMaintenanceOutcome(
+                self.arm_id, op, False, f"set_collision_sensitivity returned {code}", codes,
+                (), before, before,
+            )
+        readback = level if self.sensitivity_readback is None else int(self.sensitivity_readback)
+        after = (
+            replace(before, seq=before.seq + 2, collision_sensitivity=readback)
+            if before is not None
+            else None
+        )
+        if after is not None:
+            self.sample = after
+        echo = f" (set_collision_sensitivity returned {code}: status echo)" if code else ""
+        if after is None:
+            return FakeMaintenanceOutcome(
+                self.arm_id, op, False,
+                f"collision sensitivity {level} written but not verified{echo}", codes,
+            )
+        if readback != level:
+            return FakeMaintenanceOutcome(
+                self.arm_id, op, False,
+                f"collision sensitivity still reads {readback} after writing {level}{echo}",
+                codes, (), before, after,
+            )
+        cfg = getattr(driver_cfg, "collision_sensitivity", None)
+        notes = []
+        if before is not None and before.collision_sensitivity is not None:
+            notes.append(f"was {before.collision_sensitivity}")
+        notes.append(
+            f"the config value {cfg} is re-applied at the next connect"
+            if cfg is not None
+            else "the config value is re-applied at the next connect"
+        )
+        detail = f"collision sensitivity set to {level} ({'; '.join(notes)})"
+        if code:
+            detail += (
+                f" (set_collision_sensitivity returned {code}: status echo, value verified by "
+                "read-back)"
+            )
         return FakeMaintenanceOutcome(self.arm_id, op, True, detail, codes, (), before, after)
 
     def _home_rail(self, before, driver_cfg, expected_q, q_tol_rad):

@@ -17,6 +17,21 @@ an obstacle), ``hold`` (never sends actions: spec only). Test knobs:
 (policy_version += 1 after N actions), ``--stale-obs`` (echo an observation_id
 that is ``--stale-obs`` messages old), ``--client`` (metadata ``client``).
 
+**Per-arm action streams** (v1.3, 2026-09-11; 14-dora §5 / §6.1) — ``--arms grip[,view]``
+drives ONLY the listed arms: the spec announces ``arms``, ``action_names`` restricted to
+those arms' blocks (session order) and ``action_frames`` from the session's per-arm frames,
+and every action goes out per arm on ``action_<arm_id>`` (that arm's 7 / 8-dim block, an
+``arm_id`` metadata key) instead of the whole-cell ``action``; the runtime holds every other
+arm. ``mic_<id>`` blocks the placeholder receives are counted (``stats["mic_blocks"]``).
+
+**``--action-space abs_ee``** (2026-09-11) — the fake announces the 11 / 10-dim
+``[ee.x, ee.y, ee.z, ee.r00, ee.r10, ee.r20, ee.r01, ee.r11, ee.r21, gripper.pos, rail.pos?]``
+blocks (the ``action.abs_ee`` dataset column) instead of the session's ``delta_ee`` names and
+every row HOLDS the observed TCP of ``obs_state`` (position + the first two columns of the
+rotation matrix of the observed quaternion), the observed gripper and rail, with the
+scripted modes' small x/y/z wiggle on top (``collide`` walks the position along its axis). It
+never emits a zero absolute row: without an observation to hold it does not act.
+
 **Trainer role** (phase-14; 15-online-dagger §6, §10) — ``FAKE_TRAINER=1`` (or
 ``--trainer``) plays the policy repo's generic Online DAgger trainer without learning
 anything: ``spec.capabilities = ["online_dagger"]``; a ``session`` announce with an
@@ -83,6 +98,48 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+# The abs_ee per-arm block (mirrors recorder/features.py; the fake imports no runtime code):
+# TCP position, the first two COLUMNS of its rotation matrix (column-major), gripper, rail.
+ABS_EE_DIMS = (
+    "ee.x",
+    "ee.y",
+    "ee.z",
+    "ee.r00",
+    "ee.r10",
+    "ee.r20",
+    "ee.r01",
+    "ee.r11",
+    "ee.r21",
+    "gripper.pos",
+)
+
+
+def _quat_to_rot6d(q: np.ndarray) -> np.ndarray:
+    """wxyz unit quaternion -> ``[R00, R10, R20, R01, R11, R21]`` (Zhou et al. 2019)."""
+    w, x, y, z = (float(v) for v in q / max(float(np.linalg.norm(q)), 1e-12))
+    r00 = 1.0 - 2.0 * (y * y + z * z)
+    r10 = 2.0 * (x * y + z * w)
+    r20 = 2.0 * (x * z - y * w)
+    r01 = 2.0 * (x * y - z * w)
+    r11 = 1.0 - 2.0 * (x * x + z * z)
+    r21 = 2.0 * (y * z + x * w)
+    return np.array([r00, r10, r20, r01, r11, r21], dtype=np.float64)
+
+
+def _obs_by_name(value, meta: dict) -> dict[str, float] | None:
+    """``obs_state`` payload + its ``state_names`` metadata -> ``{name: value}``."""
+    names = meta.get("state_names") or []
+    if value is None or not names:
+        return None
+    try:
+        arr = np.asarray(value.to_numpy(zero_copy_only=False), dtype=np.float64).reshape(-1)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.shape[0] != len(names):
+        return None
+    return {str(n): float(v) for n, v in zip(names, arr, strict=True)}
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fake_policy")
     p.add_argument(
@@ -110,6 +167,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--client", default="fake_policy")
     p.add_argument(
         "--action-frame", default=None, help="override spec.action_frame (mismatch tests)"
+    )
+    p.add_argument(
+        "--arms",
+        default="",
+        help="comma list of arm ids to DRIVE: per-arm action_<arm> streams instead of the "
+        "whole-cell action (v1.3); empty = every session arm on `action`",
+    )
+    p.add_argument(
+        "--action-space",
+        default=None,
+        choices=["delta_ee", "abs_ee"],
+        help="announce this action space (default: the session's, delta_ee); abs_ee rows "
+        "hold the observed TCP / gripper / rail (+ the scripted wiggle)",
     )
     p.add_argument("--session-id", default=None, help="override echoed session_id (drop tests)")
     p.add_argument("--duration-s", type=float, default=0.0, help="0 = run until killed")
@@ -526,19 +596,105 @@ class FakePolicyNode:
         self.next_act_t = 0.0
         self.next_spec_t = 0.0
         self.nan_at = {int(x) for x in args.nan_at.split(",") if x.strip()}
+        self.collide_walk = 0.0  # abs_ee collide: metres walked along --collide-axis
         self.t0 = time.monotonic()
-        self.stats = {"actions": 0, "specs": 0, "obs": 0, "resets": 0, "reattach": 0}
+        self.stats = {
+            "actions": 0,
+            "specs": 0,
+            "obs": 0,
+            "resets": 0,
+            "reattach": 0,
+            "mic_blocks": 0,
+            "per_arm_actions": {},
+        }
+        # v1.3: the arms this fake drives (per-arm streams); [] = whole cell on `action`
+        self.arms: list[str] = [a.strip() for a in str(args.arms or "").split(",") if a.strip()]
+        # v1.3: a real policy's action layout is FIXED (its dataset's arm order) and does NOT
+        # flip with the runtime's announce - the idle announce is in workcell order, a running
+        # session in SessionSpec.arms order. The fake commits to the FIRST arm order it sees and
+        # keeps it for BOTH the spec announce AND the action vector, so the two always agree and
+        # the runtime routes each block to its arm by name (see policy_source.action_block_layout).
+        self._arm_order: list[str] = []
         # phase-14: the trainer role (FAKE_TRAINER=1 / --trainer); None = a plain policy
         self.trainer: FakeTrainerRole | None = FakeTrainerRole(self) if args.trainer else None
         self.poll_s = 0.1 if self.trainer is not None else 0.5
 
     # -- messages ---------------------------------------------------------------------------------
+    def _ordered_arms(self) -> list[str]:
+        """The session's arms in the COMMITTED order (v1.3): the arm order the fake first
+        saw, kept stable so the announced spec and the action vector never disagree even
+        when a running session announces its arms in a different order than the idle cell."""
+        present = list((self.session or {}).get("arm_ids") or [])
+        if not self._arm_order:
+            return present
+        ordered = [a for a in self._arm_order if a in present]
+        return ordered + [a for a in present if a not in ordered]
+
+    def action_space(self) -> str:
+        """The announced space: ``--action-space`` else the session's (``delta_ee``)."""
+        return str(self.a.action_space or (self.session or {}).get("action_space") or "delta_ee")
+
+    def _has_rail(self, arm: str) -> bool:
+        s = self.session or {}
+        rail = s.get("has_rail") or {}
+        if arm in rail:
+            return bool(rail[arm])
+        return f"{arm}_rail.dpos" in (s.get("action_names") or [])
+
+    def _block_names(self, arm: str) -> list[str]:
+        """``arm``'s action-name block: the session's (delta_ee, within-block order
+        preserved) or, under ``--action-space abs_ee``, the 11 / 10-dim abs layout built
+        here (the fake imports nothing from the runtime; mirrors recorder/features.py)."""
+        if self.action_space() == "abs_ee":
+            dims = list(ABS_EE_DIMS) + (["rail.pos"] if self._has_rail(arm) else [])
+            return [f"{arm}_{d}" for d in dims]
+        names = list((self.session or {}).get("action_names") or [])
+        return [n for n in names if n.startswith(f"{arm}_")]
+
+    def names(self) -> list[str]:
+        """The whole-cell ``action_names`` in the fake's COMMITTED arm order (the layout it
+        announces AND the columns of the action vector it publishes - the two always agree)."""
+        arms = self._ordered_arms()
+        if not arms:
+            return list((self.session or {}).get("action_names") or [])
+        return [n for a in arms for n in self._block_names(a)]
+
+    def driven_arms(self) -> list[str]:
+        """``--arms`` in the fake's COMMITTED order; the listed arms the session does not have
+        are kept at the end so the runtime's 409 names them."""
+        if not self.arms:
+            return []
+        order = self._ordered_arms()
+        return [a for a in order if a in self.arms] + [a for a in self.arms if a not in order]
+
+    def arm_columns(self, arm: str) -> list[int]:
+        """Column indices of ``arm``'s block in :meth:`names` (the committed whole-cell layout)."""
+        names = self.names()
+        return [i for i, n in enumerate(names) if n.startswith(f"{arm}_")]
+
     def spec_json(self) -> str:
         s = self.session or {}
+        frames = s.get("frames") or {}
+        driven = self.driven_arms()
+        names = self.names()  # committed order: the spec announce == the action-vector columns
+        # v1.3: each arm announces its own session frame (a whole-cell fake on the two-arm
+        # cell records grip in arm_base:grip and view in arm_base:view - before v1.3 no single
+        # action_frame could satisfy both)
+        action_frames = {str(a): str(f) for a, f in frames.items()}
+        if driven:  # only the driven arms' blocks, in session order
+            names = [n for a in driven for n in (names[i] for i in self.arm_columns(a))]
+            action_frames = {a: str(frames[a]) for a in driven if a in frames}
         frame = self.a.action_frame
         if frame is None:
-            frames = s.get("frames") or {}
-            frame = next(iter(frames.values()), "arm_base:grip")
+            if driven and driven[0] in frames:
+                frame = str(frames[driven[0]])
+            else:
+                frame = next(iter(frames.values()), "arm_base:grip")
+        else:
+            # an explicit --action-frame is the mismatch-test knob: it overrides the per-arm
+            # map too, so the runtime's per-DRIVEN-arm frame check sees the override (else the
+            # session-frame auto-fill above would shadow it and every arm would match)
+            action_frames = dict.fromkeys(action_frames, str(frame))
         return json.dumps(
             {
                 "mavis_schema": MAVIS_SCHEMA,
@@ -546,12 +702,14 @@ class FakePolicyNode:
                 "policy_version": self.version,
                 "node_version": NODE_VERSION,
                 "spec": {
-                    "action_space": s.get("action_space") or "delta_ee",
+                    "action_space": self.action_space(),
                     "action_frame": frame,
-                    "action_names": list(s.get("action_names") or []),
+                    "action_names": names,
                     "state_names": list(s.get("state_names") or []),
                     "camera_keys": [],
                     "version": self.version,
+                    "arms": driven,
+                    "action_frames": action_frames,
                 },
                 "rate_hz": float(self.a.rate_hz),
                 "chunk_len": int(self.a.chunk) if self.a.mode == "chunk" else 1,
@@ -567,7 +725,11 @@ class FakePolicyNode:
             }
         )
 
-    def act(self, dim: int, k: int) -> np.ndarray:
+    def act(self, dim: int, k: int, obs: dict[str, float] | None = None) -> np.ndarray | None:
+        """``k`` rows of the announced layout; ``obs`` = the ``obs_state`` dims by name (the
+        abs_ee hold needs it: None -> no rows, never zeros)."""
+        if self.action_space() == "abs_ee":
+            return self._act_abs(dim, k, obs)
         rows = np.zeros((k, dim), dtype=np.float32)
         if self.a.mode in ("echo", "hold"):
             pass
@@ -579,17 +741,68 @@ class FakePolicyNode:
             rows[:, idx] = sign * per_step  # a constant recording-frame delta every period
         else:
             t = self.acts / float(self.a.rate_hz)
-            for r in range(k):
-                ph = t + r / float(self.a.rate_hz)
-                rows[r, 0] = self.a.amplitude_m * math.sin(2 * math.pi * 0.5 * ph)
-                rows[r, 1] = self.a.amplitude_m * math.cos(2 * math.pi * 0.5 * ph)
-                if dim > 2:
-                    rows[r, 2] = 0.5 * self.a.amplitude_m * math.sin(2 * math.pi * 0.25 * ph)
+            # v1.3: move EVERY driven arm's block, not just the flat vector's first columns -
+            # the first three names of each per-arm delta_ee block are ee.dx/dy/dz
+            amp = self.a.amplitude_m
+            drive = self.driven_arms() or self._ordered_arms()
+            for arm in drive:
+                cols = [i for i in self.arm_columns(arm) if i < dim]
+                for r in range(k):
+                    ph = t + r / float(self.a.rate_hz)
+                    if len(cols) > 0:
+                        rows[r, cols[0]] = amp * math.sin(2 * math.pi * 0.5 * ph)
+                    if len(cols) > 1:
+                        rows[r, cols[1]] = amp * math.cos(2 * math.pi * 0.5 * ph)
+                    if len(cols) > 2:
+                        rows[r, cols[2]] = 0.5 * amp * math.sin(2 * math.pi * 0.25 * ph)
         # gripper dims (every 7th when the layout is per-arm 6 + grip [+ rail]) stay absolute 1.0
-        names = list((self.session or {}).get("action_names") or [])
+        names = self.names()
         for i, n in enumerate(names):
             if n.endswith("gripper.pos") and i < dim:
                 rows[:, i] = 1.0
+        if self.a.mode == "nan" and self.acts in self.nan_at:
+            rows[:] = np.nan
+        return rows
+
+    def _act_abs(self, dim: int, k: int, obs: dict[str, float] | None) -> np.ndarray | None:
+        """abs_ee rows: HOLD the observed TCP (r6 of the observed quaternion), gripper and
+        rail per driven arm; scripted modes add the x/y/z wiggle, ``collide`` walks along its
+        axis. An arm whose observation is missing yields no row at all (None)."""
+        if not obs:
+            return None
+        rows = np.zeros((k, dim), dtype=np.float32)
+        drive = self.driven_arms() or self._ordered_arms()
+        t = self.acts / float(self.a.rate_hz)
+        amp = self.a.amplitude_m if self.a.mode not in ("echo", "hold") else 0.0
+        if self.a.mode == "collide":
+            self.collide_walk += self.a.collide_mps / float(self.a.rate_hz)
+        for arm in drive:
+            cols = [i for i in self.arm_columns(arm) if i < dim]
+            if len(cols) < 10:
+                continue
+            try:
+                pos = np.array([obs[f"{arm}_ee.{ax}"] for ax in "xyz"], dtype=np.float64)
+                quat = np.array([obs[f"{arm}_ee.q{c}"] for c in "wxyz"], dtype=np.float64)
+                grip = float(obs.get(f"{arm}_gripper.pos", 1.0))
+            except KeyError:
+                return None  # no observed TCP for this arm: never an absolute zero row
+            r6 = _quat_to_rot6d(quat)
+            for r in range(k):
+                ph = t + r / float(self.a.rate_hz)
+                p = pos.copy()
+                if self.a.mode == "collide":
+                    axis = self.a.collide_axis.strip()
+                    sign = -1.0 if axis.startswith("-") else 1.0
+                    p["xyz".index(axis[-1].lower())] += sign * self.collide_walk
+                else:
+                    p[0] += amp * math.sin(2 * math.pi * 0.5 * ph)
+                    p[1] += amp * math.cos(2 * math.pi * 0.5 * ph)
+                    p[2] += 0.5 * amp * math.sin(2 * math.pi * 0.25 * ph)
+                rows[r, cols[:3]] = p
+                rows[r, cols[3:9]] = r6
+                rows[r, cols[9]] = grip
+                if len(cols) > 10:
+                    rows[r, cols[10]] = float(obs.get(f"{arm}_rail.pos", 0.0))
         if self.a.mode == "nan" and self.acts in self.nan_at:
             rows[:] = np.nan
         return rows
@@ -698,6 +911,8 @@ class FakePolicyNode:
                     self.session = json.loads(ev["value"][0].as_py())
                 except Exception:  # noqa: BLE001
                     continue
+                if not self._arm_order:  # commit the first layout order and never flip it
+                    self._arm_order = list(self.session.get("arm_ids") or [])
                 self._publish_spec(node, pa)
                 self.next_spec_t = now + 1.0
                 if self.trainer is not None:
@@ -722,11 +937,14 @@ class FakePolicyNode:
                     self.violate_until = now + 2.0
             elif iid == "obs_state":
                 self.stats["obs"] += 1
-                self._on_obs(node, pa, meta, now)
+                self._on_obs(node, pa, meta, now, ev.get("value"))
+            elif isinstance(iid, str) and iid.startswith("mic_"):
+                self.stats["mic_blocks"] += 1  # v1.3: the microphone reaches the policy too
 
-    def _on_obs(self, node, pa, meta: dict, now: float) -> None:
+    def _on_obs(self, node, pa, meta: dict, now: float, value=None) -> None:
         if self.a.mode == "hold" or self.session is None:
             return
+        obs = _obs_by_name(value, meta) if self.action_space() == "abs_ee" else None
         oid = int(meta.get("observation_id", 0))
         self.recent_obs.append(oid)
         del self.recent_obs[:-64]
@@ -735,12 +953,14 @@ class FakePolicyNode:
         if now + 0.25 / 30.0 < self.next_act_t:
             return
         self.next_act_t = now + 1.0 / float(self.a.rate_hz)
-        names = list(self.session.get("action_names") or [])
+        names = self.names()  # committed order (matches the announced spec.action_names)
         dim = len(names) or int(meta.get("action_dim", 8))
         k = int(self.a.chunk) if self.a.mode == "chunk" else 1
         if self.a.mode == "delay" and self.a.delay_ms > 0:
             time.sleep(self.a.delay_ms / 1000.0)
-        rows = self.act(dim, k)
+        rows = self.act(dim, k, obs)
+        if rows is None:
+            return  # abs_ee with nothing observed to hold: no action (never zeros)
         echo = oid
         if now < self.violate_until:
             echo = max(1, self.watermark)  # deliberately at/below the watermark
@@ -753,23 +973,42 @@ class FakePolicyNode:
             self.version += 1
             self._publish_spec(node, pa)
         chunk_dt = float(self.a.chunk_dt_s) if self.a.chunk_dt_s else 1.0 / float(self.a.rate_hz)
-        self._send(
-            node,
-            pa,
-            "action",
-            pa.array(rows.reshape(-1), type=pa.float32()),
-            {
+
+        def _meta(block: np.ndarray, extra: dict | None = None) -> dict:
+            m = {
                 "observation_id": int(echo),
                 "chunk_len": int(k),
-                "action_dim": int(dim),
+                "action_dim": int(block.shape[1]),
                 "chunk_dt_s": chunk_dt,
                 "policy_id": self.a.policy_id,
                 "policy_version": int(self.version),
                 "compute_ms": float(self.a.delay_ms),
-                "finite": bool(np.all(np.isfinite(rows))),
+                "finite": bool(np.all(np.isfinite(block))),
                 "image_seq_used": [int(x) for x in (meta.get("image_seq") or [])],
-            },
-        )
+            }
+            m.update(extra or {})
+            return m
+
+        driven = self.driven_arms()
+        if driven:  # v1.3: one stream per driven arm, that arm's block only
+            for arm in driven:
+                cols = self.arm_columns(arm)
+                if not cols:
+                    continue  # not a session arm: nothing to slice (the runtime 409s the spec)
+                block = np.ascontiguousarray(rows[:, cols])
+                self._send(
+                    node,
+                    pa,
+                    f"action_{arm}",
+                    pa.array(block.reshape(-1), type=pa.float32()),
+                    _meta(block, {"arm_id": arm}),
+                )
+                per_arm = self.stats["per_arm_actions"]
+                per_arm[arm] = int(per_arm.get(arm, 0)) + 1
+        else:
+            self._send(
+                node, pa, "action", pa.array(rows.reshape(-1), type=pa.float32()), _meta(rows)
+            )
         self.stats["actions"] += 1
 
     def _dump(self) -> None:

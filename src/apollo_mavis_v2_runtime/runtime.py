@@ -11,7 +11,11 @@ from apollo_mavis_v2_core.protocol import ArmMaintenanceResult, MicrophoneInfo
 
 from .bus import RuntimeBus
 from .config import RuntimeConfig
-from .devices.hardware_monitor import MAINTENANCE_TIMEOUT_S, HardwareStateMonitor
+from .devices.hardware_monitor import (
+    COLLISION_SENSITIVITY_LEVELS,
+    MAINTENANCE_TIMEOUT_S,
+    HardwareStateMonitor,
+)
 from .devices.hardware_probe import HardwareProbe
 from .devices.microphone import MicrophoneReader, to_info
 from .devices.rail_homing import RailHomingService
@@ -202,14 +206,27 @@ class Runtime:
 
     # -- arm maintenance routing (REST; phase-09b/09c, 04-runtime §13.1) -------------------
     def arm_maintenance(
-        self, arm_id: str, op: str, *, dry_run: bool = False
+        self,
+        arm_id: str,
+        op: str,
+        *,
+        dry_run: bool = False,
+        collision_sensitivity: int | None = None,
     ) -> ArmMaintenanceResult:
         """``POST /api/hardware/arms/{arm_id}/maintenance``: unknown hardware arm ->
         ``KeyError`` (404); a hardware session owns the boxes -> the session path
         (``clear_errors`` / ``recover`` = the driver's user recovery,
-        ``apply_backstops`` and ``home_rail`` refused); otherwise the read-only
-        monitor's maintenance queue (``recover`` refused: "no hardware session -
-        use clear_errors"). ``home_rail`` (phase-09c) is THE ONE op that moves a
+        ``set_collision_sensitivity`` = the session driver's one write via
+        ``SessionManager.session_set_collision_sensitivity``, ``apply_backstops``
+        and ``home_rail`` refused); otherwise the read-only monitor's maintenance
+        queue (``recover`` refused: "no hardware session - use clear_errors").
+        ``set_collision_sensitivity`` (2026-09-11) is allowed on BOTH paths: it is
+        one write of ``collision_sensitivity`` (1..3; ``None`` or out of range ->
+        ``ValueError`` -> 422 - pydantic enforces it on the wire, this is the
+        guard for in-process callers), no motion, volatile (the config value
+        returns at the next driver connect); the runtime remembers the level per
+        arm for telemetry (``HardwareStateMonitor.requested_sensitivity``).
+        ``home_rail`` (phase-09c) is THE ONE op that moves a
         mechanical part - the carriage drives to the track's zero end - so it is
         session-less only ("end the session first"), twin-gated (``rail_sweep``)
         and routed to the :class:`RailHomingService` (phase-09d): ``dry_run``
@@ -226,6 +243,19 @@ class Runtime:
         hw = self.cfg.workcell_config("hardware")
         if hw is None or all(a.id != arm_id for a in hw.arms):
             raise KeyError(arm_id)
+        level: int | None = None
+        if op == "set_collision_sensitivity":
+            if (
+                collision_sensitivity is None
+                or isinstance(collision_sensitivity, bool)
+                or int(collision_sensitivity) != collision_sensitivity
+                or int(collision_sensitivity) not in COLLISION_SENSITIVITY_LEVELS
+            ):
+                raise ValueError(
+                    "set_collision_sensitivity needs collision_sensitivity 1, 2 or 3 "
+                    f"(got {collision_sensitivity!r})"
+                )
+            level = int(collision_sensitivity)
         busy_arm = self.rail_homing.active_arm  # phase-09d: a job owns the cell
         if busy_arm is not None:
             raise MaintenanceUnavailableError(
@@ -237,6 +267,11 @@ class Runtime:
                 raise MaintenanceUnavailableError(
                     "home_rail is not available while a hardware session owns the arms - "
                     "end the session first"
+                )
+            if op == "set_collision_sensitivity":
+                assert level is not None
+                return self.manager.session_set_collision_sensitivity(
+                    arm_id, level, timeout_s=MAINTENANCE_TIMEOUT_S
                 )
             return self.manager.session_recovery(arm_id, op, timeout_s=MAINTENANCE_TIMEOUT_S)
         if op == "home_rail" and not dry_run and not self.cfg.hardware_session.armed:
@@ -256,7 +291,11 @@ class Runtime:
                 )
             return self.rail_homing.request(arm_id, dry_run=dry_run)
         return self.hardware_monitor.maintenance(
-            arm_id, op, timeout_s=MAINTENANCE_TIMEOUT_S, dry_run=dry_run
+            arm_id,
+            op,
+            timeout_s=MAINTENANCE_TIMEOUT_S,
+            dry_run=dry_run,
+            collision_sensitivity=level,
         )
 
     def last_maintenance(self, arm_id: str) -> ArmMaintenanceResult | None:

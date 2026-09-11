@@ -159,6 +159,16 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
         # through RECOVERING, or a lingering Studio-conflict warning) + re-seed flag.
         faults = snap.session_extra.get("arm_faults") or {}
         recovering = set(snap.session_extra.get("arm_recovering") or ())
+        # 2026-09-11: the collision sensitivity the operator wrote this session
+        # (set_collision_sensitivity, session path) - the driver's report stream has no
+        # read-back, so the runtime's per-arm requested level is the in-session value;
+        # None = the config value / unknown. Hardware sessions only (sim has no controller).
+        monitor = getattr(runtime, "hardware_monitor", None)
+        sensitivity_of = (
+            monitor.requested_sensitivity
+            if monitor is not None and session is not None and session.spec.kind == "hardware"
+            else (lambda _arm_id: None)
+        )
         for arm_id, st in snap.arms.items():
             arms.append(
                 ArmTelemetry(
@@ -177,6 +187,7 @@ def build_telemetry(runtime, seq: int) -> TelemetryMsg:
                     goto=snap.plan_status.get(arm_id),
                     fault_detail=str(faults.get(arm_id, "") or ""),
                     recovering=arm_id in recovering,
+                    collision_sensitivity=sensitivity_of(arm_id),
                 )
             )
     return TelemetryMsg(

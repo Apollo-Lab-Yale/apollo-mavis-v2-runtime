@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -158,6 +158,8 @@ class DoraBridge:
         self.depth_outputs: list[str] = []
         self.mic_output: str | None = None
         self.camera_ids: list[str] = []  # publishable camera ids (config filter applied)
+        self.arm_ids: list[str] = []  # configured arms -> per-arm policy_action_<arm> inputs (v1.3)
+        self.arm_action_inputs: list[str] = []
         self.yaml_path = self.var_dir / YAML_NAME
         self._registered: set[str] = set()  # daemons seen by the last rescan (configured ids)
         self._rendered_machines: tuple[str, ...] = ()  # machines whose placeholders are live
@@ -196,10 +198,17 @@ class DoraBridge:
 
     # -- wiring -----------------------------------------------------------------------------
     def set_outputs(
-        self, camera_ids: list[str], depth_camera_ids: list[str], mic_id: str | None
+        self,
+        camera_ids: list[str],
+        depth_camera_ids: list[str],
+        mic_id: str | None,
+        arm_ids: Sequence[str] = (),
     ) -> None:
-        """Which optional outputs the rendered dataflow declares (before ``start``)."""
+        """Which optional outputs the rendered dataflow declares (before ``start``) and,
+        since v1.3 (2026-09-11), which arms get a per-arm ``policy_action_<arm_id>`` input."""
         pub = self.cfg.publish
+        self.arm_ids = list(arm_ids)
+        self.arm_action_inputs = [ext.policy_arm_action_input_id(a) for a in self.arm_ids]
         cams = (
             list(camera_ids)
             if pub.cameras == "all"
@@ -520,6 +529,7 @@ class DoraBridge:
             depth_camera_ids=[
                 c for c in self.camera_ids if ext.depth_output_id(c) in self.depth_outputs
             ],
+            arm_ids=self.arm_ids,
         )
         self.yaml_path.write_text(text, encoding="utf-8")
         plane.validate(self.yaml_path)
@@ -552,8 +562,9 @@ class DoraBridge:
         inputs = cfg.get("inputs") if isinstance(cfg, dict) else None
         outputs = cfg.get("outputs") if isinstance(cfg, dict) else None
         problems = []
-        if isinstance(inputs, dict) and set(inputs) != set(ext.RUNTIME_INPUTS):
-            problems.append(f"inputs {sorted(inputs)} != {sorted(ext.RUNTIME_INPUTS)}")
+        expected_in = set(ext.RUNTIME_INPUTS) | set(self.arm_action_inputs)
+        if isinstance(inputs, dict) and set(inputs) != expected_in:
+            problems.append(f"inputs {sorted(inputs)} != {sorted(expected_in)}")
         expected_out = (
             set(ext.RUNTIME_FIXED_OUTPUTS) | set(self.camera_outputs) | set(self.depth_outputs)
         )

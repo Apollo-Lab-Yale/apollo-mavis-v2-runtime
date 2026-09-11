@@ -85,10 +85,13 @@ def test_dagger_features_verbatim():
         "info": {"labels": {"0": "novice", "1": "expert"}, "derived_from": "control_mode != 0"},
     }
     assert ACTOR_LABELS == {"0": "novice", "1": "expert"}
-    assert SPOOL_COLUMNS[-1] == "actor" and SPOOL_COLUMNS[:8] == (
+    # appended columns stay LAST in arrival order (readers select by name): actor (phase-14),
+    # then action.abs_ee (2026-09-11)
+    assert SPOOL_COLUMNS[-2:] == ("actor", "action.abs_ee") and SPOOL_COLUMNS[:8] == (
         "action", "observation.state", "control_mode", "policy_action", "policy_version",
         "intervention", "action_source", "wallclock_ns",
     )
+    assert feats["action.abs_ee"]["shape"] == (11,)  # the base schema's second action column
     assert "apollo_schema" not in feats.get("actor", {}).get("info", {})  # never bumped
 
 
@@ -149,6 +152,10 @@ def test_frames_carry_modes_nan_rows_and_labels(rig):
     table = pq.read_table(spool)
     assert table.num_rows == n
     assert table.column_names == list(SPOOL_COLUMNS)
+    abs_rows = np.asarray(table.column("action.abs_ee").to_pylist(), dtype=np.float32)
+    assert abs_rows.shape == (n, 11)
+    assert np.allclose(abs_rows[:, :3], Q0[:3], atol=1e-6)  # commanded TCP (q_cmd is Q0 here)
+    assert np.allclose(abs_rows[:, 9], 0.7) and np.allclose(abs_rows[:, 10], Q0[7])
     spool_modes = np.asarray(table.column("control_mode"))
     assert (spool_modes == modes).all()
     assert (np.asarray(table.column("actor")) == actors).all()

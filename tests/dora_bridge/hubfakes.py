@@ -66,6 +66,9 @@ def announce(
     names=NAMES,
     rate: float = 15.0,
     capabilities: list[str] | None = None,
+    arms: list[str] | None = None,
+    action_frames: dict[str, str] | None = None,
+    action_space: str = "delta_ee",
 ) -> PolicySpecAnnounce:
     return PolicySpecAnnounce(
         policy_id="fake",
@@ -73,10 +76,12 @@ def announce(
         node_version="t",
         rate_hz=rate,
         spec=PolicySpecModel(
-            action_space="delta_ee",
+            action_space=action_space,
             action_frame=frame,
             action_names=list(names),
             state_names=[f"arm0_joint{i}.pos" for i in range(1, 4)],
+            arms=list(arms or []),
+            action_frames=dict(action_frames or {}),
         ),
         capabilities=list(capabilities or []),
     )

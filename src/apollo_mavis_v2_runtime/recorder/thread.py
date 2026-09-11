@@ -12,6 +12,14 @@ pending until the next one fixes its action ("executed action aligned with
 obs"). Camera staleness (age > 2/fps) drops the dataset frame and counts
 ``frames_dropped`` — never a bad frame.
 
+Absolute actions (2026-09-11): every frame also carries ``action.abs_ee`` — the
+COMMANDED TCP at frame k+1 (``FK(q_cmd[k+1])`` at ``link_tcp``, the same
+``cur.cmd_pose_b`` the delta is built from) converted into the arm's recording
+frame with the FULL commanded base pose, encoded as position + the first two
+rotation-matrix columns (r6), then the absolute gripper target AT k (identical to
+the delta column's gripper dim) and the commanded carriage position at k+1.
+``tools/backfill_abs_ee.py`` reproduces the same column for older episodes.
+
 Since 2026-09-07 (04-runtime §10.5/§10.6; 10-frames §11) the recorder is an
 ``EpisodeDirRecorder`` (one directory per saved episode; LeRobot v3 is an
 export) and the thread also (a) mirrors the dataset manifest into
@@ -43,7 +51,7 @@ from apollo_mavis_v2_core.interfaces.recorder import EpisodeRecorder
 from apollo_mavis_v2_core.protocol import ActionFilterConfig, EpisodeStatus
 
 from .action_filter import ActionFilter
-from .features import ArmMeta
+from .features import ABS_EE_KEY, ArmMeta
 from .frames import RecordingFrameConverter
 
 if TYPE_CHECKING:
@@ -68,6 +76,9 @@ class _Capture:
     base_quat_w: dict[str, np.ndarray]
     rail_cmd: dict[str, float | None]
     grip_cmd: dict[str, float]
+    # Full commanded T_W_B (rail-dependent position): convert_pose needs it for the
+    # world / camera recording frames of the abs_ee column; identity for arm_base.
+    base_pose_w_cmd: dict[str, Pose]
 
 
 class RecorderThread:
@@ -512,11 +523,16 @@ class RecorderThread:
         base_quat_w: dict[str, np.ndarray] = {}
         rail_cmd: dict[str, float | None] = {}
         grip_cmd: dict[str, float] = {}
+        base_pose_w_cmd: dict[str, Pose] = {}
         for arm in self.arms:
             st: ArmState = snap.arms[arm.arm_id]
             q_meas = np.asarray(st.q, dtype=np.float64)
             t_w_b = self.kin.base_world(arm.arm_id, q_meas)
-            ee_rec = self.converter.convert_pose(arm.arm_id, st.ee_pose, t_w_b)
+            # ee.* of observation.state is the twin FK of the MEASURED joints at link_tcp (not the
+            # driver-reported pose): one definition for sim, hardware and the backfill tool
+            # (recorder/backfill_abs_ee.py), so old and new episodes align bit-for-bit.
+            ee_meas_b = self.kin.tcp_base(arm.arm_id, q_meas)
+            ee_rec = self.converter.convert_pose(arm.arm_id, ee_meas_b, t_w_b)
             state_parts += [float(x) for x in q_meas[:7]]
             state_parts.append(float(st.gripper.open_frac))
             if arm.has_rail:
@@ -525,6 +541,7 @@ class RecorderThread:
             state_parts += [float(x) for x in ee_rec.orientation]
             q_cmd = np.asarray(snap.q_cmd[arm.arm_id], dtype=np.float64)
             cmd_pose_b[arm.arm_id] = self.kin.tcp_base(arm.arm_id, q_cmd)
+            base_pose_w_cmd[arm.arm_id] = self.kin.base_world(arm.arm_id, q_cmd)
             base_quat_w[arm.arm_id] = t_w_b.orientation
             rail_cmd[arm.arm_id] = float(q_cmd[7]) if arm.has_rail else None
             grip = snap.gripper_frac.get(arm.arm_id)
@@ -538,11 +555,14 @@ class RecorderThread:
             base_quat_w=base_quat_w,
             rail_cmd=rail_cmd,
             grip_cmd=grip_cmd,
+            base_pose_w_cmd=base_pose_w_cmd,
         )
 
     def _frame_from(self, prev: _Capture, cur: _Capture) -> dict[str, Any]:
-        """Dataset frame: obs at ``prev``, delta_ee action prev -> cur (§3.2)."""
+        """Dataset frame: obs at ``prev``, delta_ee action prev -> cur (§3.2) and the
+        absolute commanded TCP at ``cur`` (``action.abs_ee``, r6 rotation)."""
         action: list[float] = []
+        abs_ee: list[float] = []
         for arm in self.arms:
             a, b = prev.cmd_pose_b[arm.arm_id], cur.cmd_pose_b[arm.arm_id]
             dp_b = b.position - a.position
@@ -555,8 +575,16 @@ class RecorderThread:
             action.append(prev.grip_cmd[arm.arm_id])  # absolute open-frac target
             if arm.has_rail:
                 action.append(float(cur.rail_cmd[arm.arm_id] - prev.rail_cmd[arm.arm_id]))
+            # abs_ee: the commanded TCP at k+1 as a pose in the recording frame (full T_W_B).
+            pose_f = self.converter.convert_pose(arm.arm_id, b, cur.base_pose_w_cmd[arm.arm_id])
+            abs_ee += [float(x) for x in pose_f.position]
+            abs_ee += [float(x) for x in se3.quat_to_rot6d(pose_f.orientation)]
+            abs_ee.append(prev.grip_cmd[arm.arm_id])  # same value as the delta column
+            if arm.has_rail:
+                abs_ee.append(float(cur.rail_cmd[arm.arm_id]))
         frame: dict[str, Any] = {
             "action": np.asarray(action, dtype=np.float32),
+            ABS_EE_KEY: np.asarray(abs_ee, dtype=np.float32),
             "observation.state": prev.state_vec,
             "intervention": np.array([False]),
             "action_source": np.array([ACTION_SOURCE_TELEOP], dtype=np.int8),

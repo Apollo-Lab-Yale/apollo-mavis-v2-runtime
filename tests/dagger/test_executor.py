@@ -24,7 +24,15 @@ from apollo_mavis_v2_runtime.dagger.loop import (
     GatedPolicyExecutor,
 )
 from apollo_mavis_v2_runtime.dagger.policies import ScriptedPolicy
-from apollo_mavis_v2_runtime.dagger.policy_runner import ActionAnchor, PolicyRunner, SlewLimits
+from apollo_mavis_v2_runtime.dagger.policy_runner import (
+    ActionAnchor,
+    PolicyRunner,
+    SlewLimits,
+    anchor_leash_kwargs,
+    split_action,
+)
+from apollo_mavis_v2_runtime.dagger.step import policy_step
+from apollo_mavis_v2_runtime.recorder.features import arm_action_names
 from apollo_mavis_v2_runtime.safety.gate import NullGate
 from apollo_mavis_v2_runtime.safety.supervisor import SafetySupervisor
 from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
@@ -32,14 +40,25 @@ from apollo_mavis_v2_runtime.safety.watchdog import InputWatchdog
 ARMS_META = [("arm0", True), ("arm1", False)]
 DIM = 8 + 7
 NAMES = [f"a{i}" for i in range(DIM)]
+# abs_ee: [x, y, z, r6(6), gripper, rail?] -> 11 + 10 (widths from arm_action_names, never
+# hard-coded; the r6 of the identity rotation is the first two columns of I)
+ABS_NAMES = [n for a, r in ARMS_META for n in arm_action_names(a, r, "abs_ee")]
+ABS_DIM = len(ABS_NAMES)
+R6_IDENTITY = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+IDENT = np.array([1.0, 0.0, 0.0, 0.0])
 
 
 class ExecKin:
+    """TCP = q[:3] in a world whose arm bases sit at the origin with identity rotation."""
+
     def tcp_world(self, arm_id, q):
-        return Pose(np.array(q[:3], dtype=float), np.array([1.0, 0.0, 0.0, 0.0]))
+        return Pose(np.array(q[:3], dtype=float), IDENT.copy())
 
     def base_quat_world(self, arm_id):
-        return np.array([1.0, 0.0, 0.0, 0.0])
+        return IDENT.copy()
+
+    def base_world(self, arm_id, q):
+        return Pose(np.zeros(3), IDENT.copy())
 
 
 class ExecIK:
@@ -131,12 +150,26 @@ class FakeTrainerClient:
         self.submitted.append((path, summary))
 
 
-def spec():
+def spec(space="delta_ee"):
+    if space == "abs_ee":
+        return PolicySpec("abs_ee", "arm_base:arm0", ABS_NAMES, [], [], 0)
     return PolicySpec("delta_ee", "arm_base:arm0", NAMES, [], [], 0)
 
 
-def build(mode="inference", policy=None, recorder=None, reloader=None, client=None):
-    cell = FakeWorkcell({"arm0": FakeArm("arm0", has_rail=True), "arm1": FakeArm("arm1")})
+def build(
+    mode="inference",
+    policy=None,
+    recorder=None,
+    reloader=None,
+    client=None,
+    arm_speed=1.0,  # FakeArm joint speed rad/s: 1.0 settles within the tick, 0.05 LAGS
+):
+    cell = FakeWorkcell(
+        {
+            "arm0": FakeArm("arm0", has_rail=True, max_joint_speed_rad_s=arm_speed),
+            "arm1": FakeArm("arm1", max_joint_speed_rad_s=arm_speed),
+        }
+    )
     cell.start()
     bus = RuntimeBus()
     supervisor = SafetySupervisor(NullGate(), InputWatchdog())
@@ -149,9 +182,10 @@ def build(mode="inference", policy=None, recorder=None, reloader=None, client=No
         rate_hz=20.0, clock=lambda: clock["t"],
     )
     ik, kin = ExecIK(), ExecKin()
+    anchor = ActionAnchor(ik, kin, SlewLimits(), action_space=policy.spec.action_space)
     loop = GatedPolicyExecutor(
         cell, ControlConfig(), bus, supervisor, ["arm0", "arm1"],
-        gate=gate, runner=runner, anchor=ActionAnchor(ik, kin, SlewLimits()),
+        gate=gate, runner=runner, anchor=anchor,
         arms_meta=ARMS_META, session_mode=mode,
         run_id="run1" if mode == "dagger" else "",
         version_label="deploy/v001" if mode == "inference" else None,
@@ -168,6 +202,20 @@ def _dx(v):
     a = np.zeros(DIM, np.float32)
     a[0] = v  # arm0 ee.dx per policy period
     a[6] = 0.5  # arm0 absolute gripper target
+    return a
+
+
+def _abs_row(x=0.05, grip=0.3, rail=0.2, x1=0.0):
+    """One abs_ee whole-cell row: arm0 at (x, 0, 0) identity rotation, gripper ``grip``,
+    rail ``rail``; arm1 at (x1, 0, 0) identity, gripper 0.7."""
+    a = np.zeros(ABS_DIM, np.float32)
+    a[0] = x
+    a[3:9] = R6_IDENTITY
+    a[9] = grip
+    a[10] = rail
+    a[11] = x1
+    a[14:20] = R6_IDENTITY
+    a[20] = 0.7
     return a
 
 
@@ -728,3 +776,232 @@ def test_save_boundary_consumed_in_the_reopen_tick_leaves_the_new_episode_its_ow
     run(rig, 2)
     assert rig.gate.engaged_arm() is None
     assert reasons == ["episode_boundary", "episode_boundary"]
+
+
+# -- v1.3 (2026-09-11): a policy that drives a SUBSET of the arms (14-dora §6.1) ------------------
+class DrivenRunner:
+    """A ``PolicySource`` proxy that also declares which arms it drives - the shape of the
+    dora ``ExternalPolicySource`` for a Manipulation-Arm-only policy: the undriven arm's
+    block is NaN in the whole-cell vector and must be a HOLD, never a NaN strike."""
+
+    def __init__(self, inner, driven):
+        self._inner = inner
+        self._driven = frozenset(driven)
+
+    def driven_arms(self):
+        return self._driven
+
+    def staleness_scale(self, now, arm_id=None):
+        return self._inner.staleness_scale(now)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _subset_policy():
+    def script(k):
+        a = _dx(0.01)  # arm0 moves +x, gripper 0.5
+        a[8:] = np.nan  # arm1: "no opinion"
+        return a
+
+    return ScriptedPolicy(spec(), script=script)
+
+
+def test_undriven_arm_holds_and_its_nan_block_is_never_a_strike():
+    rig = build("inference", policy=_subset_policy())
+    rig.loop.runner = DrivenRunner(rig.runner, {"arm0"})
+    q1_before = np.array(rig.cell.arms["arm1"].get_state().q)
+    x0 = float(rig.cell.arms["arm0"].get_state().q[0])
+    run(rig, 60)
+    assert rig.loop._nan_strikes == 0 and not rig.runner.paused
+    assert float(rig.cell.arms["arm0"].get_state().q[0]) > x0 + 0.02  # the driven arm moves
+    np.testing.assert_allclose(rig.cell.arms["arm1"].get_state().q, q1_before, atol=1e-9)
+    cf = rig.loop._last_cf
+    assert cf is not None and np.isfinite(cf[:8]).all() and np.isnan(cf[8:]).all()
+    # telemetry stays "policy driving", not stale
+    extra = rig.loop._session_extra(rig.clock["t"])
+    assert extra["inference"].policy_stale is False
+
+
+def test_without_a_driven_set_a_nan_block_still_trips_the_three_strike_guard():
+    """The contract the per-arm source relies on: a source that does NOT declare its driven
+    arms is the whole-cell one, so a NaN anywhere is a strike (12-dagger §12 unchanged)."""
+    rig = build("inference", policy=_subset_policy())
+    run(rig, 60)
+    assert rig.loop._nan_strikes >= 3 and rig.runner.paused
+
+
+# -- 2026-09-11: integrate-on-command + leash (delta_ee), abs_ee waypoints ------------------------
+def test_split_action_widths_follow_the_space_names():
+    """Block widths come from ``arm_action_names`` for BOTH spaces (8/7 delta, 11/10 abs)."""
+    d = split_action(np.arange(DIM, dtype=np.float32), ARMS_META)
+    assert d["arm0"].shape == (8,) and d["arm1"].shape == (7,) and d["arm1"][0] == 8
+    a = split_action(np.arange(ABS_DIM, dtype=np.float32), ARMS_META, "abs_ee")
+    assert a["arm0"].shape == (len(arm_action_names("arm0", True, "abs_ee")),)
+    assert a["arm1"].shape == (len(arm_action_names("arm1", False, "abs_ee")),)
+    assert a["arm1"][0] == a["arm0"].shape[0]
+    assert (ABS_DIM, a["arm0"].shape[0]) == (21, 11)  # the r6 layout: 11 + 10
+
+
+def test_lagging_arm_command_runs_ahead_to_the_leash_and_intent_accumulates():
+    """The anchor is ``FK(q_last)``, not the measured pose: a FakeArm at 0.05 rad/s
+    (0.5 mm / tick) cannot follow the 2 mm / tick command, so the command runs AHEAD of the
+    measured pose up to the 25 mm leash and stays there while the arm keeps integrating the
+    policy's intent. Under measured re-anchoring the gap could never exceed one tick's 2 mm
+    and the arm would crawl at 0.5 mm / tick."""
+    rig = build("inference", arm_speed=0.05)
+    gaps = []
+    for _ in range(60):
+        _tick_once(rig)
+        cmd = float(rig.loop._last_cmd["arm0"][0])
+        meas = float(rig.cell.arms["arm0"].get_state().q[0])
+        gaps.append(cmd - meas)
+    leash = rig.loop.anchor.leash_pos_m
+    assert max(gaps) > 0.01  # far beyond one tick's 2 mm: the intent accumulated
+    assert max(gaps) <= leash + 1e-9  # ... and never past the leash to the measured pose
+    # steady state: leashed to the measured pose at the START of the tick (the FakeArm then
+    # moves its 0.5 mm within the same tick, so the gap read after it is leash - 0.5 mm)
+    assert gaps[-1] == pytest.approx(leash - 0.0005, abs=1e-6)
+    # and the measured arm moved at its own full speed on every tick that had a command
+    # (the first policy output lands at t = 0.05, the 5th tick): 56 x 0.5 mm
+    assert rig.cell.arms["arm0"].get_state().q[0] == pytest.approx(56 * 0.0005, abs=1e-9)
+
+
+def test_leash_defaults_follow_the_control_config_and_the_dagger_override():
+    from apollo_mavis_v2_runtime.config import DaggerConfig, LeashConfig
+
+    ccfg = ControlConfig()
+    assert anchor_leash_kwargs(DaggerConfig(), ccfg) == {"leash_pos_m": 0.025, "leash_rot_rad": 0.2}
+    dcfg = DaggerConfig(anchor_leash=LeashConfig(pos_m=0.01, rot_rad=0.1))
+    kw = anchor_leash_kwargs(dcfg, ccfg)
+    assert kw == {"leash_pos_m": 0.01, "leash_rot_rad": 0.1}
+    anchor = ActionAnchor(ExecIK(), ExecKin(), SlewLimits(), **kw)
+    assert (anchor.leash_pos_m, anchor.leash_rot_rad) == (0.01, 0.1)
+    assert anchor.action_space == "delta_ee"
+
+
+def _abs_rig(mode="inference", **kw):
+    policy = ScriptedPolicy(spec("abs_ee"), script=lambda k: _abs_row())
+    return build(mode, policy=policy, **kw)
+
+
+def test_abs_ee_row_is_reached_at_its_deadline_with_gripper_and_absolute_rail():
+    """Deadline interpolation: the row becomes current at t_row and the command REACHES it
+    one period (50 ms = 5 ticks) later - a linear ramp, never a jump; the rail slot walks to
+    its absolute target with the same fraction; the gripper comes from index 9."""
+    rig = _abs_rig()
+    xs, rails = [], []
+    for _ in range(5):  # t = 0.01 .. 0.05: the first query lands at t = 0.05
+        _tick_once(rig)
+        xs.append(float(rig.loop._last_cmd["arm0"][0]))
+        rails.append(float(rig.loop._last_cmd["arm0"][7]))
+    assert xs[:4] == [0.0] * 4  # no output yet: hold
+    assert xs[4] == pytest.approx(0.05 * 0.2)  # tick of the row: 1/5 of the way
+    for _ in range(4):
+        _tick_once(rig)
+        xs.append(float(rig.loop._last_cmd["arm0"][0]))
+        rails.append(float(rig.loop._last_cmd["arm0"][7]))
+    np.testing.assert_allclose(xs[4:], 0.05 * np.array([0.2, 0.4, 0.6, 0.8, 1.0]), atol=1e-9)
+    np.testing.assert_allclose(rails[4:], 0.2 * np.array([0.2, 0.4, 0.6, 0.8, 1.0]), atol=1e-9)
+    assert rig.loop._grip_frac["arm0"] == pytest.approx(0.3)  # gripper.pos at index 9
+    run(rig, 20)  # steady state: at the waypoint, no overshoot, arm1 untouched at x1 = 0
+    assert rig.loop._last_cmd["arm0"][0] == pytest.approx(0.05, rel=1e-5)
+    assert rig.loop._last_cmd["arm0"][7] == pytest.approx(0.2, rel=1e-5)
+    assert rig.loop._last_cmd["arm1"][0] == pytest.approx(0.0, abs=1e-9)
+    # the counterfactual keeps the delta_ee width: the remaining delta per FRAME (zero at the
+    # waypoint), gripper absolute
+    cf = rig.loop._last_cf
+    assert cf is not None and cf.shape == (DIM,)
+    assert cf[0] == pytest.approx(0.0, abs=1e-6) and cf[6] == pytest.approx(0.3)
+    assert cf[8 + 6] == pytest.approx(0.7)
+
+
+def test_abs_ee_counterfactual_is_the_per_frame_delta_toward_the_waypoint():
+    """Before the arm gets there the deposit is (waypoint - FK(q_last)) * dt/period *
+    frame_scale, NOT the absolute pose scaled (which would drift toward the origin)."""
+    rig = _abs_rig()
+    run(rig, 5)  # the row lands at t = 0.05; the command is at 1/5 of the way (0.01)
+    cf = rig.loop._last_cf
+    s = (rig.loop.dt / rig.runner.period) * rig.loop._frame_scale  # 0.2 * 4 = 0.8 per frame
+    # _update_counterfactual runs BEFORE this tick's step: the delta is from x = 0 (t=0.05)
+    assert cf[0] == pytest.approx(0.05 * s) and cf[7] == pytest.approx(0.2 * s)
+    assert np.all(cf[1:6] == 0.0)
+
+
+class _AbsStubRunner:
+    """A ``PolicySource`` shape for direct ``policy_step`` calls."""
+
+    def __init__(self, row, t_row, stale=1.0, period=0.05):
+        self.spec = spec("abs_ee")
+        self.period = period
+        self._row = row
+        self._t = t_row
+        self.stale = stale
+
+    def latest(self):
+        if self._row is None:
+            return None, -1e9
+        return SimpleNamespace(actions=self._row), self._t
+
+    def staleness_scale(self, now, arm_id=None):
+        return self.stale
+
+    def driven_arms(self):
+        return None
+
+
+def _abs_step(runner, now=0.06, q_last=None, dt=0.01):
+    ik, kin = ExecIK(), ExecKin()
+    anchor = ActionAnchor(ik, kin, SlewLimits(), action_space="abs_ee")
+    q_last = np.zeros(8) if q_last is None else q_last
+    grips = []
+    q = policy_step(
+        runner=runner, anchor=anchor, arms_meta=ARMS_META, arm_id="arm0",
+        state=SimpleNamespace(q=q_last.copy()), q_last=q_last, now=now, dt=dt,
+        on_gripper=lambda a, g: grips.append((a, g)),
+    )
+    return q, grips
+
+
+def test_policy_step_abs_ee_holds_when_stale_or_non_finite_and_never_scales_by_staleness():
+    fresh = _AbsStubRunner(_abs_row(), t_row=0.05)
+    q, grips = _abs_step(fresh)
+    assert q is not None and q[0] == pytest.approx(0.05 * 0.25)  # 0.04 s left -> dt/0.04
+    assert q[7] == pytest.approx(0.2 * 0.25, rel=1e-5)
+    assert len(grips) == 1 and grips[0][0] == "arm0" and grips[0][1] == pytest.approx(0.3)
+    # a partially stale row is NOT scaled toward the origin: same interpolation
+    half = _AbsStubRunner(_abs_row(), t_row=0.05, stale=0.5)
+    q_half, _ = _abs_step(half)
+    np.testing.assert_allclose(q_half, q)
+    # staleness_scale <= 0 -> hold (None); a NaN block for this arm -> hold; no output -> hold
+    assert _abs_step(_AbsStubRunner(_abs_row(), t_row=0.05, stale=0.0)) == (None, [])
+    row = _abs_row()
+    row[3] = np.nan
+    assert _abs_step(_AbsStubRunner(row, t_row=0.05)) == (None, [])
+    assert _abs_step(_AbsStubRunner(None, t_row=0.05)) == (None, [])
+    # past the deadline the remaining time floors at dt: the row is reached in one tick
+    late = _AbsStubRunner(_abs_row(), t_row=0.0)
+    q_late, _ = _abs_step(late, now=1.0)
+    assert q_late[0] == pytest.approx(0.05, rel=1e-5) and q_late[7] == pytest.approx(0.2, rel=1e-5)
+    # a degenerate rotation (parallel r6 columns) is a hold, not a crash - and the gripper
+    # of a rejected row is not applied either
+    bad = _abs_row()
+    bad[3:9] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    assert _abs_step(_AbsStubRunner(bad, t_row=0.05)) == (None, [])
+
+
+def test_abs_ee_handback_window_caps_the_per_tick_step():
+    """Inside the handback slew window an abs waypoint approaches at most lin_mps*dt per
+    tick (1.5 mm) even when the deadline interpolation asks for more."""
+    ik, kin = ExecIK(), ExecKin()
+    anchor = ActionAnchor(ik, kin, SlewLimits(), action_space="abs_ee")
+    from apollo_mavis_v2_core.dagger import GateEvent
+
+    anchor.on_gate_event(
+        GateEvent(arm_id="arm0", mode=ControlMode.POLICY, seq=1, t_mono=0.0, source="keyboard")
+    )
+    row = _abs_row(x=0.5)
+    q = anchor.apply_absolute("arm0", row, np.zeros(8), np.zeros(8), 0.01, 0.01, 0.05, 0.0)
+    assert q[0] == pytest.approx(SlewLimits().lin_mps * 0.01)  # 1.5 mm, not 0.5 * 0.2
+    q = anchor.apply_absolute("arm0", row, np.zeros(8), np.zeros(8), 0.01, 1.0, 0.05, 1.0)
+    assert q[0] == pytest.approx(0.5 * 0.2)  # window closed: the deadline fraction dt/period

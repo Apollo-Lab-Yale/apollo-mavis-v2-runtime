@@ -112,3 +112,23 @@ def test_core_spellings_match_the_shared_contract_golden():
     assert golden["camera_output_prefix"] == ext.CAMERA_OUTPUT_PREFIX
     assert golden["depth_output_suffix"] == ext.DEPTH_OUTPUT_SUFFIX
     assert golden["mic_output_prefix"] == ext.MIC_OUTPUT_PREFIX
+    # 14-dora v1.3 (2026-09-11): the per-arm action streams are PREFIX spellings (never
+    # appended to the fixed tuples), recorded as the two LAST golden keys; PolicySpecModel
+    # grew `arms` / `action_frames` (appended last)
+    assert golden["policy_spec_model_fields"] == list(ext.PolicySpecModel.model_fields)
+    assert golden["policy_spec_model_fields"][-2:] == ["arms", "action_frames"]
+    assert keys[-2:] == ["arm_action_output_prefix", "policy_arm_action_input_prefix"]
+    assert golden["arm_action_output_prefix"] == ext.ARM_ACTION_OUTPUT_PREFIX == "action_"
+    assert (
+        golden["policy_arm_action_input_prefix"]
+        == ext.IN_POLICY_ARM_ACTION_PREFIX
+        == "policy_action_"
+    )
+    # byte-identical to the policy-node repo's copy when that checkout is present
+    twin = Path(
+        "/home/xiatao/projects/apollo-mavis-v2-ws-p12/apollo-mavis-v2-policy-node/tests/golden/"
+        "contract_golden.json"
+    )
+    if twin.is_file():
+        here = Path(__file__).parent / "golden" / "contract_golden.json"
+        assert twin.read_bytes() == here.read_bytes(), "the two contract goldens diverged"

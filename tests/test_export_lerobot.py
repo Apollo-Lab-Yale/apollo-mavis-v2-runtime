@@ -40,6 +40,7 @@ def _frame(i: int, seed: int) -> dict:
     rng = np.random.default_rng(seed * 1000 + i)
     return {
         "action": rng.standard_normal(8).astype(np.float32),
+        "action.abs_ee": rng.standard_normal(11).astype(np.float32),
         "observation.state": rng.standard_normal(16).astype(np.float32),
         f"observation.images.{CAM}": np.full((H, W, 3), (seed * 40 + i * 7) % 255, dtype=np.uint8),
         "intervention": np.array([False]),
@@ -127,8 +128,8 @@ def test_export_layout_and_progress(exported):
     pf = pq.ParquetFile(out / "data" / "chunk-000" / "file-000.parquet")
     assert pf.metadata.num_rows == 19 and pf.metadata.num_row_groups == 2
     assert set(pf.schema_arrow.names) == {
-        "action", "observation.state", "intervention", "action_source", "wallclock_ns",
-        "timestamp", "frame_index", "episode_index", "index", "task_index",
+        "action", "action.abs_ee", "observation.state", "intervention", "action_source",
+        "wallclock_ns", "timestamp", "frame_index", "episode_index", "index", "task_index",
     }
     table = pf.read()
     assert table.column("index").to_pylist() == list(range(19))
@@ -147,13 +148,15 @@ def test_export_layout_and_progress(exported):
     assert meta[1][f"videos/observation.images.{CAM}/to_timestamp"] == pytest.approx(19 / 25)
     assert meta[0]["tasks"] == ["pick"] and meta[0]["length"] == 12
     assert "stats/action/mean" in meta[0] and len(meta[0]["stats/action/mean"]) == 8
+    assert len(meta[0]["stats/action.abs_ee/mean"]) == 11
     # meta/stats.json = aggregate_stats over the per-episode stats
     stats = json.loads((out / "meta" / "stats.json").read_text())
     assert set(stats) == {
-        "action", "observation.state", "intervention", "action_source", "wallclock_ns",
-        f"observation.images.{CAM}",
+        "action", "action.abs_ee", "observation.state", "intervention", "action_source",
+        "wallclock_ns", f"observation.images.{CAM}",
     }
-    assert stats["action"]["count"] == [19]
+    assert stats["action"]["count"] == [19] and stats["action.abs_ee"]["count"] == [19]
+    assert info["features"]["action.abs_ee"]["info"]["action_space"] == "abs_ee"
     assert np.asarray(stats[f"observation.images.{CAM}"]["mean"]).shape == (3, 1, 1)
     # the store sees a fresh export; the manifest records it
     m = read_manifest(root)
@@ -190,6 +193,8 @@ def test_export_reads_back_with_lerobot(exported):
         if ep == 0:
             assert np.allclose(np.asarray(row["action"]), frames_ep0.column("action")[k].as_py(),
                                atol=1e-6)
+            assert np.allclose(np.asarray(row["action.abs_ee"]),
+                               frames_ep0.column("action.abs_ee")[k].as_py(), atol=1e-6)
     from apollo_mavis_v2_runtime.recorder.export_lerobot import validate_export
 
     validate_export(REPO, out, 2)

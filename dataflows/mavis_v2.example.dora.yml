@@ -11,6 +11,8 @@ nodes:
       policy_spec: {source: policy/spec, queue_size: 1}
       policy_status: {source: policy/status, queue_size: 8}
       policy_trainer_status: {source: policy/trainer_status, queue_size: 8}
+      policy_action_view: {source: policy/action_view, queue_size: 1, queue_policy: drop_oldest}
+      policy_action_grip: {source: policy/action_grip, queue_size: 1, queue_policy: drop_oldest}
     outputs: [heartbeat, session, telemetry, events, arm_state, arm_cmd, obs_state, policy_reset, cam_cam_front, cam_cam_top, cam_view_wrist_cam, cam_view_wrist_cam_depth, cam_grip_wrist_cam, cam_grip_wrist, cam_view_wrist, mic_mic_view]
   - id: policy  # placeholder: the policy repo attaches as Node("policy")
     deploy: {machine: lab}
@@ -26,7 +28,8 @@ nodes:
       cam_grip_wrist_cam: {source: mavis_runtime/cam_grip_wrist_cam, queue_size: 1, queue_policy: drop_oldest}
       cam_grip_wrist: {source: mavis_runtime/cam_grip_wrist, queue_size: 1, queue_policy: drop_oldest}
       cam_view_wrist: {source: mavis_runtime/cam_view_wrist, queue_size: 1, queue_policy: drop_oldest}
-    outputs: [action, spec, status, trainer_status]
+      mic_mic_view: {source: mavis_runtime/mic_mic_view, queue_size: 32}
+    outputs: [action, spec, status, trainer_status, action_view, action_grip]
   - id: viewer  # placeholder: fixed-viewpoint consumer; inputs only, no outputs
     deploy: {machine: lab}
     path: dynamic

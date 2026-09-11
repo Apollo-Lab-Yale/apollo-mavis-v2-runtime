@@ -43,6 +43,7 @@ SOFT = RecorderConfig(vcodec="libsvtav1")
 def frame(i: int) -> dict:
     return {
         "action": np.full(8, 0.001 * i, dtype=np.float32),
+        "action.abs_ee": np.full(11, 0.002 * i, dtype=np.float32),
         "observation.state": np.full(16, 0.01 * i, dtype=np.float32),
         f"observation.images.{CAM}": np.full((H, W, 3), i % 255, dtype=np.uint8),
         "intervention": np.array([False]),

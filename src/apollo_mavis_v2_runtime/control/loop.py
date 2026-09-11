@@ -11,6 +11,15 @@ deterministic tests.
 2026-09-08 (not yet in the design docs): ``goto_profile {profile_id}`` walks the
 session arms to a CHOSEN saved profile through the reset-to-initial machinery
 (:meth:`ControlLoop._op_goto_profile` -> ``SessionManager.request_goto_profile``).
+
+2026-09-11: the ACTION REPLAY slot (``replay_actions``; 04-runtime §10.8). Episode
+playback with ``source: delta_ee | abs_ee`` drives the arms from a recorded action
+column through the policy's own per-tick path (``dagger/step.policy_step`` over a
+``ReplayActionSource`` + ``ActionAnchor``) INSIDE this plain loop - no
+``GatedPolicyExecutor``, gate or recorder semantics needed. It rides the plan
+bookkeeping (``plan_status``, ``plan_cancel_reason``, interruptible, gate-hold watch)
+so telemetry and the manager's blockers treat it as one more motion; ``motion_active``
+is the one predicate that covers both.
 """
 
 from __future__ import annotations
@@ -106,6 +115,20 @@ def default_active_arm(arms: Sequence[str]) -> str | None:
     if DEFAULT_ACTIVE_ARM in arms:
         return DEFAULT_ACTIVE_ARM
     return arms[0] if arms else None
+
+
+@dataclass
+class _ActionReplay:
+    """The running action replay (``_op_replay_actions``): its ``PolicySource``, anchor,
+    the session layout the rows follow, the arms it drives and the step function."""
+
+    source: object  # ReplayActionSource (dagger/replay_source.py)
+    anchor: object  # ActionAnchor
+    arms_meta: list[tuple[str, bool]]
+    driven: frozenset[str]
+    step: Callable  # dagger.step.policy_step
+    frames: int
+    space: str
 
 
 @dataclass(frozen=True)
@@ -239,6 +262,11 @@ class ControlLoop:
         # per WAYPOINT, followed as the executor retires them. Empty for every other
         # plan, whose gripper target is a single value applied on arrival.
         self._playback_gripper: dict[str, list[float]] = {}
+        # Action replay (2026-09-11; 04-runtime §10.8): the recorded ``delta_ee`` /
+        # ``abs_ee`` rows driving the arms through ``policy_step`` (None = no replay).
+        # Always interruptible; cleared by every cancel path a plan has.
+        self._replay: _ActionReplay | None = None
+        self._tick_now: float = 0.0  # this tick's clock reading (ops drained inside it)
         # Arms whose executor returned the GOAL this tick (2026-09-08 review): the plan
         # is finished only once the gated output equals that goal (``_confirm_plan_
         # arrivals``, after the gate); a goal step the gate holds puts the arm back into
@@ -418,6 +446,7 @@ class ControlLoop:
                 self.supervisor.watchdog.on_process_stall(now, self._last_tick_now)
                 logger.warning("process stall %.0f ms (tick gap): arms held this tick", gap * 1e3)
         self._last_tick_now = now
+        self._tick_now = now
         self.bus.commands.drain(self._handle_command)  # 1
 
         got = self.bus.held_keys.get()  # 2
@@ -473,7 +502,7 @@ class ControlLoop:
         # An INTERRUPTIBLE plan (return-to-start) cancels on the PRESENCE of a movement
         # code from any source, whatever the deadman scale: a key held under a latched
         # deadman is still the operator saying "stop" (safety, 2026-09-07).
-        if self.plans.active_arms:
+        if self.motion_active:
             if self.sources.moving(HELD_CODES):
                 self._cancel_plans("movement key")
             elif self._plan_interruptible and (held & HELD_CODES):
@@ -510,8 +539,10 @@ class ControlLoop:
         dec = self.supervisor.filter(q_cmd, q_meas, source)  # 8
         self._post_filter(dec, now)
         self._confirm_plan_arrivals(dec)  # a goal the gate held stays in the executor
-        if self.plans.active_arms:
-            self._plan_gate_watch(dec, now)  # gate-held abort of a running plan
+        if self.motion_active:
+            self._plan_gate_watch(dec, now)  # gate-held abort of a running plan / replay
+        if self._replay is not None and self._replay.source.staleness_scale(now) <= 0.0:
+            self._finish_replay()  # every row has been current for a period: done
 
         for arm_id, q in dec.q_out.items():  # 9
             self._last_cmd[arm_id] = np.array(q)
@@ -542,6 +573,7 @@ class ControlLoop:
             plan_status=dict(self._plan_state),
             session_extra={
                 "plan_status": self._plan_status,
+                "replay": self._replay_progress(),
                 "kind": self.workcell_kind,
                 "arm_faults": self._arm_fault_details(now),  # arm -> fault_detail (§15)
                 "arm_recovering": sorted(self._recovering),
@@ -834,6 +866,9 @@ class ControlLoop:
             elif self.plans.active(arm_id):
                 q_next = self._plan_step(arm_id, q_last)
                 source = CommandSource.PLANNER
+            elif self._replay is not None and arm_id in self._replay.driven:
+                q_next = self._replay_step(arm_id, states[arm_id], q_last, now)
+                source = CommandSource.PLANNER  # an internal motion for the gate / health line
             elif self.jog.active(arm_id):
                 q_next = self._jog_step(arm_id, q_last, scale)
                 source = CommandSource.JOINT_JOG
@@ -843,6 +878,100 @@ class ControlLoop:
                 q_next = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             out[arm_id] = q_next
         return out, source
+
+    # -- action replay (2026-09-11; 04-runtime §10.8) --------------------------------------
+    @property
+    def motion_active(self) -> bool:
+        """A plan is executing or an action replay is running - the one predicate the
+        manager's blockers, its waits and its cancel path use for "something moves"."""
+        return bool(self.plans.active_arms) or self._replay is not None
+
+    def _motion_arms(self) -> list[str]:
+        """The arms an executing plan or the running replay drives (gate-hold watch)."""
+        arms = list(self.plans.active_arms)
+        if self._replay is not None:
+            arms += sorted(a for a in self._replay.driven if a not in arms)
+        return arms
+
+    def _busy_reason(self) -> str | None:
+        """Why a new motion op is refused right now (``None`` = free): one motion at a
+        time on the whole loop, plans and replays alike (2026-09-08 review)."""
+        if self._replay is not None:
+            return "replay executing"
+        if self.plans.active_arms or "planning" in self._plan_state.values():
+            return "plan executing"
+        return None
+
+    def _replay_progress(self) -> dict | None:
+        """``session_extra["replay"]`` while a replay runs: ``{frame, frames, source}``."""
+        rp = self._replay
+        if rp is None:
+            return None
+        k = int(getattr(rp.source, "frame_index", 0) or 0)
+        return {"frame": k, "frames": rp.frames, "source": rp.space}
+
+    def _replay_step(
+        self, arm_id: str, state: ArmState, q_last: np.ndarray, now: float
+    ) -> np.ndarray | None:
+        """One replayed row for ``arm_id`` through ``policy_step`` (the policy's own path:
+        NaN / staleness -> hold, delta integration on the last gated command inside the
+        leash, absolute deadline interpolation). A step that raises cancels the replay -
+        the arms hold - rather than failing the tick."""
+        rp = self._replay
+        if rp is None:
+            return None
+        self._note_source(arm_id, CommandSource.PLANNER)
+        try:
+            return rp.step(
+                runner=rp.source,
+                anchor=rp.anchor,
+                arms_meta=rp.arms_meta,
+                arm_id=arm_id,
+                state=state,
+                q_last=q_last,
+                now=now,
+                dt=self.dt,
+                on_gripper=self._replay_gripper,
+            )
+        except Exception:  # noqa: BLE001 - a bug in the step must leave the arms held
+            logger.exception("action replay step failed on %s", arm_id)
+            self._cancel_plans("replay step failed")
+            return None
+
+    def _replay_gripper(self, arm_id: str, frac: float) -> None:
+        """The row's absolute gripper opening: tracked every tick, sent at the modbus
+        rate (``GRIPPER_SEND_EVERY_N_TICKS``), ignored on a gripperless arm."""
+        if arm_id not in self.gripper_arms:
+            return
+        self._grip_frac[arm_id] = min(max(float(frac), 0.0), 1.0)
+        if self.tick_count % GRIPPER_SEND_EVERY_N_TICKS == 0:
+            sender = self._senders.get(arm_id)
+            if sender is not None:
+                sender.put_gripper(self._grip_frac[arm_id])
+
+    def _finish_replay(self) -> None:
+        """The recording ran out: ``plan_status done`` lingers like a finished plan."""
+        rp = self._replay
+        if rp is None:
+            return
+        self._clear_replay()
+        self._set_plan_status("done", linger=True)
+        self._plan_interruptible = False
+        self._plan_gate_hold_since = None
+        logger.info("action replay finished: %d %s rows", rp.frames, rp.space)
+
+    def _clear_replay(self) -> None:
+        """Drop the running replay's bookkeeping (finish or cancel; the arms hold)."""
+        rp = self._replay
+        if rp is None:
+            return
+        self._replay = None
+        for arm_id in rp.driven:
+            self._plan_state.pop(arm_id, None)
+        try:
+            rp.source.stop()
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            logger.exception("replay source stop failed")
 
     def arm_stopped(self, arm_id: str, state: ArmState) -> bool:
         """This arm gets no new command this tick (04-runtime §15): a controller
@@ -935,8 +1064,8 @@ class ControlLoop:
         sender = self._senders.get(arm_id)
         if sender is not None:
             sender.pause()
-        if self._plan_interruptible and self.plans.active_arms:
-            self._cancel_plans("driver fault")  # a return-to-start stops on EVERY arm
+        if self._plan_interruptible and self.motion_active:
+            self._cancel_plans("driver fault")  # a return-to-start / replay stops on EVERY arm
         elif self.plans.active(arm_id) or self._plan_state.get(arm_id) is not None:
             self.plans.cancel(arm_id)
             self._plan_state.pop(arm_id, None)
@@ -1042,7 +1171,7 @@ class ControlLoop:
         if not dec.blocked:
             self._plan_gate_hold_since = None
             return
-        for arm_id in self.plans.active_arms:
+        for arm_id in self._motion_arms():
             q_out = dec.q_out.get(arm_id)
             q_last = self._last_cmd.get(arm_id)
             if q_out is None or q_last is None or not np.array_equal(q_out, q_last):
@@ -1055,7 +1184,8 @@ class ControlLoop:
             return
         reason = f"{GATE_HOLD_PREFIX}: {self._gate_hold_pairs(dec)}"
         logger.warning(
-            "plan held by the safety gate for %.1f s (limit %.1f s): cancelling - %s",
+            "%s held by the safety gate for %.1f s (limit %.1f s): cancelling - %s",
+            "replay" if self._replay is not None else "plan",
             held_for,
             self.plan_gate_hold_s,
             reason,
@@ -1574,6 +1704,7 @@ class ControlLoop:
         for arm_id in self.plans.active_arms:
             self._plan_state.pop(arm_id, None)
         self.plans.cancel()
+        self._clear_replay()  # a running action replay is cancelled by the same paths
         self._set_plan_status("cancelled", linger=True)
         self.plan_cancel_reason = reason
         self._plan_interruptible = False
@@ -1587,7 +1718,7 @@ class ControlLoop:
         """Internal (SessionManager): cancel every running plan with ``args.reason``
         (return-to-start deadline / teardown) — the arms hold where they are."""
         reason = str(cmd.args.get("reason") or "cancelled")
-        if self.plans.active_arms:
+        if self.motion_active:
             self._cancel_plans(reason)
             return CommandResult(cmd.corr_id, True, "cancelled")
         return CommandResult(cmd.corr_id, True, "no plan")
@@ -1595,7 +1726,7 @@ class ControlLoop:
     def _interrupt_plan_for(self, reason: str) -> None:
         """Operator input during an INTERRUPTIBLE plan (the return-to-start motion,
         04-runtime §10.5) cancels it: the arm holds where it is and the input wins."""
-        if self._plan_interruptible and self.plans.active_arms:
+        if self._plan_interruptible and self.motion_active:
             self._cancel_plans(reason)
 
     def _expire_plan_status(self) -> None:
@@ -1860,8 +1991,8 @@ class ControlLoop:
                 return CommandResult(cmd.corr_id, False, f"unknown arm {arm_id!r}")
             if arm_id in self._faulted or arm_id in self._recovering:
                 return CommandResult(cmd.corr_id, False, f"arm {arm_id!r} is faulted")
-        if self.plans.active_arms or "planning" in self._plan_state.values():
-            return CommandResult(cmd.corr_id, False, "plan executing")
+        if (busy := self._busy_reason()) is not None:
+            return CommandResult(cmd.corr_id, False, busy)
         self.plan_cancel_reason = None
         self._plan_gate_hold_since = None
         self._plan_interruptible = True
@@ -1876,6 +2007,69 @@ class ControlLoop:
         self._set_plan_status("executing")
         n = len(next(iter(waypoints.values())))
         return CommandResult(cmd.corr_id, True, f"playback of {n} waypoints")
+
+    def _op_replay_actions(self, cmd: Command) -> CommandResult:
+        """Internal: replay a recorded ACTION column through the policy's per-tick path
+        (2026-09-11; 04-runtime §10.8). ``args``: ``source`` (a ``PolicySource`` -
+        ``dagger/replay_source.ReplayActionSource``) and ``anchor`` (``ActionAnchor``).
+
+        Unlike ``playback_path`` there is no pre-planned joint path to verify in the twin:
+        every row becomes a command on the tick it is due and passes the gate like any
+        other (``CommandSource.PLANNER``), and the gate-hold watch cancels a replay the
+        gate holds for ``plan_gate_hold_s``. The manager admits it in sim only until the
+        operator says otherwise. Drives the arms the source names (the episode's arms
+        that are in this session; the others hold); one motion at a time on the loop, so
+        it is refused while a plan or another replay runs, and always interruptible: any
+        operator input, driver fault or teardown cancels it and the arms hold.
+        """
+        source = cmd.args.get("source")
+        anchor = cmd.args.get("anchor")
+        if source is None or anchor is None:
+            return CommandResult(cmd.corr_id, False, "replay needs a source and an anchor")
+        if type(self)._resolve_arms is not ControlLoop._resolve_arms:
+            # a mode loop with its own resolver (GatedPolicyExecutor) never reaches the
+            # replay branch: refuse rather than accept a replay that would never step
+            return CommandResult(cmd.corr_id, False, "this session's loop does not replay actions")
+        try:
+            declared = source.driven_arms()
+        except Exception:  # noqa: BLE001 - a source without the member drives every arm
+            declared = None
+        driven = frozenset(self.session_arms if declared is None else declared)
+        if not driven:
+            return CommandResult(cmd.corr_id, False, "the replay names none of this session's arms")
+        for arm_id in sorted(driven):
+            if arm_id not in self.session_arms:
+                return CommandResult(cmd.corr_id, False, f"unknown arm {arm_id!r}")
+            if arm_id in self._faulted or arm_id in self._recovering:
+                return CommandResult(cmd.corr_id, False, f"arm {arm_id!r} is faulted")
+        if (busy := self._busy_reason()) is not None:
+            return CommandResult(cmd.corr_id, False, busy)
+        try:
+            from ..dagger.step import policy_step
+        except Exception as e:  # noqa: BLE001 - the dagger extra may be absent
+            return CommandResult(cmd.corr_id, False, f"action replay unavailable: {e!r}")
+        arms_meta = [(a, self._last_cmd[a].shape[0] > 7) for a in self.session_arms]
+        space = str(getattr(getattr(source, "spec", None), "action_space", None) or "")
+        frames = int(getattr(source, "frames", 0) or 0)
+        self.plan_cancel_reason = None
+        self._plan_gate_hold_since = None
+        self._plan_interruptible = True
+        self._plan_gripper_on_arrival.clear()
+        self._playback_gripper.clear()
+        self._replay = _ActionReplay(
+            source=source,
+            anchor=anchor,
+            arms_meta=arms_meta,
+            driven=driven,
+            step=policy_step,
+            frames=frames,
+            space=space,
+        )
+        for arm_id in driven:
+            self._plan_state[arm_id] = "executing"
+        self._set_plan_status("executing")
+        source.start()
+        return CommandResult(cmd.corr_id, True, f"replay of {frames} {space} rows")
 
     def _op_execute_plan(self, cmd: Command) -> CommandResult:
         """Internal: SessionManager hands pre-planned waypoints (start_from §5.2; the
@@ -1910,8 +2104,8 @@ class ControlLoop:
         # the running waypoints (and the bookkeeping below would reset the running
         # plan's interruptibility / deferred gripper), and the manager-side "plan
         # executing" blockers run BEFORE a worker plans - so the loop is the last line.
-        if self.plans.active_arms or "planning" in self._plan_state.values():
-            return CommandResult(cmd.corr_id, False, "plan executing")
+        if (busy := self._busy_reason()) is not None:
+            return CommandResult(cmd.corr_id, False, busy)
         self.plan_cancel_reason = None
         self._plan_gate_hold_since = None
         interruptible = bool(cmd.args.get("interruptible", False))
@@ -1965,8 +2159,8 @@ class ControlLoop:
                 f"no initial condition designated for the {self.workcell_kind} workcell - "
                 "save a profile with 'use as initial condition' first",
             )
-        if self.plans.active_arms or "planning" in self._plan_state.values():
-            return CommandResult(cmd.corr_id, False, "plan executing")
+        if (busy := self._busy_reason()) is not None:
+            return CommandResult(cmd.corr_id, False, busy)
         if self.on_reset_to_initial is None:
             return CommandResult(cmd.corr_id, False, "no session manager attached")
         ok, detail = self.on_reset_to_initial(profile)
@@ -2007,8 +2201,8 @@ class ControlLoop:
             return CommandResult(
                 cmd.corr_id, False, f"profile '{profile.name}' covers no arm of this session"
             )
-        if self.plans.active_arms or "planning" in self._plan_state.values():
-            return CommandResult(cmd.corr_id, False, "plan executing")
+        if (busy := self._busy_reason()) is not None:
+            return CommandResult(cmd.corr_id, False, busy)
         if self.on_goto_profile is None:
             return CommandResult(cmd.corr_id, False, "no session manager attached")
         ok, detail = self.on_goto_profile(profile)

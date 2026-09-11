@@ -6,6 +6,7 @@ import pytest
 from apollo_mavis_v2_core import CommandSource
 
 from apollo_mavis_v2_runtime.recorder.features import (
+    ABS_EE_KEY,
     ACTION_SOURCE_LABELS,
     ArmMeta,
     arm_action_names,
@@ -31,19 +32,25 @@ def test_delta_ee_block_order_and_prefix():
 
 
 def test_abs_ee_and_joint_blocks():
+    # abs_ee (2026-09-11): position, the first two rotation-matrix COLUMNS in column-major
+    # order (Zhou et al. 2019 r6, Gram-Schmidt decode), absolute gripper, absolute rail.
     assert arm_action_names("a", True, "abs_ee") == [
-        "a_ee.x", "a_ee.y", "a_ee.z", "a_ee.qw", "a_ee.qx", "a_ee.qy", "a_ee.qz",
+        "a_ee.x", "a_ee.y", "a_ee.z",
+        "a_ee.r00", "a_ee.r10", "a_ee.r20", "a_ee.r01", "a_ee.r11", "a_ee.r21",
         "a_gripper.pos", "a_rail.pos",
     ]
+    assert arm_action_names("a", False, "abs_ee")[-1] == "a_gripper.pos"
     joint = arm_action_names("a", True, "joint")
     assert joint[:7] == [f"a_joint{i}.pos" for i in range(1, 8)]
     assert joint[7:] == ["a_gripper.pos", "a_rail.pos"]
-    # Dims derive from the layout listings (names are authoritative; the §6
-    # table's "10/9" for abs_ee miscounts its own 9-name layout).
-    assert len(arm_action_names("a", True, "abs_ee")) == 9
-    assert len(arm_action_names("a", False, "abs_ee")) == 8
+    # Dims derive from the layout listings (names are authoritative): 3 + 6 + 1 (+ rail).
+    assert len(arm_action_names("a", True, "abs_ee")) == 11
+    assert len(arm_action_names("a", False, "abs_ee")) == 10
     assert len(arm_action_names("a", True, "joint")) == 9
     assert len(arm_action_names("a", False, "joint")) == 8
+    # no '_' inside a dim: playback splits the arm id at '_<suffix>'
+    for name in arm_action_names("a", True, "abs_ee"):
+        assert name.count("_") == 1
 
 
 def test_state_block_16_or_15_dims():
@@ -63,6 +70,19 @@ def test_full_features_1arm(features_1arm=None):
     f = build_features([ARM0], frames, {"cam_front": (640, 480)})
     assert f["action"]["dtype"] == "float32" and f["action"]["shape"] == (8,)
     assert f["observation.state"]["shape"] == (16,)
+    # the absolute companion column, right after `action` (always present, 2026-09-11)
+    assert list(f)[:3] == ["action", ABS_EE_KEY, "observation.state"]
+    abs_f = f[ABS_EE_KEY]
+    assert abs_f["dtype"] == "float32" and abs_f["shape"] == (11,)
+    assert abs_f["names"] == arm_action_names("arm0", True, "abs_ee")
+    assert abs_f["info"] == {
+        "apollo_schema": 1,
+        "action_space": "abs_ee",
+        "frames": frames,
+        "rail": {"axis": "y", "travel_m": 0.65, "arms": ["arm0"]},
+        "label": "commanded_tcp_at_next_frame",
+        "rotation": "rot6d_first_two_columns",
+    }
     img = f["observation.images.cam_front"]
     assert img["dtype"] == "video" and img["shape"] == (480, 640, 3)
     assert img["names"] == ["height", "width", "channels"]
@@ -100,12 +120,16 @@ def test_multi_arm_concatenation_order():
     assert f["action"]["names"][0].startswith("arm0_")
     assert f["action"]["names"][8].startswith("arm1_")
     assert f["observation.state"]["shape"] == (32,)
+    assert f[ABS_EE_KEY]["shape"] == (22,)
+    assert f[ABS_EE_KEY]["names"][11].startswith("arm1_")
     # mixed rail: dims derive from names, never arm count
     f2 = build_features(
         [ARM0, NORAIL], {"arm0": "world", "fix0": "world"}, {}, "delta_ee"
     )
     assert f2["action"]["shape"] == (15,)
     assert f2["action"]["info"]["rail"]["arms"] == ["arm0"]
+    assert f2[ABS_EE_KEY]["shape"] == (21,)
+    assert f2[ABS_EE_KEY]["info"]["rail"]["arms"] == ["arm0"]
 
 
 def test_repo_id_grammar():

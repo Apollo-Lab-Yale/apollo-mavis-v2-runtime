@@ -611,7 +611,9 @@ class SnapshotPublisher:
             st: ArmState = snap.arms[a]
             q = np.asarray(st.q, dtype=np.float64)
             t_w_b = kin.base_world(a, q)
-            ee = facts.converter.convert_pose(a, st.ee_pose, t_w_b)
+            # same definition as the recorder: twin FK of the measured joints at link_tcp
+            ee_b = kin.tcp_base(a, q) if hasattr(kin, "tcp_base") else st.ee_pose
+            ee = facts.converter.convert_pose(a, ee_b, t_w_b)
             parts += [float(x) for x in q[:7]]
             parts.append(float(st.gripper.open_frac))
             if facts.has_rail.get(a, False):
@@ -771,10 +773,16 @@ def _arm_block(st: ArmState, kin: Any, arm_id: str, has_rail: bool) -> list[floa
     rail = float(q[7]) if q.shape[0] > 7 else 0.0
     block = [float(v) for v in q[:7]] + [rail]
     block += [float(v) for v in dq[:7]] + [0.0]
-    block += _quat7(st.ee_pose)
+    ee_b = st.ee_pose
+    if kin is not None and hasattr(kin, "tcp_base"):
+        try:
+            ee_b = kin.tcp_base(arm_id, q)  # twin FK at link_tcp: the recorder's definition
+        except Exception:  # noqa: BLE001 - arm not in this scene
+            ee_b = st.ee_pose
+    block += _quat7(ee_b)
     if kin is not None:
         try:
-            ee_w = se3.pose_mul(kin.base_world(arm_id, q), st.ee_pose)
+            ee_w = se3.pose_mul(kin.base_world(arm_id, q), ee_b)
             block += _quat7(ee_w)
         except Exception:  # noqa: BLE001 - arm not in this scene
             block += [math.nan] * 7

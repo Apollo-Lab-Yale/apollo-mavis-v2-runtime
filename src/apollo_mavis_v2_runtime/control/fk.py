@@ -61,5 +61,16 @@ class SceneKinematics:
         mat = np.array(self.data.xmat[a.base_body_id]).reshape(3, 3)
         return se3.mat_to_quat(mat)
 
+    def base_world(self, arm_id: str, q: np.ndarray) -> Pose:
+        """``T_W_B`` — the arm base (link_base) pose in world at config q (a railed arm's
+        base translates with q[7]); the ``arm_base:<arm>`` recording frame an ``abs_ee``
+        row is expressed in. Same read as ``RecorderKinematics.base_world``."""
+        a = self.addr[arm_id]
+        self.data.qpos[a.qpos_adr] = np.asarray(q, dtype=np.float64)
+        mujoco.mj_kinematics(self.model, self.data)
+        pos = np.array(self.data.xpos[a.base_body_id])
+        quat = se3.mat_to_quat(np.array(self.data.xmat[a.base_body_id]).reshape(3, 3))
+        return Pose(pos, quat)
+
 
 __all__ = ["SceneKinematics"]

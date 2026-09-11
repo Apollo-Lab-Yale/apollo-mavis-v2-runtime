@@ -7,7 +7,11 @@ pins the renderer to it and runs ``dora validate --strict-types`` over it.
 
 Rules baked in: every runtime input is ``queue_size: 1, drop_oldest`` except
 ``policy_spec`` (1, keep), ``policy_status`` (8) and ``policy_trainer_status`` (8,
-phase-14); ``events`` fan-out is 64;
+phase-14); the per-arm action inputs ``policy_action_<arm_id>`` (v1.3, 2026-09-11; one
+per configured arm, like ``cam_<id>``) are ``1, drop_oldest`` like ``policy_action`` and
+the ``policy`` placeholder declares the matching ``action_<arm_id>`` outputs; the
+``policy`` placeholder also receives ``mic_<id>`` (queue 32, like the observer's - the
+Perception Arm's microphone is a policy input); ``events`` fan-out is 64;
 ``input_timeout`` is never set; ``debug.enable_debug_inspection`` is never
 emitted (coordinator bug, §8); the interpreter of the one spawned node is
 pinned; every node carries ``deploy: {machine: <id>}``; remote placeholders
@@ -44,8 +48,8 @@ def runtime_outputs(
     return out
 
 
-def _runtime_inputs() -> list[str]:
-    return [
+def _runtime_inputs(arm_ids: Sequence[str] = ()) -> list[str]:
+    rows = [
         f"{ext.IN_TICK}: {ext.TICK_TIMER}",
         f"{ext.IN_PROBE_HEARTBEAT}: {ext.PROBE_NODE_ID}/{ext.PROBE_OUT_HEARTBEAT}",
         f"{ext.IN_POLICY_ACTION}: "
@@ -58,9 +62,23 @@ def _runtime_inputs() -> list[str]:
         f"{ext.IN_POLICY_TRAINER_STATUS}: {{source: {ext.PLACEHOLDER_POLICY}/"
         f"{ext.POLICY_OUT_TRAINER_STATUS}, queue_size: 8}}",
     ]
+    # v1.3 (2026-09-11; 14-dora §5): one per-arm action input per configured arm, beside
+    # the whole-cell policy_action (a policy may drive a subset of the arms)
+    for arm in arm_ids:
+        rows.append(
+            f"{ext.policy_arm_action_input_id(arm)}: "
+            + _Q1_DROP % f"{ext.PLACEHOLDER_POLICY}/{ext.arm_action_output_id(arm)}"
+        )
+    return rows
 
 
-def _policy_inputs(camera_ids: Sequence[str]) -> list[str]:
+def policy_outputs(arm_ids: Sequence[str] = ()) -> list[str]:
+    """Every output id the ``policy`` placeholder declares: ``POLICY_OUTPUTS`` then
+    ``action_<arm_id>`` per configured arm (v1.3, 2026-09-11)."""
+    return list(ext.POLICY_OUTPUTS) + [ext.arm_action_output_id(a) for a in arm_ids]
+
+
+def _policy_inputs(camera_ids: Sequence[str], mic_id: str | None = None) -> list[str]:
     rt = ext.EXTERNAL_NODE_ID
     rows = [
         f"{ext.OUT_OBS_STATE}: " + _Q1_DROP % f"{rt}/{ext.OUT_OBS_STATE}",
@@ -71,6 +89,11 @@ def _policy_inputs(camera_ids: Sequence[str]) -> list[str]:
     for cam in camera_ids:
         cid = ext.camera_output_id(cam)
         rows.append(f"{cid}: " + _Q1_DROP % f"{rt}/{cid}")
+    if mic_id:
+        # v1.3 (2026-09-11): the microphone is a perception input of the policy too; the
+        # observer's queue depth (32 blocks = 1.3 s at 25 Hz) so a consumer hiccup drops none
+        mid = ext.mic_output_id(mic_id)
+        rows.append(f"{mid}: {{source: {rt}/{mid}, queue_size: 32}}")
     return rows
 
 
@@ -135,14 +158,18 @@ def render_dataflow(
     registered_machines: Sequence[str] = (),
     *,
     depth_camera_ids: Sequence[str] | None = None,
+    arm_ids: Sequence[str] = (),
 ) -> str:
     """The dataflow text for this config. ``camera_ids`` are the camera ids the runtime
     will actually publish (already filtered by ``cfg.publish.cameras``);
     ``depth_camera_ids`` default to ``cfg.publish.depth_cameras`` intersected with them;
     ``mic_id`` ``None`` = no microphone output; ``python`` is the interpreter that runs
     the probe node (``sys.executable`` of the runtime venv); ``registered_machines``
-    are the ``cfg.machines`` ids whose daemons are registered right now."""
+    are the ``cfg.machines`` ids whose daemons are registered right now; ``arm_ids`` are
+    the configured arms (WorkcellConfig order) that get a ``policy_action_<arm_id>`` input
+    and an ``action_<arm_id>`` policy output each (v1.3; empty = whole-cell only)."""
     cams = list(camera_ids)
+    arms = list(arm_ids)
     depth = [
         c
         for c in (depth_camera_ids if depth_camera_ids is not None else cfg.publish.depth_cameras)
@@ -158,15 +185,15 @@ def render_dataflow(
 
     _node(lines, cfg.node_id, me, "the runtime attaches here (Node(node_id)); never spawned")
     lines.append("    path: dynamic")
-    _inputs(lines, _runtime_inputs())
+    _inputs(lines, _runtime_inputs(arms))
     _outputs(lines, outs)
 
     _node(
         lines, ext.PLACEHOLDER_POLICY, me, 'placeholder: the policy repo attaches as Node("policy")'
     )
     lines.append("    path: dynamic")
-    _inputs(lines, _policy_inputs(cams))
-    _outputs(lines, list(ext.POLICY_OUTPUTS))
+    _inputs(lines, _policy_inputs(cams, mic_id if cfg.publish.audio else None))
+    _outputs(lines, policy_outputs(arms))
 
     _node(
         lines,
@@ -238,4 +265,11 @@ def placeholders_for(
     return out
 
 
-__all__ = ["CANARY_NODE_ID", "HEADER", "placeholders_for", "render_dataflow", "runtime_outputs"]
+__all__ = [
+    "CANARY_NODE_ID",
+    "HEADER",
+    "placeholders_for",
+    "policy_outputs",
+    "render_dataflow",
+    "runtime_outputs",
+]

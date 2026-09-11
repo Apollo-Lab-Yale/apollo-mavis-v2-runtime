@@ -191,6 +191,13 @@ def test_recorder_thread_skips_idle_frames_and_writes_the_filter_block():
     # the delta action of the frame before the gap spans the WHOLE gap (last kept -> next kept)
     dx = [float(f["action"][0]) for f in frames]
     assert max(dx) == pytest.approx(0.002, abs=1e-6)  # every kept-to-kept step is one motion step
+    # action.abs_ee[k][:3] = the commanded TCP of kept capture k+1 (FakeKin: q[:3]) - across
+    # the gap too, so integrating the deltas from frame 0 lands on it exactly
+    xs = [float(f["action.abs_ee"][0]) for f in frames]
+    x0 = float(frames[0]["observation.state"][0])  # q_meas is Q0 in these snapshots
+    assert xs[0] == pytest.approx(Q0[0] + 2 * 0.002, abs=1e-6)  # capture 1 is the first kept
+    assert np.allclose(np.diff(xs), dx[1:], atol=1e-6)
+    assert xs[-1] == pytest.approx(x0 + 20 * 0.002, abs=1e-6)  # the last kept capture's command
 
 
 def test_recorder_thread_save_flushes_a_short_episode_inside_the_look_ahead():

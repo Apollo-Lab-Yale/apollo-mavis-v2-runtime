@@ -10,7 +10,13 @@ dry-run verdict, blocked sweep = ok false + zero writes, clear sweep = the
 fake's exact write set), the session path (a hardware session owns the boxes:
 clear_errors / recover = the driver's user recovery, apply_backstops and
 home_rail -> 409) and the 409 matrix (unknown arm 404, monitor off / paused /
-erroring, busy; ``POST /api/session`` while a homing is in flight). Plus the
+erroring, busy; ``POST /api/session`` while a homing is in flight). Since
+2026-09-11 also ``set_collision_sensitivity`` on BOTH paths (one write of the
+level 1..3, 422 otherwise; the monitor path judges by read-back, the session
+path routes to the fake workcell's ``request_set_collision_sensitivity`` /
+``setting_result`` channel) and the runtime's per-arm requested level (telemetry
+on the paused monitor row + the in-session arm row, ``backstops_match`` against
+it, forgotten at the hand-over and by ``apply_backstops``). Plus the
 fake full chain of the phase-09c acceptance (unhomed -> session 409 -> home_rail
 -> session running) and the session state machine FAULT -> RECOVERING ->
 RUNNING driven by the scripted driver events."""
@@ -557,6 +563,130 @@ def test_fake_full_chain_unhomed_409_then_home_rail_then_session_running(client,
     assert _wait(lambda: not rt.hardware_monitor.paused) and grip.calls[-1] == "start"
 
 
+# -- set_collision_sensitivity (2026-09-11): monitor path + the requested level ------------
+SENS_URL = URL.format("grip")
+
+
+def _sens(level):
+    return {"op": "set_collision_sensitivity", "collision_sensitivity": level}
+
+
+def test_set_collision_sensitivity_via_the_monitor_and_the_requested_level(client, rt, factory):
+    grip = factory.monitors["grip"]
+    # Start from the config value on the box (idempotent) - no override in force.
+    r = client.post(SENS_URL, json={"op": "apply_backstops"})
+    assert r.status_code == 200 and r.json()["ok"] is True, r.text
+    assert rt.hardware_monitor.requested_sensitivity("grip") is None
+    calls = len(grip.sensitivity_calls)
+
+    r = client.post(SENS_URL, json=_sens(2))
+    assert r.status_code == 200, r.text
+    res = ArmMaintenanceResult.model_validate(r.json())
+    assert (res.path, res.ok, res.status) == ("monitor", True, "done")
+    assert res.op == "set_collision_sensitivity" and res.collision_sensitivity == 2
+    assert res.sdk_codes == {"set_collision_sensitivity": 0} and res.warnings == []
+    assert res.rail_sweep is None and res.job_id is None
+    assert res.detail.startswith("collision sensitivity set to 2 (was 3; the config value 3")
+    assert res.before is not None and res.before.collision_sensitivity == 3
+    assert res.before.backstops_match is True  # against the level in force before: config 3
+    assert res.after is not None and res.after.collision_sensitivity == 2
+    assert res.after.backstops_match is True  # against the level written
+    assert grip.sensitivity_calls[calls:] == [2]  # exactly one write reached the monitor
+    assert grip.maintenance_calls[-1][0] == "set_collision_sensitivity"
+    assert grip.maintenance_calls[-1][1].collision_sensitivity == 3  # the config the note names
+    assert rt.hardware_monitor.requested_sensitivity("grip") == 2
+    # Telemetry: the monitor row reads back the level and matches against it; the
+    # in-session arm rows do not exist without a session.
+    msg = _telemetry(client, lambda m: _hw_arm(m, "grip")["collision_sensitivity"] == 2)
+    assert _hw_arm(msg, "grip")["backstops_match"] is True
+    assert _hw_arm(msg, "view")["collision_sensitivity"] == 1 and msg["arms"] == []
+
+    # 422 on the wire: the level is required for this op and 1..3 only; the monitor
+    # never sees any of it.
+    for body in (
+        {"op": "set_collision_sensitivity"},
+        _sens(None),
+        _sens(0),
+        _sens(4),
+        _sens(5),
+        _sens(2.5),
+        _sens("high"),
+    ):
+        assert client.post(SENS_URL, json=body).status_code == 422, body
+    # (a JSON ``true`` is pydantic's lax int 1 - the core model's business, not routed here)
+    assert grip.sensitivity_calls[calls:] == [2]
+    # The in-process guard behind pydantic (a caller that skips the wire).
+    for bad in (None, 0, 4, 2.5):
+        with pytest.raises(ValueError, match="1, 2 or 3"):
+            rt.arm_maintenance("grip", "set_collision_sensitivity", collision_sensitivity=bad)
+    # Every other op ignores the field and reports no level.
+    r = client.post(SENS_URL, json={"op": "clear_errors", "collision_sensitivity": 1})
+    assert r.status_code == 200 and r.json()["collision_sensitivity"] is None
+    assert rt.hardware_monitor.requested_sensitivity("grip") == 2
+
+    # The synchronous hand-over seam (a driver connects and re-applies the config):
+    # the override is forgotten; resuming alone does not bring it back.
+    rt.hardware_monitor.pause()
+    assert rt.hardware_monitor.requested_sensitivity("grip") is None
+    r = client.post(SENS_URL, json=_sens(3))
+    assert r.status_code == 409 and "monitor paused" in r.json()["detail"]
+    rt.hardware_monitor.resume()
+    assert _wait(lambda: rt.hardware_monitor.status_of("grip")[0] == "running")
+    assert rt.hardware_monitor.requested_sensitivity("grip") is None
+
+    # A status echo (a fault latched) is ok - the read-back decides.
+    grip.sensitivity_code = 2
+    try:
+        r = client.post(SENS_URL, json=_sens(1))
+    finally:
+        grip.sensitivity_code = 0
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert r.json()["sdk_codes"] == {"set_collision_sensitivity": 2}
+    assert r.json()["collision_sensitivity"] == 1 and "status echo" in r.json()["detail"]
+    assert rt.hardware_monitor.requested_sensitivity("grip") == 1
+    # The box keeps the old value: ok false, the read-back is what comes back.
+    grip.sensitivity_readback = 1
+    try:
+        r = client.post(SENS_URL, json=_sens(3))
+    finally:
+        grip.sensitivity_readback = None
+    assert r.status_code == 200 and r.json()["ok"] is False
+    assert r.json()["detail"] == "collision sensitivity still reads 1 after writing 3"
+    assert r.json()["collision_sensitivity"] == 1
+    assert rt.hardware_monitor.requested_sensitivity("grip") == 1  # unchanged by a failure
+    # Busy arm: 409 before any write.
+    grip.maintenance_busy = True
+    try:
+        r = client.post(SENS_URL, json=_sens(2))
+        assert r.status_code == 409 and "already running" in r.json()["detail"]
+    finally:
+        grip.maintenance_busy = False
+
+    # apply_backstops writes the config value again and forgets the override.
+    r = client.post(SENS_URL, json={"op": "apply_backstops"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert r.json()["after"]["collision_sensitivity"] == 3
+    assert r.json()["after"]["backstops_match"] is True
+    assert r.json()["collision_sensitivity"] is None
+    assert rt.hardware_monitor.requested_sensitivity("grip") is None
+    msg = _telemetry(client, lambda m: _hw_arm(m, "grip")["collision_sensitivity"] == 3)
+    assert _hw_arm(msg, "grip")["backstops_match"] is True
+
+
+def test_set_collision_sensitivity_is_409_while_rail_homing(client, rt, factory, monkeypatch):
+    grip = factory.monitors["grip"]
+    calls = len(grip.sensitivity_calls)
+    monkeypatch.setattr(type(rt.rail_homing), "active_arm", property(lambda self: "view"))
+    r = client.post(SENS_URL, json=_sens(2))
+    assert r.status_code == 409
+    assert r.json()["detail"] == (
+        "set_collision_sensitivity refused: rail homing in progress on the Perception Arm - "
+        "wait for it to finish"
+    )
+    assert grip.sensitivity_calls[calls:] == []
+    assert client.post(URL.format("view"), json=_sens(2)).status_code == 409  # the busy arm too
+
+
 # -- session path (a hardware session owns the boxes) ----------------------------------------
 @pytest.fixture()
 def hw_session(rt, client, factory):
@@ -702,5 +832,109 @@ def test_session_path_without_a_recovery_channel_is_409(client, rt, hw_session):
     try:
         r = client.post(URL.format("grip"), json={"op": "recover"})
         assert r.status_code == 409 and "no recovery channel" in r.json()["detail"]
+    finally:
+        session.workcell = cell
+
+
+def test_session_path_set_collision_sensitivity_routes_to_the_session_driver(
+    client, rt, factory, hw_session
+):
+    """2026-09-11: inside a hardware session the op is ALLOWED (unlike apply_backstops)
+    and goes to the session driver's channel; the runtime records the level so both
+    telemetry carriers show it while the monitor is paused."""
+    cell, _loop, _session = hw_session
+    grip = factory.monitors["grip"]
+    calls = len(grip.sensitivity_calls)
+    # The hand-over forgot any earlier override (the driver connect re-applied the config).
+    assert rt.hardware_monitor.paused and rt.hardware_monitor.requested_sensitivity("grip") is None
+
+    r = client.post(SENS_URL, json=_sens(1))
+    assert r.status_code == 200, r.text
+    res = ArmMaintenanceResult.model_validate(r.json())
+    assert (res.path, res.ok, res.status) == ("session", True, "done")
+    assert res.op == "set_collision_sensitivity" and res.collision_sensitivity == 1
+    assert res.sdk_codes == {"set_collision_sensitivity": 0} and res.warnings == []
+    assert res.before is None and res.after is None  # no monitor sample on this path
+    assert res.detail == (
+        "collision sensitivity set to 1 on the session driver (verified by the monitor after "
+        "the session)"
+    )
+    assert cell.setting_requests == [("grip", 1)] and cell.recovery_requests == []
+    assert grip.sensitivity_calls[calls:] == []  # the read-only monitor never saw it
+    assert rt.hardware_monitor.requested_sensitivity("grip") == 1
+    assert rt.hardware_monitor.requested_sensitivity("view") is None
+    # Telemetry: the in-session arm row AND the paused monitor row carry the level.
+    msg = _telemetry(
+        client,
+        lambda m: any(
+            a["arm_id"] == "grip" and a.get("collision_sensitivity") == 1 for a in m["arms"]
+        ),
+    )
+    view = next(a for a in msg["arms"] if a["arm_id"] == "view")
+    assert view["collision_sensitivity"] is None
+    row = _hw_arm(msg, "grip")
+    assert row["status"] == "paused" and row["collision_sensitivity"] == 1
+    assert row["backstops_match"] is True  # the payload alone is judged while paused
+
+    # A status echo while a fault is latched: ok, the driver's note rides warnings.
+    cell.setting_code_next["grip"] = 2
+    r = client.post(SENS_URL, json=_sens(2))
+    assert r.status_code == 200 and r.json()["ok"] is True, r.text
+    assert r.json()["sdk_codes"] == {"set_collision_sensitivity": 2}
+    assert r.json()["warnings"] == [r.json()["detail"]]
+    assert r.json()["detail"].startswith("set_collision_sensitivity returned 2 (status echo")
+    assert r.json()["collision_sensitivity"] == 2
+    assert rt.hardware_monitor.requested_sensitivity("grip") == 2
+    # The SDK refused the write: ok false, nothing recorded.
+    cell.setting_code_next["grip"] = -1
+    r = client.post(SENS_URL, json=_sens(3))
+    assert r.status_code == 200 and r.json()["ok"] is False
+    assert r.json()["detail"] == "set_collision_sensitivity returned -1"
+    assert r.json()["sdk_codes"] == {"set_collision_sensitivity": -1}
+    assert r.json()["collision_sensitivity"] is None and r.json()["warnings"] == []
+    assert rt.hardware_monitor.requested_sensitivity("grip") == 2
+    assert cell.setting_requests == [("grip", 1), ("grip", 2), ("grip", 3)]
+    # 422 / 404 / the unchanged 409s hold inside a session too.
+    assert client.post(SENS_URL, json={"op": "set_collision_sensitivity"}).status_code == 422
+    assert client.post(SENS_URL, json=_sens(4)).status_code == 422
+    assert client.post(URL.format("arm9"), json=_sens(2)).status_code == 404
+    r = client.post(SENS_URL, json={"op": "apply_backstops"})
+    assert r.status_code == 409 and "hardware session" in r.json()["detail"]
+    assert len(cell.setting_requests) == 3
+    rt.hardware_monitor.forget_requested_sensitivity("grip")  # leave the module state clean
+
+
+def test_session_path_set_collision_sensitivity_timeout_and_channel_409s(
+    client, rt, hw_session, monkeypatch
+):
+    cell, _loop, session = hw_session
+    monkeypatch.setattr("apollo_mavis_v2_runtime.runtime.MAINTENANCE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(cell, "_complete_setting", lambda arm_id, level: None)  # never answers
+    r = client.post(SENS_URL, json=_sens(2))
+    assert r.status_code == 200 and r.json()["ok"] is False
+    assert r.json()["detail"] == (
+        "set_collision_sensitivity: no result from the session driver within 0.2 s"
+    )
+    assert r.json()["collision_sensitivity"] is None and r.json()["sdk_codes"] == {}
+    assert rt.hardware_monitor.requested_sensitivity("grip") is None
+    # The driver refuses the request (CommandError): 409 with its text.
+    from apollo_mavis_v2_core import CommandError
+
+    def refuse(arm_id: str, level: int) -> None:
+        raise CommandError(f"{arm_id}: driver not connected")
+
+    monkeypatch.setattr(cell, "request_set_collision_sensitivity", refuse)
+    r = client.post(SENS_URL, json=_sens(2))
+    assert r.status_code == 409 and r.json()["detail"] == "grip: grip: driver not connected"
+    # A workcell without the channel.
+    from apollo_mavis_v2_core.testing import FakeWorkcell
+
+    plain = FakeWorkcell({"grip": FakeArm("grip", has_rail=True)}, {}, kind="hardware")
+    plain.start()
+    session.workcell = plain
+    try:
+        r = client.post(SENS_URL, json=_sens(2))
+        assert r.status_code == 409
+        assert "no collision-sensitivity channel" in r.json()["detail"]
     finally:
         session.workcell = cell

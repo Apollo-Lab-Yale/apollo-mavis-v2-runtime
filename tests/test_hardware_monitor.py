@@ -313,6 +313,13 @@ def test_backstops_match_tolerances():
     assert backstops_match(replace(ok, collision_sensitivity=4), grip) is False
     assert backstops_match(replace(ok, tcp_load_cog_mm=()), grip) is False  # cog unreadable
     assert backstops_match(replace(ok, collision_sensitivity=None), grip) is None
+    # 2026-09-11: the operator's requested level replaces the config as the expectation
+    # (an obeyed set_collision_sensitivity is not "differs from config").
+    assert backstops_match(ok, grip, expected_sensitivity=2) is False
+    assert backstops_match(replace(ok, collision_sensitivity=2), grip, expected_sensitivity=2)
+    assert backstops_match(replace(ok, collision_sensitivity=2), grip) is False
+    assert backstops_match(replace(ok, collision_sensitivity=2), grip, 3) is False
+    assert backstops_match(replace(ok, collision_sensitivity=None), grip, 2) is None
     # The lab as found (2026-09-04): 0 kg / sensitivity 1 on the Perception Arm.
     view = HW.arms[1].model_copy(update={"tcp_load_kg": 0.55, "tcp_load_cog_mm": (0.0, 0.0, 90.0)})
     found = FakeMonitorSample(
@@ -424,7 +431,9 @@ def test_maintenance_refusals_on_the_runtime_monitor():
     from apollo_mavis_v2_runtime.devices.hardware_monitor import MAINTENANCE_OPS
     from apollo_mavis_v2_runtime.errors import MaintenanceUnavailableError
 
-    assert MAINTENANCE_OPS == ("clear_errors", "apply_backstops", "recover", "home_rail")
+    assert MAINTENANCE_OPS == (
+        "clear_errors", "apply_backstops", "recover", "home_rail", "set_collision_sensitivity",
+    )
     factory = FakeMonitorFactory()
     mon = HardwareStateMonitor(HardwareMonitorConfig(), HW, monitor_factory=factory)
     with pytest.raises(KeyError):
@@ -437,6 +446,12 @@ def test_maintenance_refusals_on_the_runtime_monitor():
         mon.maintenance("grip", "clear_errors")  # not started
     with pytest.raises(MaintenanceUnavailableError, match="monitor off"):
         mon.maintenance("grip", "home_rail")  # phase-09c: a real op now, same gate
+    # set_collision_sensitivity validates the level BEFORE any gate (422 upstream).
+    for bad in (None, 0, 4, 5, 2.5, True, "2"):
+        with pytest.raises(ValueError, match="1, 2 or 3"):
+            mon.maintenance("grip", "set_collision_sensitivity", collision_sensitivity=bad)
+    with pytest.raises(MaintenanceUnavailableError, match="monitor off"):
+        mon.maintenance("grip", "set_collision_sensitivity", collision_sensitivity=2)
     mon.start()
     try:
         grip = factory.monitors["grip"]
@@ -476,8 +491,103 @@ def test_maintenance_refusals_on_the_runtime_monitor():
     # Inert monitor (no hardware workcell): every op is 409, never a crash.
     none = HardwareStateMonitor(HardwareMonitorConfig(), None)
     with pytest.raises(KeyError):
+        none.note_requested_sensitivity("grip", 2)
+    assert none.requested_sensitivity("grip") is None
+    none.forget_requested_sensitivity("grip")  # unknown arm: a no-op
+    with pytest.raises(KeyError):
         none.maintenance("grip", "clear_errors")
     off = HardwareStateMonitor(HardwareMonitorConfig(enabled=False), HW)
     off.start()
     with pytest.raises(MaintenanceUnavailableError, match="monitor off"):
         off.maintenance("grip", "clear_errors")
+
+
+def test_set_collision_sensitivity_on_the_runtime_monitor_and_the_requested_level():
+    """2026-09-11: the monitor path writes once and judges by read-back; the level
+    is remembered per arm (``backstops_match`` expects it, the row publishes it while
+    paused) until a hand-over (driver connect) or ``apply_backstops`` forgets it."""
+    from dataclasses import replace
+
+    from apollo_mavis_v2_runtime.errors import MaintenanceUnavailableError
+
+    now = time.monotonic()
+    cfg = HW.model_copy(update={"arms": [
+        HW.arms[0].model_copy(update={"tcp_load_kg": 0.95, "tcp_load_cog_mm": (0.0, 0.0, 60.0)}),
+        HW.arms[1],
+    ]})
+    samples = {
+        "grip": FakeMonitorSample(
+            "grip", seq=2, t_mono=now, collision_sensitivity=3, tcp_load_kg=0.95,
+            tcp_load_cog_mm=(0.0, 0.0, 60.0),
+        ),
+    }
+    factory = FakeMonitorFactory(samples)
+    paused = {"on": False}
+    mon = HardwareStateMonitor(
+        HardwareMonitorConfig(), cfg, lambda: paused["on"], monitor_factory=factory,
+        driver_cfg_factory=lambda arm: arm, check_period_s=0.02,
+    )
+    mon.start()
+    try:
+        grip = factory.monitors["grip"]
+        assert _wait(lambda: mon.status_of("grip")[0] == "running")
+        res = mon.maintenance("grip", "set_collision_sensitivity", collision_sensitivity=2)
+        assert res.ok and res.path == "monitor" and res.op == "set_collision_sensitivity"
+        assert res.sdk_codes == {"set_collision_sensitivity": 0} and res.warnings == []
+        assert res.collision_sensitivity == 2 and grip.sensitivity_calls == [2]
+        assert grip.maintenance_calls[-1][0] == "set_collision_sensitivity"
+        assert res.detail.startswith("collision sensitivity set to 2 (was 3; the config value 3")
+        assert res.before is not None and res.before.collision_sensitivity == 3
+        assert res.before.backstops_match is True  # judged against the level in force: config
+        assert res.after is not None and res.after.collision_sensitivity == 2
+        assert res.after.backstops_match is True  # judged against the level written
+        assert mon.requested_sensitivity("grip") == 2 and mon.requested_sensitivity("view") is None
+        row = next(r for r in mon.arm_telemetry() if r.arm_id == "grip")
+        assert row.collision_sensitivity == 2 and row.backstops_match is True
+        # A status echo (fault latched) is ok with the note in warnings; the read-back rules.
+        grip.sensitivity_code = 2
+        res = mon.maintenance("grip", "set_collision_sensitivity", collision_sensitivity=1)
+        assert res.ok and res.sdk_codes == {"set_collision_sensitivity": 2}
+        assert res.collision_sensitivity == 1 and mon.requested_sensitivity("grip") == 1
+        assert "status echo" in res.detail
+        # The box did not take the value: not ok, the read-back is what is reported.
+        grip.sensitivity_code = 0
+        grip.sensitivity_readback = 1
+        res = mon.maintenance("grip", "set_collision_sensitivity", collision_sensitivity=3)
+        assert not res.ok and res.collision_sensitivity == 1
+        assert res.detail == "collision sensitivity still reads 1 after writing 3"
+        assert mon.requested_sensitivity("grip") == 1  # a failed write changes nothing
+        grip.sensitivity_readback = None
+        # Paused (a driver connected: the config value is back): the level is forgotten ...
+        paused["on"] = True
+        assert _wait(lambda: mon.paused)
+        assert mon.requested_sensitivity("grip") is None
+        # ... and a session-path write recorded now is PUBLISHED on the paused row (the
+        # stale sample reads 1; the payload alone is judged).
+        mon.note_requested_sensitivity("grip", 2)
+        row = next(r for r in mon.arm_telemetry() if r.arm_id == "grip")
+        assert row.status == "paused" and row.collision_sensitivity == 2
+        assert row.backstops_match is True
+        with pytest.raises(MaintenanceUnavailableError, match="monitor paused"):
+            mon.maintenance("grip", "set_collision_sensitivity", collision_sensitivity=3)
+        paused["on"] = False
+        assert _wait(lambda: not mon.paused)
+        assert mon.requested_sensitivity("grip") == 2  # a resume alone keeps the override
+        row = next(r for r in mon.arm_telemetry() if r.arm_id == "grip")
+        assert row.collision_sensitivity == 1  # running again: the read-back is published
+        assert row.backstops_match is False  # ... and 1 != the requested 2
+        grip.sample = replace(grip.sample, collision_sensitivity=2, seq=grip.sample.seq + 1)
+        row = next(r for r in mon.arm_telemetry() if r.arm_id == "grip")
+        assert row.collision_sensitivity == 2 and row.backstops_match is True
+        # apply_backstops rewrites the config value: the override is gone.
+        res = mon.maintenance("grip", "apply_backstops")
+        assert res.ok and res.after is not None and res.after.collision_sensitivity == 3
+        assert res.after.backstops_match is True and res.collision_sensitivity is None
+        assert mon.requested_sensitivity("grip") is None
+        for bad in (0, 4, 2.5):
+            with pytest.raises(ValueError):
+                mon.note_requested_sensitivity("grip", bad)
+        with pytest.raises(KeyError):
+            mon.note_requested_sensitivity("arm9", 2)
+    finally:
+        mon.stop()

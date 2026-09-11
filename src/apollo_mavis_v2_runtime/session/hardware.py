@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from apollo_mavis_v2_core import ArmState, CommandError, GripperCommand, GripperState, Pose
+from apollo_mavis_v2_core import ArmState, CommandError, GripperCommand, GripperState, Pose, se3
 from apollo_mavis_v2_core.interfaces import ArmInterface, WorkcellInterface
 from apollo_mavis_v2_core.protocol import ArmBringupTelemetry
 
@@ -620,11 +620,19 @@ def frozen_state(
     rail_fallback_m: Mapping[str, float],
     rail_flip: bool = False,
     travel_m: float = RAIL_TRAVEL_M,
+    gripper: bool | None = None,
 ) -> tuple[ArmState, str | None]:
     """``ArmState`` posing an arm that is NOT commanded (09c: the unselected
     session arm; 09d: the other arm during a rail-homing job) from its last
     monitor sample (q7 + rail position, ``rail_fallback_m`` when the rail is
-    unknown; ``rail_flip`` applied like the overlay) -> ``(state, assumption | None)``."""
+    unknown; ``rail_flip`` applied like the overlay) -> ``(state, assumption | None)``.
+
+    ``ee_pose`` (2026-09-11) is the twin's ``link_tcp`` built from the sample's FLANGE
+    ``tcp_pose`` (``[x, y, z m, roll, pitch, yaw rad]``, extrinsic-XYZ RPY) through
+    ``se3.rpy_to_quat`` + ``se3.flange_to_tcp``; ``gripper`` says whether the arm carries
+    one (``ArmConfig.gripper != "none"``), ``None`` = infer it from the sample
+    (``gripper_open_frac`` is ``None`` exactly for gripper ``"none"``). Identity when
+    the sample carries no pose (the pre-2026-09-11 behaviour for every sample)."""
     q7 = np.asarray(list(sample.q)[:7], dtype=np.float64)
     note: str | None = None
     if has_rail:
@@ -640,12 +648,19 @@ def frozen_state(
     else:
         q = q7
     frac = getattr(sample, "gripper_open_frac", None)
+    tcp = tuple(getattr(sample, "tcp_pose", ()) or ())
+    if len(tcp) >= 6 and all(np.isfinite(v) for v in tcp[:6]):
+        flange = Pose(np.asarray(tcp[:3], dtype=np.float64), se3.rpy_to_quat(tcp[3:6]))
+        has_gripper = (frac is not None) if gripper is None else bool(gripper)
+        ee_pose = se3.flange_to_tcp(flange, gripper=has_gripper)
+    else:
+        ee_pose = Pose.identity()
     now = time.monotonic()
     state = ArmState(
         arm_id=arm_id,
         q=q,
         dq=np.zeros_like(q),
-        ee_pose=Pose.identity(),
+        ee_pose=ee_pose,
         gripper=GripperState(open_frac=1.0 if frac is None else min(1.0, max(0.0, float(frac)))),
         rail_pos_m=float(q[7]) if has_rail else None,
         error_code=int(getattr(sample, "error_code", 0) or 0),

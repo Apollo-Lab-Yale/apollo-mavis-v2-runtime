@@ -281,7 +281,16 @@ def dataset_incompatibility(
             parts.append(f"dataset has {missing} which this session lacks")
         if extra:
             parts.append(f"this session adds {extra}")
-        return "feature set differs: " + "; ".join(parts)
+        why = "feature set differs: " + "; ".join(parts)
+        if not missing and extra == ["action.abs_ee"]:
+            # A dataset recorded before 2026-09-11: the ONLY difference is the absolute
+            # action column every session now writes - the backfill tool adds it in place.
+            why += (
+                " - the dataset predates the action.abs_ee column; run "
+                "`python -m apollo_mavis_v2_runtime.tools.backfill_abs_ee <dataset dir>` "
+                "to add it, then resume"
+            )
+        return why
     for key, spec in features.items():
         if _feature_signature(stored[key]) != _feature_signature(spec):
             return (

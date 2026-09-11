@@ -28,12 +28,13 @@ import threading
 from collections import deque
 
 import numpy as np
-from apollo_mavis_v2_core import ArmState, Command, CommandResult, CommandSource
+from apollo_mavis_v2_core import ArmState, Command, CommandResult, CommandSource, Pose, se3
 from apollo_mavis_v2_core.dagger import ControlMode
 from apollo_mavis_v2_core.interfaces.policy import Observation
 from apollo_mavis_v2_core.protocol import DaggerStatus, InferenceStatus
 
 from ..control.loop import GRIPPER_SEND_EVERY_N_TICKS, NOT_ONLINE_DAGGER, ControlLoop
+from ..recorder.features import arm_action_names
 from .policy_runner import (
     BLOCK_STREAK_TICKS,
     NAN_STRIKES_PER_EPISODE,
@@ -42,6 +43,7 @@ from .policy_runner import (
     split_action,
 )
 from .policy_source import PolicySource
+from .step import action_space_of, policy_step, staleness_of
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,7 @@ class GatedPolicyExecutor(ControlLoop):
         self._last_cf: np.ndarray | None = None  # per-frame counterfactual deposit
         self._last_out_t = -1.0
         self._policy_drove = False
+        self._cf_warned = False  # one warning when an abs_ee counterfactual cannot be a delta
 
     # -- episode-boundary plumbing ---------------------------------------------------
     def on_episode_saved(self, index: int, summary, spool_path: str) -> None:
@@ -125,7 +128,10 @@ class GatedPolicyExecutor(ControlLoop):
         reset's ``events.gate`` payload names the episode that just CLOSED (cached when it
         opened): the recorder has already cleared its id by now, whether the boundary runs
         while its state still reads ``saving`` or after the flip to idle."""
-        self._publish_gate(self.gate.reset(), episode_id=self._ep_id)
+        reset_events = self.gate.reset()
+        for ev in reset_events:
+            self.anchor.on_gate_event(ev)  # re-anchor rule (12-dagger §6 rule 1)
+        self._publish_gate(reset_events, episode_id=self._ep_id)
         if self._ep_ticks > 0:
             self._rates.append(self._ep_human_ticks / self._ep_ticks)
         self._ep_ticks = 0
@@ -247,10 +253,15 @@ class GatedPolicyExecutor(ControlLoop):
                 out[arm_id] = self._teleop_step(arm_id, states[arm_id], q_last, held, scale, now)
             elif engaged is not None:
                 out[arm_id] = None  # frozen: hold; ordinary policy frame (§2)
-            elif policy_on:
+            elif policy_on and self._drives(arm_id):
                 self._note_source(arm_id, CommandSource.POLICY)  # teleop re-seeds after this
                 out[arm_id] = self._policy_step(arm_id, states[arm_id], q_last, now)
                 self._policy_drove = True
+            elif policy_on:
+                # v1.3 (14-dora §6.1): the policy does not drive this arm - hold it exactly
+                # like a frozen arm (last command re-sent, gripper untouched); the parked
+                # Perception Arm of a Manipulation-Arm-only policy
+                out[arm_id] = None
             elif self.session_mode == "dagger" and arm_id == self.active_arm:
                 # between episodes: plain teleop for scene staging
                 self._note_source(arm_id, CommandSource.TELEOP)
@@ -276,67 +287,147 @@ class GatedPolicyExecutor(ControlLoop):
             return True
         return self._recording()
 
+    # -- per-arm driving (v1.3, 2026-09-11; 14-dora §6.1) --------------------------------------
+    def _driven_arms(self) -> frozenset[str] | None:
+        """The source's driven set (``None`` = every arm); read per tick because an external
+        spec may change, and defensively because test stubs predate the member."""
+        fn = getattr(self.runner, "driven_arms", None)
+        if fn is None:
+            return None
+        try:
+            d = fn()
+        except Exception:  # noqa: BLE001 - never on the tick
+            return None
+        return None if d is None else frozenset(d)
+
+    def _drives(self, arm_id: str) -> bool:
+        d = self._driven_arms()
+        return d is None or arm_id in d
+
+    def _stale(self, now: float, arm_id: str) -> float:
+        """This arm's staleness (a source without the per-arm form answers for the cell)."""
+        return staleness_of(self.runner, now, arm_id)
+
+    def _action_space(self) -> str:
+        """The layout the source's rows follow (``delta_ee`` | ``abs_ee``)."""
+        return action_space_of(self.runner, self.anchor)
+
+    def _driven_finite(self, actions: np.ndarray) -> bool:
+        """Finite on every block the policy DRIVES (undriven blocks are NaN by contract and
+        never a strike)."""
+        d = self._driven_arms()
+        if d is None:
+            return bool(np.all(np.isfinite(actions)))
+        for arm_id, block in split_action(actions, self.arms_meta, self._action_space()).items():
+            if arm_id in d and not np.all(np.isfinite(block)):
+                return False
+        return True
+
     def _recording(self) -> bool:
         return self.recorder is not None and self.episode_state == "recording"
 
     # -- policy application ---------------------------------------------------------
     def _update_counterfactual(self, now: float) -> None:
-        """Latest policy output -> per-frame counterfactual (NaN when absent)."""
+        """Latest policy output -> per-frame counterfactual (NaN when absent).
+
+        The ``policy_action`` column keeps the recorded canonical ``delta_ee`` layout in
+        dataset-FRAME units. A ``delta_ee`` row is per policy period, so its delta dims
+        scale by ``dt / period * frame_scale``; an ``abs_ee`` row is a waypoint one period
+        ahead, so its delta against the current command ``FK(q_last)`` is what the policy
+        "would move" per period and scales by the SAME factor (no absolute value is ever
+        multiplied). Gripper dims pass through. When the conversion is impossible the
+        block is NaN and ONE warning is logged."""
         out, t_out = self.runner.latest()
         if out is None:
             self._last_cf = None
             return
         if t_out != self._last_out_t:
             self._last_out_t = t_out
-            if not np.all(np.isfinite(out.actions)):
+            if not self._driven_finite(out.actions):
                 self._nan_strike(now)
-        cf = np.asarray(out.actions, dtype=np.float32).copy()
-        # delta dims scale from policy-period to dataset-frame units; the
-        # absolute gripper dim passes through (layout: 6 delta + grip [+ rail]).
         s = float(self.dt / self.runner.period) * self._frame_scale
+        space = self._action_space()
+        if space == "abs_ee":
+            self._last_cf = self._abs_counterfactual(out.actions, s)
+            return
+        cf = np.asarray(out.actions, dtype=np.float32).copy()
         i = 0
-        for _, has_rail in self.arms_meta:
-            n = 8 if has_rail else 7
+        for arm_id, has_rail in self.arms_meta:
+            n = len(arm_action_names(arm_id, has_rail, "delta_ee"))
             cf[i : i + 6] *= s
             if has_rail:
                 cf[i + 7] *= s
             i += n
         self._last_cf = cf
 
+    def _abs_counterfactual(self, actions: np.ndarray, s: float) -> np.ndarray:
+        """``abs_ee`` rows -> the ``delta_ee``-width counterfactual: per arm the delta from
+        ``FK(q_last)`` to the row's TCP (arm_base frame, space-frame rotvec, rail delta),
+        scaled per frame; gripper absolute; NaN where the row (or the conversion) is not."""
+        parts: list[np.ndarray] = []
+        blocks = split_action(actions, self.arms_meta, "abs_ee")
+        kin = self.anchor.kin
+        for arm_id, has_rail in self.arms_meta:
+            n = len(arm_action_names(arm_id, has_rail, "delta_ee"))
+            cf = np.full(n, np.nan, dtype=np.float32)
+            parts.append(cf)
+            block = blocks.get(arm_id)
+            if block is None or block.shape[0] < 10 or not np.all(np.isfinite(block)):
+                continue  # NaN by contract (undriven / NaN row): no warning
+            q_last = self._last_cmd.get(arm_id)
+            base_world = getattr(kin, "base_world", None)
+            try:
+                if q_last is None or base_world is None:
+                    raise ValueError("no command or no base_world on the kinematics seam")
+                row = np.asarray(block, dtype=np.float64)
+                target_w = se3.pose_mul(
+                    base_world(arm_id, q_last), Pose(row[:3], se3.rot6d_to_quat(row[3:9]))
+                )
+                cur = kin.tcp_world(arm_id, q_last)
+                base_inv = se3.quat_conj(kin.base_quat_world(arm_id))
+                dp_b = se3.quat_rotate(base_inv, target_w.position - cur.position)
+                dq_w = se3.quat_mul(target_w.orientation, se3.quat_conj(cur.orientation))
+                dr_b = se3.quat_rotate(base_inv, se3.quat_to_rotvec(dq_w))
+            except (ValueError, KeyError, AttributeError, TypeError) as exc:
+                if not self._cf_warned:
+                    self._cf_warned = True
+                    logger.warning(
+                        "abs_ee counterfactual for %s cannot be converted to a delta (%s); "
+                        "the policy_action column records NaN", arm_id, exc,
+                    )
+                continue
+            cf[:3] = dp_b * s
+            cf[3:6] = dr_b * s
+            cf[6] = row[9]
+            if has_rail and row.shape[0] > 10:
+                cf[7] = (row[10] - float(q_last[7])) * s
+        return np.concatenate(parts)
+
     def _policy_step(
         self, arm_id: str, state: ArmState, q_last: np.ndarray, now: float
     ) -> np.ndarray | None:
-        out, _ = self.runner.latest()
-        if out is None or not np.all(np.isfinite(out.actions)):
-            return None  # hold; counterfactual row records NaN (12-dagger §12)
-        stale = self.runner.staleness_scale(now)
-        if stale <= 0.0:
-            return None  # > 5 stale periods: hold
-        blocks = split_action(out.actions, self.arms_meta)
-        block = blocks.get(arm_id)
-        if block is None:
-            return None
-        tick_scale = (self.dt / self.runner.period) * stale
-        has_rail = state.q.shape[0] > 7
-        rail_d = float(block[7]) * tick_scale if has_rail and block.shape[0] > 7 else None
-        q = self.anchor.apply_delta(
-            arm_id,
-            np.asarray(block[:3], dtype=np.float64) * tick_scale,
-            np.asarray(block[3:6], dtype=np.float64) * tick_scale,
-            rail_d,
-            q_last,
-            state.q,
-            self.dt,
-            now,
+        """One arm's command from the source's newest row (``dagger.step.policy_step``);
+        the gripper dim lands in ``_grip_frac`` and is sent every N ticks."""
+        return policy_step(
+            runner=self.runner,
+            anchor=self.anchor,
+            arms_meta=self.arms_meta,
+            arm_id=arm_id,
+            state=state,
+            q_last=q_last,
+            now=now,
+            dt=self.dt,
+            on_gripper=self._policy_gripper,
         )
-        grip = float(block[6])
-        if np.isfinite(grip) and arm_id in self.gripper_arms:
-            self._grip_frac[arm_id] = float(np.clip(grip, 0.0, 1.0))
-            if self.tick_count % GRIPPER_SEND_EVERY_N_TICKS == 0:
-                sender = self._senders.get(arm_id)
-                if sender is not None:
-                    sender.put_gripper(self._grip_frac[arm_id])
-        return q
+
+    def _policy_gripper(self, arm_id: str, frac: float) -> None:
+        if arm_id not in self.gripper_arms:
+            return
+        self._grip_frac[arm_id] = frac
+        if self.tick_count % GRIPPER_SEND_EVERY_N_TICKS == 0:
+            sender = self._senders.get(arm_id)
+            if sender is not None:
+                sender.put_gripper(self._grip_frac[arm_id])
 
     def _nan_strike(self, now: float) -> None:
         self._nan_strikes += 1

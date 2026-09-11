@@ -466,3 +466,21 @@ def test_gate_ops_and_train_now_are_nacked_outside_their_sessions(client, sessio
         assert not ack["ok"] and "invalid args" in ack["detail"]
         ws.send_json({"t": "action", "name": "takeover", "args": {"x": 1}})
         assert not ws.receive_json()["ok"]
+
+
+def test_playback_request_carries_the_source_and_info_lists_the_sources(client):
+    """2026-09-11 (04-runtime §10.8): ``POST /api/session/playback`` takes ``source``
+    (``state`` default, ``delta_ee``, ``abs_ee``) and the info GET publishes ``sources`` -
+    both additive, so an older UI keeps working and a newer one can enable its control."""
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    source = schemas["EpisodePlaybackRequest"]["properties"]["source"]
+    assert source["enum"] == ["state", "delta_ee", "abs_ee"] and source["default"] == "state"
+    info = schemas["EpisodePlaybackInfo"]["properties"]
+    assert info["sources"]["default"] == ["state"]
+    assert "action_space" in info
+    # an unknown source is a 422 from the model; a valid one without a session is a refusal
+    body = {"repo_id": "bc/x", "episode_id": "20260910T000000.000Z-a1b2c3", "action": "play"}
+    assert client.post("/api/session/playback", json={**body, "source": "joint"}).status_code == 422
+    r = client.post("/api/session/playback", json={**body, "source": "abs_ee"})
+    assert r.status_code == 200 and r.json()["ok"] is False
+    assert r.json()["detail"] == "no active session"

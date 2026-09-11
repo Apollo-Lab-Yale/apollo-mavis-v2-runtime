@@ -165,13 +165,25 @@ def test_pending_frame_action_alignment(rig):
     # action[k] = executed commanded delta k -> k+1 (leading convention §3.2)
     assert np.allclose(f1["action"], [0.002, 0, 0, 0, 0, 0.01, 0.7, 0.001], atol=1e-9)
     assert np.allclose(f2["action"], [0, 0.004, 0, 0, 0, 0, 0.8, 0.0], atol=1e-9)
-    # obs at frame k: measured state, 16 dims, ee verbatim (arm_base frame)
+    # action.abs_ee[k] = the COMMANDED TCP at k+1 (FakeKin: q[:3], rotvec q[3:6]) as
+    # position + r6, the gripper target AT k (same as the delta column), rail at k+1
+    for f, q_next, grip in ((f1, q2, 0.7), (f2, q3, 0.8)):
+        abs_ee = f["action.abs_ee"]
+        assert abs_ee.shape == (11,) and abs_ee.dtype == np.float32
+        r6 = se3.quat_to_rot6d(se3.rotvec_to_quat(q_next[3:6]))
+        assert np.allclose(abs_ee[:3], q_next[:3], atol=1e-7)
+        assert np.allclose(abs_ee[3:9], r6, atol=1e-7)
+        assert abs_ee[9] == pytest.approx(grip) and abs_ee[10] == pytest.approx(q_next[7])
+        assert abs_ee[9] == f["action"][6]  # identical gripper values in both columns
+    # obs at frame k: measured state, 16 dims; ee.* = the twin FK of the MEASURED joints at
+    # link_tcp (FakeKin: q[:3], rotvec q[3:6]) - NOT the driver-reported pose (0.4, 0, 0.3):
+    # one definition shared with recorder/backfill_abs_ee.py so old and new episodes align
     s = f1["observation.state"]
     assert s.shape == (16,) and s.dtype == np.float32
     assert np.allclose(s[:7], Q0[:7], atol=1e-6)
     assert np.allclose(s[7:9], [0.5, 0.10], atol=1e-6)  # gripper, rail
-    assert np.allclose(s[9:12], [0.4, 0.0, 0.3], atol=1e-6)
-    assert np.allclose(s[12:], [0.0, 1.0, 0.0, 0.0], atol=1e-6)
+    assert np.allclose(s[9:12], Q0[:3], atol=1e-6)
+    assert np.allclose(s[12:], se3.rotvec_to_quat(Q0[3:6]), atol=1e-6)
     # fixed columns
     assert f1["intervention"][0] == np.False_
     assert f1["action_source"][0] == 1 and f1["action_source"].dtype == np.int8

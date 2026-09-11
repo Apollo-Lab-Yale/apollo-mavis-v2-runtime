@@ -67,6 +67,18 @@ class RecoveryResult:
     t_mono: float = 0.0
 
 
+@dataclass(frozen=True)
+class SettingResult:
+    """Mirror of ``apollo_mavis_v2_hardware.SettingResult`` (2026-09-11)."""
+
+    seq: int
+    ok: bool
+    code: int
+    level: int
+    t_mono: float = 0.0
+    detail: str = ""
+
+
 class EventFakeWorkcell(FakeWorkcell):
     """``FakeWorkcell`` + the hardware workcell's event / recovery surface.
 
@@ -78,7 +90,12 @@ class EventFakeWorkcell(FakeWorkcell):
     queues ``FaultEvent(source="user") -> ReseedEvent -> RecoveredEvent`` plus a
     ``RecoveryResult(ok=True)`` - or, when ``latch_next[arm_id]`` holds a reason,
     a latch ``FaultEvent`` plus ``RecoveryResult(ok=False, detail=reason)`` and
-    the error stays latched.
+    the error stays latched. ``request_set_collision_sensitivity(arm_id, level)``
+    (2026-09-11) mirrors ``HardwareWorkcell.request_set_collision_sensitivity``:
+    after the same ``recovery_latency_s`` it publishes a :class:`SettingResult`
+    (``setting_result(arm_id)``) whose code is ``setting_code_next.pop(arm_id, 0)``
+    - 0 clean, 1 / 2 / 9 a status echo (``ok`` with the driver's note), anything
+    else a failure; ``setting_requests`` logs ``(arm_id, level)``.
     """
 
     def __init__(
@@ -100,6 +117,11 @@ class EventFakeWorkcell(FakeWorkcell):
         self._seq: dict[str, int] = {}
         self.recovery_requests: list[str] = []
         self.drains = 0
+        # 2026-09-11 collision-sensitivity channel
+        self.setting_requests: list[tuple[str, int]] = []
+        self.setting_code_next: dict[str, int] = {}  # arm -> SDK code of the next write
+        self._setting_results: dict[str, SettingResult] = {}
+        self._setting_seq: dict[str, int] = {}
 
     # -- events -------------------------------------------------------------------------
     def queue(self, *events: object) -> None:
@@ -170,6 +192,44 @@ class EventFakeWorkcell(FakeWorkcell):
 
     def recovery_result(self, arm_id: str) -> RecoveryResult | None:
         return self._results.get(arm_id)
+
+    # -- collision-sensitivity channel (HardwareWorkcell surface, 2026-09-11) ------------
+    def request_set_collision_sensitivity(self, arm_id: str, level: int) -> None:
+        if arm_id not in self.arms:
+            raise KeyError(arm_id)
+        if not self.started:
+            raise CommandError(f"{arm_id}: driver not connected")
+        if isinstance(level, bool) or int(level) != level or int(level) not in (1, 2, 3):
+            raise CommandError(f"{arm_id}: collision sensitivity must be 1, 2 or 3 (got {level!r})")
+        self.setting_requests.append((arm_id, int(level)))
+        if self.recovery_latency_s > 0.0:
+            timer = threading.Timer(
+                self.recovery_latency_s, self._complete_setting, (arm_id, int(level))
+            )
+            timer.daemon = True
+            timer.start()
+        else:
+            self._complete_setting(arm_id, int(level))
+
+    def _complete_setting(self, arm_id: str, level: int) -> None:
+        code = int(self.setting_code_next.pop(arm_id, 0))
+        seq = self._setting_seq.get(arm_id, 0) + 1
+        self._setting_seq[arm_id] = seq
+        ok = code == 0 or code in (1, 2, 9)
+        if code == 0:
+            detail = ""
+        elif ok:
+            detail = (
+                f"set_collision_sensitivity returned {code} (status echo: the controller has "
+                "an error / warning latched or is not ready; the write went through - the "
+                "read-only monitor verifies the value once it holds the box again)"
+            )
+        else:
+            detail = f"set_collision_sensitivity returned {code}"
+        self._setting_results[arm_id] = SettingResult(seq, ok, code, level, self._clock(), detail)
+
+    def setting_result(self, arm_id: str) -> SettingResult | None:
+        return self._setting_results.get(arm_id)
 
 
 @dataclass(frozen=True)

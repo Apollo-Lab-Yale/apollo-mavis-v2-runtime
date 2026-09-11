@@ -54,6 +54,7 @@ def features(width: int = W, height: int = H):
 def make_frame(i: int, width: int = W, height: int = H) -> dict:
     return {
         "action": np.full(8, 0.001 * i, dtype=np.float32),
+        "action.abs_ee": np.full(11, 0.002 * i, dtype=np.float32),
         "observation.state": np.full(16, 0.01 * i, dtype=np.float32),
         f"observation.images.{CAM}": np.full((height, width, 3), i % 255, dtype=np.uint8),
         "intervention": np.array([False]),
@@ -126,13 +127,15 @@ def test_directory_layout_and_frames_equal_rows(saved):
         pf = pq.ParquetFile(d / FRAMES_PARQUET)
         assert pf.metadata.num_rows == n and pf.metadata.num_row_groups == 1
         assert pf.schema_arrow.names == [
-            "action", "observation.state", "intervention", "action_source", "wallclock_ns",
-            "timestamp", "frame_index", "task",
+            "action", "action.abs_ee", "observation.state", "intervention", "action_source",
+            "wallclock_ns", "timestamp", "frame_index", "task",
         ]
         table = pf.read()
         import pyarrow as pa
 
         assert table.schema.field("action").type == pa.list_(pa.float32(), 8)
+        assert table.schema.field("action.abs_ee").type == pa.list_(pa.float32(), 11)
+        assert np.allclose(table.column("action.abs_ee")[n - 1].as_py(), [0.002 * (n - 1)] * 11)
         assert str(table.schema.field("timestamp").type) == "float"
         assert table.column("frame_index").to_pylist() == list(range(n))
         assert table.column("task").to_pylist() == ["test task"] * n
@@ -153,9 +156,11 @@ def test_directory_layout_and_frames_equal_rows(saved):
         # stats: lerobot semantics — (3,1,1) image stats in [0,1], vectors per dim, count (1,)
         st = ep["stats"]
         assert set(st) == {
-            "action", "observation.state", "intervention", "action_source", "wallclock_ns",
-            f"observation.images.{CAM}",
+            "action", "action.abs_ee", "observation.state", "intervention", "action_source",
+            "wallclock_ns", f"observation.images.{CAM}",
         }
+        assert np.asarray(st["action.abs_ee"]["mean"]).shape == (11,)
+        assert st["action.abs_ee"]["count"] == [n]
         img = st[f"observation.images.{CAM}"]
         assert np.asarray(img["mean"]).shape == (3, 1, 1) and 0.0 <= img["mean"][0][0][0] <= 1.0
         assert img["count"][0] >= n  # lerobot's writer stores the downsampled PIXEL count
@@ -178,6 +183,9 @@ def test_manifest_counters_identity_and_stale_flag(saved):
     }
     assert m["features"]["action"]["shape"] == [8]
     assert m["features"]["action"]["info"]["apollo_schema"] == 1
+    assert "action.abs_ee" in m["features"]  # the manifest is written sort_keys, no order pin
+    assert m["features"]["action.abs_ee"]["shape"] == [11]
+    assert m["features"]["action.abs_ee"]["info"]["action_space"] == "abs_ee"
     assert m["last_export"] is None  # never exported: nothing to mark stale
     assert stored_video_codec(root) == "av1"
 
@@ -214,6 +222,16 @@ def test_dataset_incompatibility_reads_the_manifest_incl_info_blocks(saved):
     two = build_features([ArmMeta("arm0", True), ArmMeta("arm1", False)],
                          {"arm0": "arm_base:arm0", "arm1": "arm_base:arm1"}, {CAM: (W, H)})
     assert "differs" in dataset_incompatibility(m, two, 25, ROBOT_TYPE)
+    # a dataset recorded before action.abs_ee existed: the refusal names the backfill tool
+    old_manifest = json.loads(json.dumps(m))
+    del old_manifest["features"]["action.abs_ee"]
+    why = dataset_incompatibility(old_manifest, features(), 25, ROBOT_TYPE)
+    assert why is not None and "this session adds ['action.abs_ee']" in why
+    assert "apollo_mavis_v2_runtime.tools.backfill_abs_ee" in why
+    # ... but not when anything else differs too
+    del old_manifest["features"]["wallclock_ns"]
+    why2 = dataset_incompatibility(old_manifest, features(), 25, ROBOT_TYPE)
+    assert why2 is not None and "backfill_abs_ee" not in why2
     with pytest.raises(ValueError, match="cannot be continued"):
         EpisodeDirRecorder(SOFT, other, root, REPO_ID, ROBOT_TYPE, "t")
 

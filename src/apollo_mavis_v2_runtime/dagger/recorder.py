@@ -50,6 +50,7 @@ SPOOL_COLUMNS = (
     "action_source",
     "wallclock_ns",
     "actor",  # phase-14 (appended: readers by name are unaffected)
+    "action.abs_ee",  # 2026-09-11 (appended LAST, same reason; 10-frames §6)
 )
 
 

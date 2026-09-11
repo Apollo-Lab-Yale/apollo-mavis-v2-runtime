@@ -82,7 +82,7 @@ from mavis_policy_node.types import Observation, PolicyOutput, PolicySpec
 
 class MyPolicy:
     def __init__(self, model, spec: PolicySpec, device): ...
-    spec: PolicySpec            # action_space "delta_ee", action_frame "arm_base:grip", action_names,
+    spec: PolicySpec            # action_space "delta_ee" | "abs_ee", action_frame "arm_base:grip", action_names,
                                 # state_names, camera_keys, version (int - bump on every swap)
     policy_id = "my-policy"     # optional; the node's spec.policy_id / trainer_id prefix (default: the class name)
     def reset(self) -> None: ...                       # drop chunks / history

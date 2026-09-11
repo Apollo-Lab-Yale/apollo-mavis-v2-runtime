@@ -532,3 +532,201 @@ def test_a_joint_goal_the_cap_holds_is_not_reported_as_an_arrival(tmp_path):
     assert loop.plans.active_arms == ["arm0"]
     assert loop._plan_status == "executing" and loop.plan_cancel_reason is None
     assert np.allclose(loop._last_cmd["arm0"], 0.0)  # held, not arrived
+
+
+# -- action replay (2026-09-11; 04-runtime §10.8) ---------------------------------------
+# Episode playback with ``source: delta_ee | abs_ee`` runs a recorded action column through
+# ``dagger/step.policy_step`` INSIDE the plain ControlLoop (``replay_actions``). These pin
+# the slot's bookkeeping against the plan semantics it rides: one motion at a time, the
+# same cancel paths, ``plan_status`` executing -> done, ``motion_active`` as the predicate.
+def _replay_traj(frames: int, dx: float, fps: float = 25.0):
+    """An in-memory EpisodeTrajectory whose ``delta_ee`` rows move arm0 +x by ``dx`` per
+    frame (rail +dx too) and hold the gripper at 0.5; arm1 is not in the episode."""
+    from pathlib import Path
+
+    from apollo_mavis_v2_runtime.recorder.features import arm_action_names, arm_state_names
+    from apollo_mavis_v2_runtime.recorder.playback import (
+        ActionColumn,
+        EpisodeTrajectory,
+        parse_action_names,
+        parse_state_names,
+    )
+
+    state_names = arm_state_names("arm0", True)
+    rows = [[0.0] * len(state_names) for _ in range(frames)]
+    names = arm_action_names("arm0", True, "delta_ee")
+    act = np.zeros((frames, len(names)), dtype=np.float32)
+    act[:, 0] = dx
+    act[:, 6] = 0.5
+    act[:, 7] = dx
+    col = ActionColumn(
+        source="delta_ee",
+        column="action",
+        names=names,
+        blocks=parse_action_names(names, "delta_ee"),
+        rows=act,
+        frames_map={"arm0": "arm_base:arm0"},
+    )
+    return EpisodeTrajectory(
+        repo_id="bc/x",
+        episode_id="20260911T000000.000Z-replay",
+        directory=Path("."),
+        fps=fps,
+        rows=rows,
+        columns=parse_state_names(state_names),
+        actions={"delta_ee": col},
+        action_space="delta_ee",
+    )
+
+
+class _PosAnchor:
+    """A position-only ``ActionAnchor`` stand-in: q[:3] += the delta, the rail integrates."""
+
+    action_space = "delta_ee"
+
+    def apply_delta(self, arm_id, dp, dr, rail_d, q_last, q_meas, dt, now):
+        q = np.array(q_last, dtype=np.float64)
+        q[:3] += np.asarray(dp, dtype=np.float64)
+        if q.shape[0] > 7 and rail_d is not None:
+            q[7] = float(np.clip(q[7] + rail_d, 0.0, 0.65))
+        return q
+
+
+def _replay_source(loop, frames=5, dx=0.01, driven=None):
+    from apollo_mavis_v2_runtime.dagger.replay_source import ReplayActionSource
+
+    arms_meta = [(a, loop.workcell.arms[a].dof > 7) for a in loop.session_arms]
+    src = ReplayActionSource(
+        _replay_traj(frames, dx), "delta_ee", arms_meta, clock=lambda: loop._tick_now
+    )
+    if driven is not None:
+        src.driven_arms = lambda: frozenset(driven)  # type: ignore[method-assign]
+    return src
+
+
+def test_replay_actions_refusals(fake_loop):
+    """No source / anchor, an arm outside the session, a faulted arm, a running plan and
+    a running replay are each refused with the plan ops' vocabulary."""
+    cell, bus, loop = fake_loop
+    anchor = _PosAnchor()
+    f = submit(bus, "replay_actions", source=None, anchor=anchor)
+    run_ticks(loop, cell, 1)
+    assert not f.result(0).ok and "source" in f.result(0).detail
+    f = submit(bus, "replay_actions", source=_replay_source(loop, driven={"nope"}), anchor=anchor)
+    t = run_ticks(loop, cell, 1)
+    assert not f.result(0).ok and f.result(0).detail == "unknown arm 'nope'"
+    loop._faulted.add("arm0")
+    f = submit(bus, "replay_actions", source=_replay_source(loop), anchor=anchor)
+    t = run_ticks(loop, cell, 1, t)
+    assert not f.result(0).ok and f.result(0).detail == "arm 'arm0' is faulted"
+    loop._faulted.discard("arm0")
+    # a plan executing: one motion at a time on the loop
+    plan = submit(
+        bus, "execute_plan", waypoints={"arm1": [[0.3] * 7]}, gripper={}, interruptible=False
+    )
+    f = submit(bus, "replay_actions", source=_replay_source(loop), anchor=anchor)
+    t = run_ticks(loop, cell, 1, t)
+    assert plan.result(0).ok and not f.result(0).ok and f.result(0).detail == "plan executing"
+    assert loop.motion_active
+    while loop.plans.active_arms:
+        t = run_ticks(loop, cell, 1, t)
+    # a replay executing refuses a second replay AND every plan op with its own word
+    f1 = submit(bus, "replay_actions", source=_replay_source(loop, frames=50), anchor=anchor)
+    t = run_ticks(loop, cell, 1, t)
+    assert f1.result(0).ok and loop.motion_active and loop._replay is not None
+    f2 = submit(bus, "replay_actions", source=_replay_source(loop), anchor=anchor)
+    f3 = submit(
+        bus, "execute_plan", waypoints={"arm1": [[0.0] * 7]}, gripper={}, interruptible=False
+    )
+    t = run_ticks(loop, cell, 1, t)
+    assert not f2.result(0).ok and f2.result(0).detail == "replay executing"
+    assert not f3.result(0).ok and f3.result(0).detail == "replay executing"
+
+
+def test_replay_actions_drives_the_named_arm_and_finishes_done(fake_loop):
+    """5 rows at 25 fps on a 100 Hz loop = 4 ticks per row; each row's +10 mm is
+    integrated as 2.5 mm per tick, so after the last row has been current for a period
+    arm0 is 50 mm along, arm1 (not in the episode) never moved, and the slot finished the
+    way a plan does: ``plan_status done`` lingering, no cancel reason, ``motion_active``
+    false. Telemetry carried the progress meanwhile."""
+    cell, bus, loop = fake_loop
+    f = submit(
+        bus, "replay_actions", source=_replay_source(loop, frames=5, dx=0.01), anchor=_PosAnchor()
+    )
+    t = run_ticks(loop, cell, 1)
+    res = f.result(0)
+    assert res.ok and res.detail == "replay of 5 delta_ee rows", res
+    assert loop._plan_state == {"arm0": "executing"} and loop._plan_status == "executing"
+    assert loop.motion_active and loop.plans.active_arms == []
+    t = run_ticks(loop, cell, 8, t)
+    snap = bus.snapshot.get()[0]
+    progress = snap.session_extra["replay"]
+    assert progress["frames"] == 5 and progress["source"] == "delta_ee"
+    assert 1 <= progress["frame"] <= 3
+    assert loop._grip_frac["arm0"] == pytest.approx(0.5)  # the row's absolute gripper
+    t = run_ticks(loop, cell, 20, t)  # well past 5 rows x 4 ticks
+    assert loop._replay is None and not loop.motion_active
+    assert loop._plan_status == "done" and loop.plan_cancel_reason is None
+    assert loop._plan_state == {}
+    assert loop._last_cmd["arm0"][0] == pytest.approx(0.05, abs=1e-6)  # float32 rows
+    assert loop._last_cmd["arm0"][7] == pytest.approx(0.05, abs=1e-6)
+    assert np.allclose(loop._last_cmd["arm1"], 0.0)
+    assert bus.snapshot.get()[0].session_extra["replay"] is None
+
+
+def test_a_movement_key_cancels_a_replay(fake_loop):
+    """Always interruptible: the operator's input wins and the arm holds where it is."""
+    cell, bus, loop = fake_loop
+    f = submit(bus, "replay_actions", source=_replay_source(loop, frames=50), anchor=_PosAnchor())
+    t = run_ticks(loop, cell, 6)
+    assert f.result(0).ok and loop._replay is not None
+    moved_to = loop._last_cmd["arm0"].copy()
+    assert moved_to[0] > 0.0
+    bus.held_keys.put(HeldState(held=frozenset({"KeyW"}), seq=1, rx_mono=t))
+    loop.supervisor.watchdog.on_keys(HeldState(frozenset({"KeyW"}), 1, t))
+    t = run_ticks(loop, cell, 1, t)
+    assert loop._replay is None and not loop.motion_active
+    assert loop._plan_status == "cancelled" and loop.plan_cancel_reason == "movement key"
+    assert loop._plan_state == {}
+
+
+def test_cancel_plan_op_and_a_driver_fault_cancel_a_replay(fake_loop):
+    """The manager's ``cancel_plan`` (stop button / teardown) and a driver fault clear the
+    replay through the same paths a plan takes."""
+    cell, bus, loop = fake_loop
+    f = submit(bus, "replay_actions", source=_replay_source(loop, frames=50), anchor=_PosAnchor())
+    t = run_ticks(loop, cell, 3)
+    assert f.result(0).ok
+    c = submit(bus, "cancel_plan", reason="playback stopped by the operator")
+    t = run_ticks(loop, cell, 1, t)
+    assert c.result(0).ok and c.result(0).detail == "cancelled"
+    assert loop._replay is None and loop.plan_cancel_reason == "playback stopped by the operator"
+    # nothing running: the op is idempotent
+    c2 = submit(bus, "cancel_plan", reason="again")
+    t = run_ticks(loop, cell, 1, t)
+    assert c2.result(0).detail == "no plan"
+    # a fault on ANY arm while a replay runs
+    f = submit(bus, "replay_actions", source=_replay_source(loop, frames=50), anchor=_PosAnchor())
+    t = run_ticks(loop, cell, 3, t)
+    assert f.result(0).ok and loop._replay is not None
+    loop._on_fault_event("arm1", type("Ev", (), {"source": "driver", "error_code": 31})(), t)
+    assert loop._replay is None and loop.plan_cancel_reason == "driver fault"
+    loop._faulted.discard("arm1")
+
+
+def test_a_gate_held_replay_is_cancelled_with_the_blocking_pair(tmp_path):
+    """The gate-hold watch covers the replay like a plan: PLANNER-sourced rows the gate
+    holds for ``plan_gate_hold_s`` cancel it with the pair in ``plan_cancel_reason``."""
+    from apollo_mavis_v2_runtime.control.loop import GATE_HOLD_PREFIX
+
+    cell, bus, loop = _railed_loop(tmp_path, 0.0, gate=_UnrelatedPairGate(), hold_s=0.1)
+    f = submit(bus, "replay_actions", source=_replay_source(loop, frames=50), anchor=_PosAnchor())
+    t = run_ticks(loop, cell, 2)
+    assert f.result(0).ok and loop._replay is not None
+    assert loop._plan_gate_hold_since is not None
+    t = run_ticks(loop, cell, 15, t)  # past the 0.1 s hold limit
+    assert loop._replay is None and loop._plan_status == "cancelled"
+    assert loop.plan_cancel_reason is not None
+    assert loop.plan_cancel_reason.startswith(GATE_HOLD_PREFIX)
+    assert "arm0_link4 / arm1_link5" in loop.plan_cancel_reason
+    assert np.allclose(loop._last_cmd["arm0"], 0.0)  # never moved

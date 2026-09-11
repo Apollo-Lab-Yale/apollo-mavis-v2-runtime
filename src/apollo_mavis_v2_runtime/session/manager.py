@@ -280,6 +280,17 @@ PLAYBACK_START_TOL_RAD = math.radians(1.0)
 #: Playback deadline = its own length x this + the grace, so a gate hold has room.
 PLAYBACK_BUDGET_FACTOR = 3.0
 PLAYBACK_BUDGET_GRACE_S = 20.0
+#: An ACTION replay (``delta_ee`` / ``abs_ee``, 2026-09-11) is judged on the TCP, not the
+#: joints: the executor tracks the Cartesian command through IK, and a 7-DOF arm has a null
+#: space, so the measured joints legitimately end a few mrad off the recorded ones while
+#: the tool is exactly where the recording says (the first sim replay: 8.8 mrad joints,
+#: 1.7 mm TCP). "Done" = the measured TCP within these of the last recorded frame's TCP
+#: once the arm has settled (no joint moving more than ``REPLAY_SETTLE_EPS`` over
+#: ``REPLAY_SETTLE_S``); the joint / carriage residual is still reported.
+REPLAY_TCP_TOL_M = 0.005
+REPLAY_TCP_TOL_RAD = 0.02
+REPLAY_SETTLE_S = 0.3
+REPLAY_SETTLE_EPS = 1e-4
 
 
 def _motion_title(label: str, profile) -> str:
@@ -2662,7 +2673,7 @@ class SessionManager:
 
     def _cancel_plan_via_loop(self, reason: str) -> None:
         session = self.session
-        if session is None or not session.loop.plans.active_arms:
+        if session is None or not session.loop.motion_active:
             return
         try:
             self.bus.commands.submit(
@@ -2744,7 +2755,7 @@ class SessionManager:
                     "detail": f"{names} is recovering - release every input (clutch / keys) first",
                 }
             )
-        if session.loop.plans.active_arms or self._profile_motion is not None:
+        if session.loop.motion_active or self._profile_motion is not None:
             return result.model_copy(update={"detail": MOTION_BUSY})
         return None
 
@@ -2923,6 +2934,8 @@ class SessionManager:
             arms=list(traj.initial_state().values()),
             playable=not reason,
             reason=reason,
+            sources=traj.sources,
+            action_space=traj.action_space,
         )
 
     def _episode_initial_profile(self, session: ActiveSession, traj) -> StateProfile:
@@ -3060,21 +3073,37 @@ class SessionManager:
                 )
         return ""
 
-    def episode_playback_play(self, repo_id: str, episode_id: str) -> ReturnHomeResult:
-        """``POST /api/session/playback {action: "play"}``: replay the whole episode.
+    def episode_playback_play(
+        self, repo_id: str, episode_id: str, source: str = "state"
+    ) -> ReturnHomeResult:
+        """``POST /api/session/playback {action: "play", source}``: replay the episode.
 
         SYNCHRONOUS, like ``goto_initial`` and ``return_home``: the dialog awaits it and
-        shows the outcome. What is replayed is the MEASURED joint / rail / gripper
-        trajectory (``observation.state``), resampled onto the loop tick with ONE global
-        time scale so the arms keep their recorded relative timing, verified posture by
-        posture in the twin, then streamed through the gated executor as one
-        ``playback_path`` command. Interruptible throughout - any operator input, a driver
-        fault or a teardown cancels it and the arms hold where they are.
+        shows the outcome. Interruptible throughout - any operator input, a driver fault
+        or a teardown cancels it and the arms hold where they are.
 
-        It deliberately does NOT re-place the arms first: the operator's dialog requires
-        "return to the initial state" to have run, and doing it again silently here would
-        hide a cell that has drifted since. The starting posture is instead CHECKED
-        against frame 0 below, and a mismatch is refused with the distance.
+        ``source: "state"`` (the default; this path is unchanged since 2026-09-10) replays
+        the MEASURED joint / rail / gripper trajectory (``observation.state``), resampled
+        onto the loop tick with ONE global time scale so the arms keep their recorded
+        relative timing, verified posture by posture in the twin, then streamed through
+        the gated executor as one ``playback_path`` command.
+
+        ``source: "delta_ee" | "abs_ee"`` (2026-09-11) replays the recorded ``action`` /
+        ``action.abs_ee`` column through the executor path a policy drives
+        (``dagger/step.policy_step`` over a ``ReplayActionSource`` + ``ActionAnchor``)
+        inside this session's control loop (``replay_actions``). There is no pre-planned
+        joint path, so ``_verify_playback`` does not apply: every row is gated on the tick
+        it is due, and a gate hold longer than ``plan_gate_hold_s`` cancels it with the
+        pair. Admitted in SIM only until the operator says otherwise (hardware answers
+        ``ok: false``), refused when the episode lacks the column (naming the backfill),
+        and refused in dagger / inference sessions (their loop drives its own policy).
+        The outcome names the terminal residual against the last measured frame - the
+        executor-fidelity metric these two sources exist for.
+
+        Neither path re-places the arms first: the operator's dialog requires "return to
+        the initial state" to have run, and doing it again silently here would hide a
+        cell that has drifted since. The starting posture is instead CHECKED against
+        frame 0 below, and a mismatch is refused with the distance.
         """
         from ..recorder.playback import ExecutorCaps, PlaybackError, resample
 
@@ -3088,6 +3117,10 @@ class SessionManager:
         reason = self._playback_refusal(traj)
         if reason:
             return ReturnHomeResult(ok=False, status="refused", detail=reason)
+        if source != "state":
+            reason = self._action_replay_refusal(session, traj, source)
+            if reason:
+                return ReturnHomeResult(ok=False, status="refused", detail=reason)
         profile = self._episode_initial_profile(session, traj)
         blocked = self._reset_blockers(session, profile)
         if blocked is not None:
@@ -3114,22 +3147,27 @@ class SessionManager:
                         "episode's first frame - run 'Return to the initial state' first"
                     ),
                 )
-        try:
-            plan = resample(
-                traj,
-                ExecutorCaps.from_jog(session.loop.cfg.jog),
-                loop_hz=session.loop.cfg.rate_hz,
-                arms=arms,
-                rail_hold=rail_hold,
-            )
-        except PlaybackError as e:
-            return ReturnHomeResult(ok=False, status="refused", detail=str(e))
+        plan = None
+        if source == "state":
+            try:
+                plan = resample(
+                    traj,
+                    ExecutorCaps.from_jog(session.loop.cfg.jog),
+                    loop_hz=session.loop.cfg.rate_hz,
+                    arms=arms,
+                    rail_hold=rail_hold,
+                )
+            except PlaybackError as e:
+                return ReturnHomeResult(ok=False, status="refused", detail=str(e))
         token = self._claim_profile_motion(PLAYBACK_LABEL)
         if token is None:
             return ReturnHomeResult(ok=False, status="refused", detail=MOTION_BUSY)
         try:
             session.motion_detail = ""
-            result = self._playback_motion(session, traj, plan)
+            if source == "state":
+                result = self._playback_motion(session, traj, plan)
+            else:
+                result = self._replay_motion(session, traj, source, arms, rail_hold)
         except Exception as e:  # noqa: BLE001 - a worker bug must not kill the session
             logger.exception("episode playback failed")
             result = ReturnHomeResult(ok=False, status="failed", detail=repr(e))
@@ -3208,6 +3246,234 @@ class SessionManager:
             }
         )
 
+    def _action_replay_refusal(self, session: ActiveSession, traj, source: str) -> str:
+        """Why an ACTION replay (``delta_ee`` / ``abs_ee``) cannot run here; "" = it can.
+        Checked before the shared blockers so the operator reads the specific reason."""
+        from ..recorder.playback import ACTION_COLUMNS, PlaybackError
+
+        if source not in ACTION_COLUMNS:
+            return f"unknown playback source {source!r} (state, delta_ee or abs_ee)"
+        if session.spec.kind == "hardware":
+            # The per-tick gate is the only check an action replay gets - no whole-path
+            # twin verification - and the executor's fidelity is what it MEASURES. Until
+            # the operator has seen it in sim, the real arms do not get it (D7's spirit).
+            return "action replay is admitted in sim only"
+        if session.spec.mode in ("dagger", "inference"):
+            return (
+                "action replay runs in teleop / collect sessions only - this session's loop "
+                "drives its own policy"
+            )
+        try:
+            traj.action_column(source)
+        except PlaybackError as e:
+            return str(e)
+        if session.loop.ik is None or session.loop.kin is None:
+            return "this session has no IK / kinematics to drive Cartesian actions with"
+        return ""
+
+    def _replay_motion(
+        self,
+        session: ActiveSession,
+        traj,
+        source: str,
+        arms: list[str],
+        rail_hold: dict[str, float],
+    ) -> ReturnHomeResult:
+        """Submit ``replay_actions`` and wait; the status vocabulary of :meth:`_execute_arms`.
+
+        Mirrors :meth:`_playback_motion` - the same budget rule, the same cancel path, the
+        same measured-arrival wait against the LAST recorded frame - with two differences:
+        nothing is verified up front (there is no path yet), and the outcome carries the
+        residual against that last frame (max joint / carriage error, and for an episode
+        with an ``action.abs_ee`` column the TCP error against the last COMMANDED pose),
+        because that residual is the point of replaying an action column at all.
+        """
+        from ..dagger.policy_runner import ActionAnchor, SlewLimits, anchor_leash_kwargs
+        from ..dagger.replay_source import ReplayActionSource
+        from ..recorder.playback import PlaybackError
+
+        base = ReturnHomeResult(ok=False, status="failed", detail="", arms=sorted(arms))
+        loop = session.loop
+        states = session.workcell.states()
+        arms_meta = [(a, len(states[a].q) > 7) for a in session.spec.arms if a in states]
+        try:
+            replay = ReplayActionSource(
+                traj, source, arms_meta, clock=loop._clock, rail_hold=rail_hold
+            )
+        except PlaybackError as e:
+            return base.model_copy(update={"status": "refused", "detail": str(e)})
+        anchor = ActionAnchor(
+            loop.ik,
+            loop.kin,
+            SlewLimits(window_s=self.cfg.dagger.slew_window_s),
+            action_space=source,
+            **anchor_leash_kwargs(self.cfg.dagger, self.cfg.control),
+        )
+        ack = self.bus.commands.submit(
+            Command(
+                op="replay_actions",
+                args={"source": replay, "anchor": anchor},
+                source="internal",
+            )
+        ).result(timeout=5.0)
+        if not ack.ok:
+            return base.model_copy(update={"status": "refused", "detail": ack.detail})
+        expected_s = traj.frames / max(1e-6, traj.fps)
+        budget = expected_s * PLAYBACK_BUDGET_FACTOR + PLAYBACK_BUDGET_GRACE_S
+        deadline = time.monotonic() + budget
+        timed_out = False
+        while loop.motion_active:
+            if session.state is not SessionState.RUNNING:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.02)
+        if loop.motion_active:
+            why = f"budget {budget:.0f} s" if timed_out else f"session {session.state.value}"
+            self._cancel_plan_via_loop(f"playback: {why}")
+        if timed_out:
+            return base.model_copy(update={"status": "timeout", "detail": f"budget {budget:.0f} s"})
+        cancel = loop.plan_cancel_reason
+        if cancel:
+            if cancel.startswith(GATE_HOLD_PREFIX):
+                pair = cancel[len(GATE_HOLD_PREFIX) :].lstrip(": ")
+                return base.model_copy(update={"status": "held", "detail": pair})
+            return base.model_copy(update={"status": "cancelled", "detail": cancel})
+        # The rows ran out; now the ARMS have to be where the recording ended. Wait for
+        # each arm to settle (arrival in joint space is not required - see REPLAY_TCP_TOL_M),
+        # then judge the measured TCP against the last recorded frame's TCP. That verdict IS
+        # the fidelity report, so a miss is reported with the distance.
+        goals = self._replay_goals(traj, arms, rail_hold, arms_meta)
+        settle_by = time.monotonic() + max(PLAN_ARRIVAL_GRACE_S, expected_s)
+        for arm_id in arms:
+            status, detail = self._await_settle(
+                session,
+                arm_id,
+                goals[arm_id],
+                running=lambda: session.state is SessionState.RUNNING,
+                deadline=settle_by,
+            )
+            if status == "cancelled":
+                return base.model_copy(
+                    update={"status": status, "detail": f"{arm_label(arm_id)}: {detail}"}
+                )
+        residuals = self._replay_residuals(session, traj, arms, goals)
+        report = "; ".join(text for _, text, _ in residuals)
+        summary = f"replayed {traj.frames} {source} rows in {expected_s:.1f} s; {report}"
+        misses = [arm_label(a) for a, _, ok in residuals if not ok]
+        if misses:
+            return base.model_copy(
+                update={
+                    "status": "stalled",
+                    "detail": f"{' / '.join(misses)} did not reach the last frame - {summary}",
+                }
+            )
+        return base.model_copy(update={"ok": True, "status": "done", "detail": summary})
+
+    def _await_settle(
+        self,
+        session: ActiveSession,
+        arm_id: str,
+        goal,
+        *,
+        running: Callable[[], bool],
+        deadline: float,
+    ) -> tuple[str, str]:
+        """Wait until ``arm_id`` has ARRIVED at ``goal`` (the plan rule) or has SETTLED (no
+        joint / carriage moved more than ``REPLAY_SETTLE_EPS`` over ``REPLAY_SETTLE_S``) -
+        ``("done", "")`` / ``("settled", "")``; ``("cancelled", ...)`` when the session leaves
+        RUNNING or the arm faults; ``("stalled", "")`` at ``deadline``. Never commands."""
+        last_q = None
+        still_since = None
+        while True:
+            try:
+                q = np.asarray(session.workcell.states()[arm_id].q, dtype=np.float64)
+            except Exception:  # noqa: BLE001 - a read hiccup is not a settle
+                q = None
+            now = time.monotonic()
+            if q is not None:
+                if self._arrived(q, goal):
+                    return "done", ""
+                if last_q is not None and np.max(np.abs(q - last_q)) <= REPLAY_SETTLE_EPS:
+                    if still_since is None:
+                        still_since = now
+                    elif now - still_since >= REPLAY_SETTLE_S:
+                        return "settled", ""
+                else:
+                    still_since = None
+                last_q = q
+            if not running():
+                return "cancelled", f"session {session.state.value}"
+            if arm_id in session.loop.faulted_arms:
+                return "cancelled", "driver fault"
+            if now >= deadline:
+                return "stalled", ""
+            time.sleep(PLAN_ARRIVAL_POLL_S)
+
+    @staticmethod
+    def _replay_goals(traj, arms, rail_hold, arms_meta) -> dict[str, list[float]]:
+        """Per arm, the LAST ``observation.state`` row as a full q (rail slot from the
+        recording, else the held carriage position, only for a railed session arm)."""
+        last = traj.state_at(traj.frames - 1)
+        railed = dict(arms_meta)
+        goals: dict[str, list[float]] = {}
+        for arm_id in arms:
+            st = last[arm_id]
+            goal = [float(v) for v in st.q]
+            if railed.get(arm_id):
+                rail = st.rail_pos_m if st.rail_pos_m is not None else rail_hold.get(arm_id)
+                if rail is not None:
+                    goal.append(float(rail))
+            goals[arm_id] = goal
+        return goals
+
+    def _replay_residuals(
+        self, session: ActiveSession, traj, arms, goals
+    ) -> list[tuple[str, str, bool]]:
+        """Per arm ``(arm_id, text, within_tolerance)``: the max joint error (mrad), the
+        carriage error (mm), the measured TCP against the last recorded frame's TCP (mm /
+        mrad; the verdict, ``REPLAY_TCP_TOL_M`` / ``_RAD``) and, when the episode carries
+        ``action.abs_ee``, against the last COMMANDED pose - the executor-fidelity metric.
+        A recording without TCP dims falls back to the joint verdict."""
+        from apollo_mavis_v2_core import Pose, se3
+
+        try:
+            states = session.workcell.states()
+        except Exception:  # noqa: BLE001 - a read hiccup only costs the report
+            return [(a, f"{arm_label(a)}: no state read-back", False) for a in arms]
+        abs_col = traj.actions.get("abs_ee")
+        out: list[tuple[str, str, bool]] = []
+        for arm_id in arms:
+            st = states.get(arm_id)
+            if st is None:
+                out.append((arm_id, f"{arm_label(arm_id)}: no state", False))
+                continue
+            joints, rail = self._arrival_error(st.q, goals[arm_id])
+            ok = self._arrived(st.q, goals[arm_id])
+            text = f"{arm_label(arm_id)} joints {joints * 1e3:.1f} mrad"
+            if rail is not None:
+                text += f", carriage {rail * 1e3:.1f} mm"
+            recorded = traj.tcp_at(traj.frames - 1, arm_id)
+            if recorded is not None:
+                dp, dr = se3.pose_error(recorded, st.ee_pose)
+                ok = dp <= REPLAY_TCP_TOL_M and dr <= REPLAY_TCP_TOL_RAD
+                text += f", TCP {dp * 1e3:.1f} mm / {dr * 1e3:.0f} mrad off the last frame"
+            block = abs_col.block(arm_id) if abs_col is not None else None
+            if block is not None:
+                row = abs_col.rows[traj.frames - 1, block.start : block.stop]
+                try:
+                    want = Pose(
+                        np.asarray(row[:3], dtype=np.float64),
+                        se3.rot6d_to_quat(np.asarray(row[3:9], dtype=np.float64)),
+                    )
+                    dp, dr = se3.pose_error(want, st.ee_pose)
+                    text += f" and {dp * 1e3:.1f} mm / {dr * 1e3:.0f} mrad off the last command"
+                except Exception:  # noqa: BLE001 - a malformed row only costs the report
+                    text += ", command residual unavailable"
+            out.append((arm_id, text, ok))
+        return out
+
     def episode_playback_stop(self) -> ReturnHomeResult:
         """``POST /api/session/playback {action: "stop"}``: cancel a replay in flight.
 
@@ -3218,7 +3484,7 @@ class SessionManager:
         session = self.session
         if session is None:
             return ReturnHomeResult(ok=False, status="refused", detail="no active session")
-        if not session.loop.plans.active_arms:
+        if not session.loop.motion_active:
             return ReturnHomeResult(ok=True, status="skipped", detail="nothing is playing")
         self._cancel_plan_via_loop("playback stopped by the operator")
         return ReturnHomeResult(ok=True, status="done", detail="playback stopped; the arms hold")
@@ -3373,7 +3639,12 @@ class SessionManager:
             InferenceSession,
             make_obs_fn,
         )
-        from ..dagger.policy_runner import ActionAnchor, PolicyRunner, SlewLimits
+        from ..dagger.policy_runner import (
+            ActionAnchor,
+            PolicyRunner,
+            SlewLimits,
+            anchor_leash_kwargs,
+        )
         from ..dagger.registry import resolve_policy
         from ..dagger.trainer.checkpoints import STATE_DICT, CheckpointStore, sha256_file
         from ..recorder.features import arm_action_names, arm_state_names
@@ -3388,7 +3659,13 @@ class SessionManager:
             )
         resolved = resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)
         info = resolved.info
-        if info.action_space != "delta_ee" or any(f != info.action_frame for f in frames.values()):
+        # 2026-09-11: the executor drives ``delta_ee`` AND ``abs_ee`` (dagger/step.py); the
+        # space refusal has its own text, the FRAME refusal keeps the one the UI knows
+        if info.action_space not in ("delta_ee", "abs_ee"):
+            raise SessionError(
+                f"unsupported policy action_space {info.action_space!r} (delta_ee or abs_ee)"
+            )
+        if any(f != info.action_frame for f in frames.values()):
             raise SessionError("policy/dataset frame mismatch")
         from ..dagger.policies import MLPPolicy, resolve_device
 
@@ -3409,7 +3686,11 @@ class SessionManager:
             policy_lock=policy_lock,
         )
         anchor = ActionAnchor(
-            ik, kin, SlewLimits(window_s=dcfg.slew_window_s), action_space=info.action_space
+            ik,
+            kin,
+            SlewLimits(window_s=dcfg.slew_window_s),
+            action_space=info.action_space,
+            **anchor_leash_kwargs(dcfg, self.cfg.control),
         )
         common = dict(
             ik=ik,
@@ -3476,7 +3757,7 @@ class SessionManager:
             dagger_ctx={"run_id": run_id, "gate": gate},
         )
         state_dim = sum(len(arm_state_names(a, r)) for a, r in arms_meta)
-        action_dim = sum(len(arm_action_names(a, r, "delta_ee")) for a, r in arms_meta)
+        action_dim = sum(len(arm_action_names(a, r, info.action_space)) for a, r in arms_meta)
         tcfg = TrainerConfig(
             run_id=run_id,
             checkpoints_root=str(self.cfg.checkpoints_root),
@@ -3570,24 +3851,44 @@ class SessionManager:
             GatedPolicyExecutor,
             InferenceSession,
         )
-        from ..dagger.policy_runner import ActionAnchor, SlewLimits
-        from ..dora_bridge.policy_source import ExternalPolicySource, spec_from_announce
-        from ..recorder.features import arm_action_names, arm_state_names
+        from ..dagger.policy_runner import ActionAnchor, SlewLimits, anchor_leash_kwargs
+        from ..dora_bridge.policy_source import (
+            DrivenArmsError,
+            ExternalPolicySource,
+            resolve_driven_arms,
+            spec_from_announce,
+        )
+        from ..recorder.features import arm_state_names
 
         dora, hub, ann = self._external_hub_or_409()
         pspec = spec_from_announce(ann)
-        if pspec.action_space != "delta_ee" or any(
-            f != pspec.action_frame for f in frames.values()
-        ):
-            raise SessionError("policy/dataset frame mismatch")
         arms_meta = [(a, bool(scene.meta.rail[a])) for a in spec.arms]
-        action_names = [n for a, r in arms_meta for n in arm_action_names(a, r, "delta_ee")]
-        state_names = [n for a, r in arms_meta for n in arm_state_names(a, r)]
-        if list(pspec.action_names) != action_names:
+        # v1.3 (14-dora §6.1): the policy drives the arms its spec names (or every arm whose
+        # whole block its action_names cover); every other session arm holds. The frame
+        # check is per DRIVEN arm - a per-arm policy may record each arm in its own base
+        # frame (``action_frames``), as the cell's datasets do
+        if pspec.action_space not in ("delta_ee", "abs_ee"):
             raise SessionError(
-                f"external policy action_names {list(pspec.action_names)} != session layout "
-                f"{action_names}"
+                f"unsupported external policy action_space {pspec.action_space!r} "
+                "(delta_ee or abs_ee)"
             )
+        try:
+            driven = resolve_driven_arms(
+                ann.spec.arms, pspec.action_names, arms_meta, pspec.action_space
+            )
+        except DrivenArmsError as e:
+            raise SessionError(str(e)) from e
+        for a in driven:
+            want = ann.spec.action_frames.get(a, pspec.action_frame)
+            if frames[a] != want:
+                logger.warning(
+                    "external policy frame for arm %s is %r, the session records %r",
+                    a,
+                    want,
+                    frames[a],
+                )
+                raise SessionError("policy/dataset frame mismatch")
+        state_names = [n for a, r in arms_meta for n in arm_state_names(a, r)]
         if not set(pspec.state_names) <= set(state_names):
             raise SessionError(
                 "external policy state_names are not a subset of the session state layout: "
@@ -3604,10 +3905,22 @@ class SessionManager:
             rate_hz=float(ann.rate_hz) if ann.rate_hz else dcfg.policy_rate_hz,
             chunk_dt_s=ann.chunk_dt_s,
             cfg=self.cfg.dora.policy,
+            driven_arms=driven,
         )
+        if len(driven) < len(arms_meta):
+            logger.info(
+                "external policy %s drives %s; %s hold",
+                ann.policy_id,
+                driven,
+                [a for a, _ in arms_meta if a not in driven],
+            )
         gate = TakeoverGateImpl(list(spec.arms), dcfg.t_blend_s)
         anchor = ActionAnchor(
-            ik, kin, SlewLimits(window_s=dcfg.slew_window_s), action_space="delta_ee"
+            ik,
+            kin,
+            SlewLimits(window_s=dcfg.slew_window_s),
+            action_space=pspec.action_space,
+            **anchor_leash_kwargs(dcfg, self.cfg.control),
         )
         common = dict(
             ik=ik,
@@ -4032,6 +4345,91 @@ class SessionManager:
             path="session",
             ok=bool(res.ok),
             detail=detail,
+        )
+
+    def session_set_collision_sensitivity(
+        self, arm_id: str, level: int, timeout_s: float = RECOVERY_WAIT_S
+    ) -> ArmMaintenanceResult:
+        """Session path of ``set_collision_sensitivity`` (2026-09-11; 04-runtime
+        §13.1): inside a hardware session the ONE write goes to the SESSION driver's
+        monitor thread (``workcell.request_set_collision_sensitivity(arm_id, level)``,
+        the sibling of ``request_recovery``: never an SDK call on this thread) and
+        the outcome is awaited <= ``timeout_s`` via ``workcell.setting_result`` (a
+        ``SettingResult`` with a higher ``seq``). No motion: the SDK call runs
+        ``wait_move()`` (immediate in servo mode 1), ``set_collis_sens`` and an
+        idempotent ``set_state(0)``; the driver's phase / budget / streamer are
+        untouched. ``ok`` = the SDK accepted the write (code 0, or a 1 / 2 / 9
+        status echo while a fault is latched - reported in ``warnings``); the
+        ``real`` report stream carries no sensitivity read-back, so ``before`` /
+        ``after`` are ``None``, the result's ``collision_sensitivity`` echoes the
+        level written and the read-only monitor verifies the value once it holds
+        the box again. On success the level is recorded in the hardware monitor's
+        requested map so telemetry shows it for the rest of the session; the
+        next driver connect re-applies the config value. 409
+        (:class:`MaintenanceUnavailableError`): no hardware session, an arm
+        outside the session, a workcell without the channel, the driver's
+        ``CommandError`` (not connected / read-only / level refused)."""
+        session = self.session
+        if session is None or session.spec.kind != "hardware":
+            raise MaintenanceUnavailableError("no hardware session")
+        if arm_id not in session.spec.arms:
+            raise MaintenanceUnavailableError(f"arm {arm_id!r} is not part of the session")
+        workcell = session.workcell
+        request = getattr(workcell, "request_set_collision_sensitivity", None)
+        result_of = getattr(workcell, "setting_result", None)
+        if request is None or result_of is None:
+            raise MaintenanceUnavailableError(
+                "the session workcell has no collision-sensitivity channel"
+            )
+        previous = result_of(arm_id)
+        seq0 = int(getattr(previous, "seq", 0) or 0) if previous is not None else -1
+        try:
+            request(arm_id, int(level))
+        except KeyError:
+            raise MaintenanceUnavailableError(f"unknown arm {arm_id!r}") from None
+        except Exception as e:  # noqa: BLE001 - CommandError: driver not connected / refused
+            raise MaintenanceUnavailableError(f"{arm_id}: {e}") from e
+        deadline = time.monotonic() + float(timeout_s)
+        res = None
+        while time.monotonic() < deadline:
+            res = result_of(arm_id)
+            if res is not None and int(getattr(res, "seq", 0) or 0) > seq0:
+                break
+            time.sleep(RECOVERY_POLL_S)
+        else:
+            return ArmMaintenanceResult(
+                arm_id=arm_id,
+                op="set_collision_sensitivity",
+                path="session",
+                ok=False,
+                detail=(
+                    "set_collision_sensitivity: no result from the session driver within "
+                    f"{float(timeout_s):g} s"
+                ),
+            )
+        ok = bool(res.ok)
+        code = int(getattr(res, "code", 0) or 0)
+        note = str(getattr(res, "detail", "") or "")
+        detail = note or (
+            f"collision sensitivity set to {level} on the session driver (verified by the "
+            "monitor after the session)"
+        )
+        if ok and self.hardware_monitor is not None:
+            try:
+                self.hardware_monitor.note_requested_sensitivity(arm_id, int(level))
+            except (KeyError, ValueError):  # an arm the monitor does not know: nothing to show
+                logger.warning("requested sensitivity of %r not recorded", arm_id, exc_info=True)
+        return ArmMaintenanceResult(
+            arm_id=arm_id,
+            op="set_collision_sensitivity",
+            path="session",
+            ok=ok,
+            detail=detail,
+            sdk_codes={"set_collision_sensitivity": code},
+            warnings=[note] if ok and code != 0 and note else [],
+            collision_sensitivity=int(level) if ok else None,
+            before=None,
+            after=None,
         )
 
     # -- teardown -------------------------------------------------------------------

@@ -14,9 +14,9 @@ addition below is additive.
 | your node id (dynamic placeholder) | `policy` (`Node("policy", daemon_port=<GET /api/dora daemon_port>)`) |
 | the runtime's node id | `mavis_runtime` |
 | dataflow name | `mavis_v2` |
-| inputs your node receives | `obs_state`, `session`, `policy_reset`, `events`, `cam_<camera_id>`, `cam_<camera_id>_depth` |
-| outputs your node may send | `action`, `spec`, `status`, **`trainer_status`** (`POLICY_OUTPUTS`, in this order) |
-| runtime inputs (its side of the same wires) | `tick`, `probe_heartbeat`, `policy_action`, `policy_spec`, `policy_status`, **`policy_trainer_status`** (dora source `policy/trainer_status`, `queue_size: 8`) |
+| inputs your node receives | `obs_state`, `session`, `policy_reset`, `events`, `cam_<camera_id>`, `cam_<camera_id>_depth`, `mic_<mic_id>` (the Perception Arm's microphone, since v1.3 / 2026-09-11) |
+| outputs your node may send | `action`, `spec`, `status`, **`trainer_status`** (`POLICY_OUTPUTS`, in this order) + one `action_<arm_id>` per configured arm (v1.3: that arm's block in the announced `spec.action_space` - `delta_ee` 8 / 7 dims or `abs_ee` 11 / 10, prefix `ARM_ACTION_OUTPUT_PREFIX = "action_"`) |
+| runtime inputs (its side of the same wires) | `tick`, `probe_heartbeat`, `policy_action`, `policy_spec`, `policy_status`, **`policy_trainer_status`** (dora source `policy/trainer_status`, `queue_size: 8`) + one `policy_action_<arm_id>` per configured arm (v1.3; prefix `IN_POLICY_ARM_ACTION_PREFIX = "policy_action_"`, `queue_size: 1, drop_oldest` like `policy_action`) |
 | metadata on every message your node sends | `mavis_schema` (1), `session_id` (echo of the current announce; `""` before one), `client` (your process id string), `seq` (ONE monotonic counter per client over every output), `t_mono`, `wallclock_ns`, `epoch` when known |
 | metadata values | `bool` / `int` / `float` / `str` / `list[int\|float\|str]` only |
 | JSON payloads | one `Utf8[1]` Arrow scalar holding the JSON object |
@@ -32,7 +32,19 @@ addition below is additive.
 Fields in order: `mavis_schema, policy_id, policy_version, node_version, spec, rate_hz,
 chunk_len, chunk_dt_s, loader, device, supports_reload, health, detail, uptime_s,
 acts_total, last_compute_ms, extrinsics_sha, capabilities`. `spec` is
-`{action_space, action_frame, action_names, state_names, camera_keys, version}`.
+`{action_space, action_frame, action_names, state_names, camera_keys, version, arms,
+action_frames}` — `arms` (v1.3, 2026-09-11) lists the arms this policy DRIVES (`[]` = every
+session arm, the whole-cell `action`; non-empty = `action_names` is exactly those arms'
+blocks in session order, actions go out per arm on `action_<arm_id>`, and every other session
+arm HOLDS - a Manipulation-Arm-only policy leaves the Perception Arm parked), `action_frames`
+gives a per-arm frame where the arms record in different frames (an arm absent there uses
+`action_frame`; the runtime checks frames for the driven arms only). `action_space` may be
+`delta_ee` (the recorded column: `[ee.dx, ee.dy, ee.dz, ee.drx, ee.dry, ee.drz, gripper.pos,
+rail.dpos]` per arm, 8 / 7 dims) or `abs_ee` (the COMMANDED TCP in the arm's recording frame:
+`[ee.x, ee.y, ee.z, ee.r00, ee.r10, ee.r20, ee.r01, ee.r11, ee.r21, gripper.pos, rail.pos]`,
+11 / 10 dims - metres, the first two COLUMNS of the rotation matrix column-major, the absolute
+gripper open fraction and carriage position); the session's announce stays `delta_ee` and the
+runtime accepts either, sizing each per-arm block by the announced space's names.
 `policy_version` == `spec.version`; **bump it in `swap_weights()`** - the runtime's acting
 version follows the ANNOUNCED version (this heartbeat or an action's `policy_version`
 metadata), never your `trainer_status.policy_version` claim; a change shows as "swapped".

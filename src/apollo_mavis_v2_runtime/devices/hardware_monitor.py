@@ -66,6 +66,25 @@ sweep-clear gets a planned pre-positioning motion run by a ``RailHomingJob``
 registry is attached as :attr:`HardwareStateMonitor.jobs` (``busy(arm_id)`` /
 ``progress(arm_id)``): ``maintenance_busy`` is true for the job's whole life and
 ``ArmMonitorTelemetry.maintenance`` carries its ``MaintenanceProgress``.
+
+**``set_collision_sensitivity`` (2026-09-11, operator decision; 04-runtime §13.1).**
+ONE write, ``set_collision_sensitivity(level)`` with ``level`` 1..3 (anything else is
+``ValueError`` -> 422 here, before the arm monitor sees it), no motion; on THIS path
+the arm monitor's poll thread writes, waits for the rich frame and judges by the
+READ-BACK (the SDK returns the raw uxbus code: a 1 / 2 / 9 status echo while a fault
+is latched is not a failure). The op is also allowed INSIDE a hardware session
+(``SessionManager.session_set_collision_sensitivity`` -> the session driver's
+monitor thread), unlike ``apply_backstops``. The controller default stays the
+config value, re-applied at EVERY driver connect by ``apply_backstops``, so the
+runtime remembers the operator's REQUESTED level per arm (:meth:`note_requested_sensitivity`,
+set by both paths on success) until the next connect: :meth:`_apply_paused` (a
+hardware session or a rail-homing job connects a driver) and a successful
+``apply_backstops`` forget it. :func:`backstops_match` then judges the sensitivity
+read-back against the requested level instead of the config, and while the monitor
+is paused (no fresh sample) the arm's ``ArmMonitorTelemetry.collision_sensitivity``
+publishes the requested level so the Cockpit's control shows what the operator
+wrote — the UI never shows an optimistic value, the monitor's read-back replaces it
+the moment the box is polled again.
 """
 
 from __future__ import annotations
@@ -103,7 +122,16 @@ MAINTENANCE_TIMEOUT_S = 10.0
 # the caller (REST) waits this long (hardware HOME_RAIL_TIMEOUT_S, D3).
 HOME_RAIL_TIMEOUT_S = 45.0
 MONITOR_JOIN_TIMEOUT_S = 15.0  # hand-over: wait this long for a poll thread inside the SDK
-MAINTENANCE_OPS: tuple[str, ...] = ("clear_errors", "apply_backstops", "recover", "home_rail")
+MAINTENANCE_OPS: tuple[str, ...] = (
+    "clear_errors",
+    "apply_backstops",
+    "recover",
+    "home_rail",
+    "set_collision_sensitivity",  # 2026-09-11: one write, level 1..3, both paths
+)
+COLLISION_SENSITIVITY_LEVELS: frozenset[int] = frozenset({1, 2, 3})
+# the operator's admissible range (hardware ``backstops.COLLISION_SENSITIVITY_LEVELS``):
+# 0 turns detection off, 4 / 5 false-trigger under payload
 CONNECTED_STATUSES: frozenset[str] = frozenset({"running", "stale"})  # a maintenance op may run
 
 
@@ -131,6 +159,7 @@ class ArmMonitorLike(Protocol):
         *,
         expected_q: Any = None,  # home_rail: the 7 joints the sweep assumed (phase-09c)
         q_tol_rad: float = 0.02,
+        level: int | None = None,  # set_collision_sensitivity: the level 1..3 (2026-09-11)
     ) -> Any: ...  # MaintenanceOutcome (phase-09b)
 
     @property
@@ -211,18 +240,25 @@ def default_driver_cfg_factory() -> DriverConfigFactory:
     return _driver_cfg
 
 
-def backstops_match(sample: Any, arm: ArmConfig) -> bool | None:
+def backstops_match(
+    sample: Any, arm: ArmConfig, expected_sensitivity: int | None = None
+) -> bool | None:
     """Controller read-back == ``ArmConfig`` backstops (contract tolerances):
     sensitivity equal, ``|d tcp_load| <= 0.05 kg`` and every centre-of-gravity
     component within 10 mm. ``None`` when the sample carries no read-back yet
-    (older sample shape, or the monitor never read the rich report frame)."""
+    (older sample shape, or the monitor never read the rich report frame).
+    ``expected_sensitivity`` (2026-09-11) replaces the config value as the
+    sensitivity to expect: the level the operator wrote with
+    ``set_collision_sensitivity`` (the runtime's per-arm requested level), so
+    an obeyed override does not read as "differs from config"."""
     if sample is None:
         return None
     sens = getattr(sample, "collision_sensitivity", None)
     kg = getattr(sample, "tcp_load_kg", None)
     if sens is None or kg is None:
         return None
-    if int(sens) != int(arm.collision_sensitivity):
+    expected = arm.collision_sensitivity if expected_sensitivity is None else expected_sensitivity
+    if int(sens) != int(expected):
         return False
     eps = 1e-9  # the tolerances are inclusive; keep 0.95 + 0.05 vs 1.0 from flipping on rounding
     if abs(float(kg) - float(arm.tcp_load_kg)) > TCP_LOAD_MATCH_KG + eps:
@@ -337,6 +373,11 @@ class HardwareStateMonitor:
         self._maintenance_locks: dict[str, threading.Lock] = {
             arm_id: threading.Lock() for arm_id in self.arm_ids
         }
+        # 2026-09-11: the collision sensitivity the operator WROTE per arm
+        # (set_collision_sensitivity on either path), remembered until the next driver
+        # connect re-applies the config value (_apply_paused(True)) or apply_backstops
+        # rewrites it. Guarded by _lock; read by arm_telemetry() / the ws telemetry.
+        self._requested_sensitivity: dict[str, int] = {}
         self._disabled_detail = ""  # why the monitor is inert ("" = it is not)
         self._paused = False
         self._lock = threading.Lock()
@@ -488,6 +529,15 @@ class HardwareStateMonitor:
                     return
                 self._paused = flag
                 self.transitions += 0 if initial else 1
+                if flag and self._requested_sensitivity:
+                    # A hand-over means a driver connects and apply_backstops rewrites
+                    # the CONFIG sensitivity: the operator's override is gone with it.
+                    logger.info(
+                        "hardware monitor paused: forgetting the requested collision "
+                        "sensitivity %s (the driver connect re-applies the config value)",
+                        dict(self._requested_sensitivity),
+                    )
+                    self._requested_sensitivity.clear()
             for mon in self._monitors.values():
                 try:
                     if flag:
@@ -554,24 +604,64 @@ class HardwareStateMonitor:
         """Live / lingering progress of the phase-09d job on this arm (``None`` = none)."""
         return self.jobs.progress(arm_id) if self.jobs is not None else None
 
+    # -- the operator's collision-sensitivity override (2026-09-11) ----------------------
+    def requested_sensitivity(self, arm_id: str) -> int | None:
+        """The level the operator wrote with ``set_collision_sensitivity`` on this arm
+        since the last driver connect (either path); ``None`` = the config value /
+        unknown. Fills ``ArmTelemetry.collision_sensitivity`` in a hardware session."""
+        with self._lock:
+            return self._requested_sensitivity.get(arm_id)
+
+    def note_requested_sensitivity(self, arm_id: str, level: int) -> None:
+        """Record a SUCCESSFUL ``set_collision_sensitivity`` write (monitor or session
+        path). Unknown arm -> ``KeyError``; a level outside 1..3 -> ``ValueError``."""
+        if arm_id not in self._arm_cfgs:
+            raise KeyError(arm_id)
+        if (
+            isinstance(level, bool)
+            or int(level) != level
+            or int(level) not in COLLISION_SENSITIVITY_LEVELS
+        ):
+            raise ValueError(f"collision sensitivity must be 1, 2 or 3 (got {level!r})")
+        with self._lock:
+            self._requested_sensitivity[arm_id] = int(level)
+
+    def forget_requested_sensitivity(self, arm_id: str) -> None:
+        """The config value is back on the controller (``apply_backstops`` ran)."""
+        with self._lock:
+            self._requested_sensitivity.pop(arm_id, None)
+
     def arm_telemetry(self) -> list[ArmMonitorTelemetry]:
+        paused = self.paused
         rows: list[ArmMonitorTelemetry] = []
         for arm_id in self.arm_ids:
             mon = self._monitors.get(arm_id)
             status, detail = self.status_of(arm_id)
             sample = mon.snapshot() if mon is not None else None
-            rows.append(
-                sample_to_telemetry(
-                    arm_id,
-                    status,
-                    detail,
-                    mon.age_s if mon is not None else None,
-                    sample,
-                    backstops_match=backstops_match(sample, self._arm_cfgs[arm_id]),
-                    maintenance_busy=self.maintenance_busy(arm_id),
-                    maintenance=self.job_progress(arm_id),
-                )
+            requested = self.requested_sensitivity(arm_id)
+            expected = requested
+            if requested is not None and paused:
+                # In a hardware session the box is the driver's: no read-back reaches this
+                # sample, so its sensitivity is the PRE-session value. The operator's write
+                # (session path) is what the controller holds now: publish it as the row's
+                # collision_sensitivity and judge the payload only (the sensitivity term
+                # compares the stale read-back with itself).
+                expected = getattr(sample, "collision_sensitivity", None)
+            row = sample_to_telemetry(
+                arm_id,
+                status,
+                detail,
+                mon.age_s if mon is not None else None,
+                sample,
+                backstops_match=backstops_match(
+                    sample, self._arm_cfgs[arm_id], expected_sensitivity=expected
+                ),
+                maintenance_busy=self.maintenance_busy(arm_id),
+                maintenance=self.job_progress(arm_id),
             )
+            if requested is not None and paused and row.collision_sensitivity != requested:
+                row = row.model_copy(update={"collision_sensitivity": requested})
+            rows.append(row)
         return rows
 
     def telemetry(self) -> HardwareMonitorTelemetry:
@@ -589,6 +679,7 @@ class HardwareStateMonitor:
         timeout_s: float = MAINTENANCE_TIMEOUT_S,
         *,
         dry_run: bool = False,
+        collision_sensitivity: int | None = None,
     ) -> ArmMaintenanceResult:
         """Run one operator-triggered maintenance op on ``arm_id``'s READ-ONLY
         monitor (``path="monitor"``) and wait for its outcome (<= ``timeout_s``).
@@ -613,9 +704,32 @@ class HardwareStateMonitor:
         -> ``ValueError`` (422 is FastAPI's job upstream). The result's
         ``before`` / ``after`` rows carry :func:`backstops_match` against the
         config; 200 whether or not ``ok``.
+
+        ``set_collision_sensitivity`` (2026-09-11): ``collision_sensitivity`` is
+        the level to write, 1..3 only (else ``ValueError`` -> 422, nothing
+        queued); the arm monitor writes it once, waits for the rich frame and
+        is ``ok`` iff the read-back equals it (module docstring). On success
+        the level is remembered as this arm's requested sensitivity
+        (:meth:`note_requested_sensitivity`) and the result's
+        ``collision_sensitivity`` carries the read-back; a successful
+        ``apply_backstops`` forgets it (the config value is back).
         """
         if op not in MAINTENANCE_OPS:
             raise ValueError(f"unknown maintenance op {op!r}; expected one of {MAINTENANCE_OPS}")
+        level: int | None = None
+        if op == "set_collision_sensitivity":
+            if (
+                collision_sensitivity is None
+                or isinstance(collision_sensitivity, bool)
+                or int(collision_sensitivity) != collision_sensitivity
+                or int(collision_sensitivity) not in COLLISION_SENSITIVITY_LEVELS
+            ):
+                raise ValueError(
+                    "set_collision_sensitivity needs collision_sensitivity 1, 2 or 3 "
+                    f"(got {collision_sensitivity!r}; 0 turns detection off, 4 / 5 "
+                    "false-trigger under payload)"
+                )
+            level = int(collision_sensitivity)
         arm = self._arm_cfgs.get(arm_id)
         if arm is None:
             raise KeyError(arm_id)
@@ -642,10 +756,19 @@ class HardwareStateMonitor:
                     f"a maintenance op is already running on {arm_id!r}"
                 )
             driver_cfg = self._driver_cfg(arm)
-            outcome = mon.maintenance(op, driver_cfg, timeout_s=float(timeout_s))
+            if op == "set_collision_sensitivity":
+                outcome = mon.maintenance(op, driver_cfg, timeout_s=float(timeout_s), level=level)
+            else:
+                outcome = mon.maintenance(op, driver_cfg, timeout_s=float(timeout_s))
         finally:
             lock.release()
-        return self._result(arm, mon, op, outcome)
+        result = self._result(arm, mon, op, outcome, level=level)
+        if result.ok:
+            if op == "set_collision_sensitivity" and level is not None:
+                self.note_requested_sensitivity(arm_id, level)
+            elif op == "apply_backstops":
+                self.forget_requested_sensitivity(arm_id)  # the config value is back
+        return result
 
     def home_rail_preflight(self, arm_id: str) -> HomeRailPreflight:
         """``home_rail`` refusals + the twin sweep, ZERO writes (phase-09c/09d).
@@ -792,11 +915,27 @@ class HardwareStateMonitor:
         op: str,
         outcome: Any,
         rail_sweep: Any = None,
+        level: int | None = None,
     ) -> ArmMaintenanceResult:
-        """Hardware ``MaintenanceOutcome`` -> core ``ArmMaintenanceResult`` (monitor path)."""
-        status, detail = self.status_of(arm.id)
+        """Hardware ``MaintenanceOutcome`` -> core ``ArmMaintenanceResult`` (monitor path).
 
-        def row(sample: Any) -> ArmMonitorTelemetry | None:
+        ``level`` (``set_collision_sensitivity`` only) fills the result's
+        ``collision_sensitivity`` with the after-sample's READ-BACK (equal to
+        ``level`` when ``ok``), or with ``level`` itself when the op succeeded
+        without an after-sample; ``None`` for every other op and a refusal."""
+        status, detail = self.status_of(arm.id)
+        # backstops_match on the rows: before = against the level in force so far (the
+        # operator's earlier override, else the config); after = against the level this
+        # op leaves on the box (the written level; the config again after apply_backstops).
+        requested = self.requested_sensitivity(arm.id)
+        if op == "set_collision_sensitivity":
+            after_expected = level
+        elif op == "apply_backstops":
+            after_expected = None
+        else:
+            after_expected = requested
+
+        def row(sample: Any, expected: int | None) -> ArmMonitorTelemetry | None:
             if sample is None:
                 return None
             age = max(0.0, self._clock() - float(getattr(sample, "t_mono", self._clock())))
@@ -806,10 +945,18 @@ class HardwareStateMonitor:
                 detail,
                 age,
                 sample,
-                backstops_match=backstops_match(sample, arm),
+                backstops_match=backstops_match(sample, arm, expected_sensitivity=expected),
                 maintenance_busy=False,
             )
 
+        after_sample = getattr(outcome, "after", None)
+        written: int | None = None
+        if op == "set_collision_sensitivity" and level is not None:
+            readback = getattr(after_sample, "collision_sensitivity", None)
+            if readback is not None:
+                written = int(readback)
+            elif bool(outcome.ok):
+                written = level
         return ArmMaintenanceResult(
             arm_id=arm.id,
             op=str(getattr(outcome, "op", op)),  # type: ignore[arg-type]
@@ -818,14 +965,16 @@ class HardwareStateMonitor:
             detail=str(getattr(outcome, "detail", "") or ""),
             sdk_codes={str(k): int(v) for k, v in dict(getattr(outcome, "sdk_codes", {})).items()},
             warnings=[str(w) for w in (getattr(outcome, "warnings", ()) or ())],
-            before=row(getattr(outcome, "before", None)),
-            after=row(getattr(outcome, "after", None)),
+            before=row(getattr(outcome, "before", None), requested),
+            after=row(after_sample, after_expected),
             rail_sweep=rail_sweep,
+            collision_sensitivity=written,
         )
 
 
 __all__ = [
     "ArmMonitorLike",
+    "COLLISION_SENSITIVITY_LEVELS",
     "CONNECTED_STATUSES",
     "DriverConfigFactory",
     "HOME_RAIL_TIMEOUT_S",

@@ -32,8 +32,16 @@ class PolicySource(Protocol):
         current (for chunked sources: the time the current row became active)."""
         ...
 
-    def staleness_scale(self, now: float) -> float:
-        """1.0 fresh; linear decay to 0 over 5 periods past ``period + 0.05 s``."""
+    def staleness_scale(self, now: float, arm_id: str | None = None) -> float:
+        """1.0 fresh; linear decay to 0 over 5 periods past ``period + 0.05 s``. With
+        ``arm_id`` (v1.3, per-arm streams) the value for THAT arm's stream; without it the
+        source-wide value (the minimum over the driven arms) telemetry reports."""
+        ...
+
+    def driven_arms(self) -> frozenset[str] | None:
+        """The arms this source drives (v1.3; 14-dora §6.1): ``None`` = every session arm
+        (in-process policies); a set = the executor HOLDS every other session arm - like the
+        parked Perception Arm of a Manipulation-Arm-only policy ("a fancy tripod")."""
         ...
 
     def drop_and_requery(self, reason: str = "handback") -> None:

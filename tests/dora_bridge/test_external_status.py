@@ -37,7 +37,12 @@ def test_external_status_carries_capabilities_and_trainer_status(tmp_path):
     assert isinstance(st, ExternalStatus)
     assert st.policy_attached is False and st.capabilities == [] and st.trainer_status is None
     # appended LAST (additive wire change)
-    assert list(ExternalStatus.model_fields)[-2:] == ["capabilities", "trainer_status"]
+    assert list(ExternalStatus.model_fields)[-3:] == [
+        "capabilities",
+        "trainer_status",
+        "policy_arms",  # v1.3 (2026-09-11): the arms the fresh spec drives
+    ]
+    assert st.policy_arms == []
     hub._on_spec(spec_event(announce(version=2, capabilities=["online_dagger", "x"])))
     msg = trainer_status("preparing", progress=0.5, metrics={"loss": 0.25}, detail="pool 3/6")
     hub._on_trainer_status(trainer_event(msg, client="node", seq=7))

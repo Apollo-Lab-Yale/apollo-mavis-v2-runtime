@@ -152,7 +152,8 @@ class DoraWiring:
             if c in self.camera_ids and c not in self.depth_camera_ids:
                 self.depth_camera_ids.append(c)
         mic_id = self.cfg.microphone.mic_id if self.cfg.microphone.enabled else None
-        self.bridge.set_outputs(self.camera_ids, self.depth_camera_ids, mic_id)
+        # v1.3 (2026-09-11): the configured arms get a per-arm policy_action_<arm> input each
+        self.bridge.set_outputs(self.camera_ids, self.depth_camera_ids, mic_id, self.arm_ids)
 
     # -- lifecycle ---------------------------------------------------------------------------------
     def start(self) -> None:
@@ -161,7 +162,7 @@ class DoraWiring:
             self.bridge.start()  # -> disabled with detail
             return
         rt = self.rt
-        self.policy_hub = ExternalPolicyHub(self.bridge, dcfg.policy)
+        self.policy_hub = ExternalPolicyHub(self.bridge, dcfg.policy, arm_ids=self.arm_ids)
         self.stamper = PoseStamper(
             self._kin_factory,
             intrinsics=self.intrinsics,
@@ -433,6 +434,9 @@ class DoraWiring:
                 # phase-14 (15-online-dagger §6/§8): the FRESH spec's capabilities so the
                 # launcher can gate "Start Online DAgger" before a session exists
                 st.capabilities = list(spec.capabilities)
+                # v1.3 (14-dora §6.1): the arms the fresh spec drives (declared or inferred
+                # from its action_names) so the launcher can say "drives: Manipulation Arm"
+                st.policy_arms = hub.policy_arms(now)
             # the newest trainer_status while fresh (session-less trainer pill); None once
             # the node detaches or falls silent for > spec_stale_s
             st.trainer_status = hub.trainer_status(now)

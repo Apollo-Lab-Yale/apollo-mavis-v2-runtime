@@ -20,6 +20,7 @@ class FakeNode:
         node_id: str = ext.EXTERNAL_NODE_ID,
         daemon_port: int = 0,
         outputs: list[str] | None = None,
+        inputs: list[str] | None = None,  # default: the fixed RUNTIME_INPUTS (no per-arm rows)
     ) -> None:
         self.node_id = node_id
         self.daemon_port = daemon_port
@@ -28,6 +29,7 @@ class FakeNode:
         self.sent: list[tuple[str, Any, dict[str, Any]]] = []
         self.fail_send = False
         self._outputs = outputs
+        self._inputs = list(inputs) if inputs is not None else list(ext.RUNTIME_INPUTS)
         self.closed = False
 
     # -- test side ------------------------------------------------------------------------------
@@ -69,7 +71,7 @@ class FakeNode:
     def node_config(self) -> dict[str, Any]:
         return {
             "id": self.node_id,
-            "inputs": dict.fromkeys(ext.RUNTIME_INPUTS, {}),
+            "inputs": dict.fromkeys(self._inputs, {}),
             "outputs": list(self._outputs) if self._outputs is not None else None,
         }
 
