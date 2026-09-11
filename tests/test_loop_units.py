@@ -580,9 +580,18 @@ def _replay_traj(frames: int, dx: float, fps: float = 25.0):
 
 
 class _PosAnchor:
-    """A position-only ``ActionAnchor`` stand-in: q[:3] += the delta, the rail integrates."""
+    """A position-only ``ActionAnchor`` stand-in: q[:3] += the delta, the rail integrates;
+    the row budget (``row_step``) is the real one so each row is applied exactly once."""
 
     action_space = "delta_ee"
+
+    def __init__(self) -> None:
+        from apollo_mavis_v2_runtime.dagger.policy_runner import ActionAnchor, SlewLimits
+
+        self._budget = ActionAnchor(None, None, SlewLimits())
+
+    def row_step(self, arm_id, row_key, delta_row, dt_over_period):
+        return self._budget.row_step(arm_id, row_key, delta_row, dt_over_period)
 
     def apply_delta(self, arm_id, dp, dr, rail_d, q_last, q_meas, dt, now):
         q = np.array(q_last, dtype=np.float64)

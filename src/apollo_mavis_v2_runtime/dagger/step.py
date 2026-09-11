@@ -92,7 +92,11 @@ def policy_step(
         rail_row = float(block[7]) if has_rail and block.shape[0] > 7 else 0.0
         delta_row = np.concatenate([np.asarray(block[:6], dtype=np.float64), [rail_row]])
         dt_over_period = float(dt) / float(runner.period)
-        share = anchor.row_step(arm_id, row_key, delta_row, dt_over_period) * stale
+        row_step = getattr(anchor, "row_step", None)
+        if row_step is not None:
+            share = row_step(arm_id, row_key, delta_row, dt_over_period) * stale
+        else:  # a duck-typed stand-in without the budget: the plain per-tick share
+            share = delta_row * (dt_over_period * stale)
         rail_d = float(share[6]) if has_rail and block.shape[0] > 7 else None
         q = anchor.apply_delta(
             arm_id,
