@@ -16,8 +16,13 @@ phase-09d's "hardware sessions include every configured arm" (D1 freezing is
 now the rail-homing job's alone) - the phase-09d ``start_from=profile`` path
 (planned on the gate twin inside bring-up, executed through ``_op_execute_plan`` one
 arm at a time in the planner's ``arm_order`` - 2026-09-08 evening - 409 on a plan
-failure) and - optional, skipped without the hardware package's
-test fakes - the REAL ``HardwareWorkcell`` + ``XArmDriver`` over ``FakeXArmAPI``."""
+failure), the 2026-09-12 admission of POLICY-DRIVEN motion behind
+``hardware_session.policy_modes`` (refused with the knob named while it is false; with it
+true an external inference session and an Online DAgger session come up over the same
+``GatedPolicyExecutor`` stack as sim, the speed scale still bounding the drivers, the
+rollouts recorded from the adopted wrist cameras) and - optional, skipped without the
+hardware package's test fakes - the REAL ``HardwareWorkcell`` + ``XArmDriver`` over
+``FakeXArmAPI``."""
 
 from __future__ import annotations
 
@@ -42,6 +47,8 @@ from starlette.testclient import TestClient
 
 from apollo_mavis_v2_runtime.config import (
     ControlConfig,
+    DatasetNamespaceConfig,
+    DatasetsConfig,
     HardwareMonitorConfig,
     HardwareProbeConfig,
     HardwareSessionConfig,
@@ -190,6 +197,14 @@ def _config(tmp_path):
             "hardware_monitor": HardwareMonitorConfig(),
             "twin_overlay": TwinOverlayConfig(fps=12.0, env_outline=False),
             "hardware_session": HardwareSessionConfig(armed=True, bringup_timeout_s=20.0),
+            # the shipped Online DAgger layout (<root>/<s>/rollouts, 15-online-dagger D5) for
+            # the 2026-09-12 policy-mode tests; demonstrations keep the tmp datasets_root
+            "datasets": DatasetsConfig(
+                default_namespace="apollo",
+                namespaces={
+                    "online_dagger": DatasetNamespaceConfig(root=tmp_path / "od", subdir="rollouts")
+                },
+            ),
         }
     )
 
@@ -1371,6 +1386,288 @@ def test_collect_start_from_profile_returns_after_save_and_a_fault_cancels_it(
     finally:
         assert client.delete("/api/session").status_code == 204
     assert _wait(lambda: not rt.hardware_monitor.paused)
+
+
+# -- policy-driven motion on the real arms (operator decision 2026-09-12; 15-online-dagger D7) --
+POLICY_MODES_REFUSAL = "hardware sessions support teleop and data collection only"
+
+
+@pytest.fixture()
+def policy_modes(rt):
+    """``hardware_session.policy_modes`` ON for one test (what the lab render's
+    ``HARDWARE_POLICY_MODES=true`` does); the module config keeps the repo default False."""
+    hs = rt.manager.cfg.hardware_session
+    assert hs.policy_modes is False
+    hs.policy_modes = True
+    try:
+        yield hs
+    finally:
+        hs.policy_modes = False
+
+
+def _both_arm_announce(version: int = 1, capabilities=()):
+    """A ``PolicySpecAnnounce`` whose policy drives BOTH cell arms in their base frames
+    (the hubfakes default names a single ``arm0``)."""
+    from dora_bridge.hubfakes import announce
+
+    from apollo_mavis_v2_runtime.recorder.features import arm_action_names, arm_state_names
+
+    names = [n for a in ALL_ARMS for n in arm_action_names(a, True, "delta_ee")]
+    states = [n for a in ALL_ARMS for n in arm_state_names(a, True)]
+    ann = announce(
+        version=version,
+        frame="arm_base:grip",
+        names=names,
+        arms=list(ALL_ARMS),
+        action_frames=dict(ALL_FRAMES),
+        capabilities=list(capabilities),
+    )
+    return ann.model_copy(update={"spec": ann.spec.model_copy(update={"state_names": states})})
+
+
+def _announce(dora, version: int = 1, *capabilities: str) -> None:
+    from dora_bridge.hubfakes import spec_event
+
+    dora.policy_hub._on_spec(spec_event(_both_arm_announce(version, capabilities)))
+
+
+@pytest.fixture()
+def external_policy(rt, tmp_path):
+    """A FAKE dora wiring (no bus thread; ``test_online_dagger_session.FakeDora``) on the
+    manager - the seam every ``policy_source: external`` session goes through."""
+    from test_online_dagger_session import FakeDora
+
+    dora = FakeDora(tmp_path)
+    rt.manager.dora = dora
+    try:
+        yield dora
+    finally:
+        rt.manager.dora = None
+
+
+def _action(rt, op: str):
+    from apollo_mavis_v2_core import Command
+
+    return rt.bus.commands.submit(Command(op=op, source="ws")).result(timeout=5.0)
+
+
+def test_policy_modes_off_refuses_inference_and_dagger_before_touching_anything(
+    client, rt, factory, cells
+):
+    """D7 as shipped (repo default ``policy_modes: false``): inference / dagger / an Online
+    DAgger body are 409 with the knob NAMED, before the monitor is paused or a box is
+    enabled - the mode line stays FIRST in the refusal matrix (no session directory either)."""
+    grip = factory.monitors["grip"]
+    n0 = len(grip.calls)
+    assert rt.manager.cfg.hardware_session.policy_modes is False
+    bodies = (
+        spec(mode="inference"),
+        spec(mode="inference", policy_source="external"),
+        spec(mode="dagger", task="t", return_to_start=False),
+        spec(
+            mode="dagger",
+            task="t",
+            policy_source="external",
+            return_to_start=False,
+            online_dagger={"session_name": "never"},
+        ),
+    )
+    for body in bodies:
+        r = client.post("/api/session", json=body)
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert POLICY_MODES_REFUSAL in detail and "hardware_session.policy_modes" in detail, detail
+    assert cells.built == [] and grip.calls[n0:] == [] and not rt.hardware_monitor.paused
+    assert rt.manager.session is None
+    assert not (rt.manager.online_dagger_root() / "never").exists()
+
+
+def test_policy_modes_on_still_resolves_the_policy_before_any_box_is_touched(
+    client, rt, factory, cells, policy_modes
+):
+    """With the knob on the policy is resolved INSIDE the refusal matrix - an unknown
+    checkpoint or no attached policy node is 409 before the monitor is paused."""
+    grip = factory.monitors["grip"]
+    n0 = len(grip.calls)
+    r = client.post("/api/session", json=spec(mode="inference", policy="nope/deploy/v001"))
+    assert r.status_code == 409 and "unknown policy 'nope/deploy/v001'" in r.json()["detail"]
+    r = client.post(
+        "/api/session",
+        json=spec(mode="dagger", task="t", return_to_start=False, policy="nope/v000001"),
+    )
+    assert r.status_code == 409 and "unknown policy 'nope/v000001'" in r.json()["detail"]
+    r = client.post("/api/session", json=spec(mode="inference", policy_source="external"))
+    assert r.status_code == 409, r.text
+    assert "no external policy attached (dora bridge is not attached)" in r.json()["detail"]
+    assert cells.built == [] and grip.calls[n0:] == [] and not rt.hardware_monitor.paused
+    assert rt.manager.session is None
+
+
+def test_external_inference_session_is_admitted_with_policy_modes(
+    client, rt, factory, cams, cells, policy_modes, external_policy
+):
+    """Operator decision 2026-09-12: with the knob ON an inference session over the external
+    policy node comes up on the real cell with the SAME stack as sim - a
+    ``GatedPolicyExecutor`` of kind hardware over the rig's speed-scaled, servo-capped
+    control config and the gate twin; the speed scale still bounds the drivers; the
+    explicit ``takeover`` / ``handback`` publish ``events.gate``; teardown is the D6
+    hand-back like any teleop session (loop -> drivers -> fps back -> monitor resumed)."""
+    from apollo_mavis_v2_runtime.dagger.loop import GatedPolicyExecutor, InferenceSession
+    from apollo_mavis_v2_runtime.dora_bridge.policy_source import ExternalPolicySource
+
+    dora = external_policy
+    _announce(dora, 1)
+    grip = factory.monitors["grip"]
+    hub_ids_before = set(rt.hub.ids())
+    r = client.post("/api/session", json=spec(mode="inference", policy_source="external"))
+    assert r.status_code == 200, r.text
+    info = r.json()
+    assert (info["mode"], info["kind"], info["policy_source"]) == (
+        "inference",
+        "hardware",
+        "external",
+    )
+    assert info["speed_scale"] == 0.1 and info["streams"] == []
+    session = rt.manager.session
+    cell = cells.cell
+    try:
+        loop = session.loop
+        assert isinstance(loop, GatedPolicyExecutor) and loop.session_mode == "inference"
+        assert loop.workcell_kind == "hardware" and loop.gripper_arms == {"grip"}
+        assert isinstance(session.supervisor.gate, SafetyGate)
+        assert loop.supervisor is session.supervisor and loop.planner is session.twin
+        assert loop.ik is not None and loop.kin is not None and loop.workcell is cell
+        assert isinstance(session.policy_session, InferenceSession)
+        assert isinstance(loop.runner, ExternalPolicySource)
+        assert session.recorder_thread is None and session.online_dagger is None
+        # the speed scale (0.1) bounds the loop exactly like a teleop session's (host-only
+        # caps on these fakes), the anchor leash stays the unscaled one, and the driver
+        # factory carries the scaled servo caps to the (fake) drivers
+        assert loop.cfg.dq_max_rad == pytest.approx(0.004)
+        assert loop.cfg.teleop.linear_mps == pytest.approx(0.012)
+        assert loop.cfg.target_rate.v_mps == pytest.approx(0.1)
+        assert loop.cfg.leash == rt.cfg.control.leash
+        assert loop.anchor.leash_pos_m == pytest.approx(rt.cfg.control.leash.pos_m)
+        if importlib.util.find_spec("apollo_mavis_v2_hardware") is not None:
+            import apollo_mavis_v2_hardware as hw
+
+            base = hw.XArmDriverConfig(arm_id="grip", ip="192.168.1.201", gripper="xarm_g2")
+            driver = cells.driver_factories[0](base)  # inert: nothing connects in the ctor
+            assert driver.cfg.servo.max_joint_vel == pytest.approx((0.06,) * 7)
+            assert driver.cfg.servo.max_cart_step_m == pytest.approx(0.0004)
+            assert driver.cfg.rail_speed_mm_s == 5
+        assert rt.hardware_monitor.paused and rt.manager.hardware_session_active
+        assert session.adopted_streams == ["grip_wrist", "view_wrist"]
+        assert _wait(lambda: rt.manager.state is SessionState.RUNNING, 20.0)
+        msg = _telemetry(
+            client, lambda m: m["session"]["state"] == "running" and m.get("inference")
+        )
+        assert msg["dagger"] is None and msg["episode"] is None
+        assert msg["inference"]["control_mode"] == "policy"
+        assert msg["collision"] is not None  # the gate twin is live (unconditional)
+        assert dora.calls[:2] == ["before_bringup", "after_session_start"]
+        assert dora.facts.kind == "hardware" and dora.facts.policy_source == "external"
+        assert dora.facts.camera_ids == ["grip_wrist", "view_wrist"]
+        for op in ("episode_new", "episode_save", "episode_discard"):
+            assert _action(rt, op).ok is False  # no recorder in inference
+        assert _action(rt, "takeover").ok
+        assert _wait(lambda: any(g["mode"] == "human" for g in dora.publisher.of("gate")), 5.0)
+        _telemetry(client, lambda m: (m.get("inference") or {}).get("control_mode") == "human")
+        assert _action(rt, "handback").ok
+        assert _wait(lambda: dora.publisher.of("gate")[-1]["mode"] == "policy", 5.0)
+        assert all(g["arm_id"] == "grip" for g in dora.publisher.of("gate"))
+    finally:
+        assert client.delete("/api/session").status_code == 204
+    assert cell.stop_calls == 1 and rt.manager.session is None
+    assert rt.hub._workers["grip_wrist"].fps == 15.0 and set(rt.hub.ids()) == hub_ids_before
+    assert _wait(lambda: not rt.hardware_monitor.paused)
+    assert not rt.manager.hardware_session_active and grip.calls[-1] == "start"
+    assert dora.calls[-1] == "after_teardown"
+
+
+def test_online_dagger_session_is_admitted_with_policy_modes_and_records_rollouts(
+    client, rt, factory, cams, cells, policy_modes, external_policy
+):
+    """D7 amended: an Online DAgger body comes up on the real cell - the executor is a
+    ``GatedPolicyExecutor`` of kind hardware carrying the ``OnlineDaggerCoordinator``, the
+    rollouts are recorded from the ADOPTED wrist cameras into ``online_dagger/<s>/rollouts``
+    (both videos, the twin camera extrinsics), ``episode_new`` waits for the trainer's
+    ``ready`` exactly as in sim, a kept rollout publishes ``episode_saved`` with the
+    ``online_dagger`` block, and teardown leaves ``session.json`` behind."""
+    from apollo_mavis_v2_runtime.dagger.loop import DaggerSession, GatedPolicyExecutor
+
+    dora = external_policy
+    _announce(dora, 1, "online_dagger")
+    sdir = rt.manager.online_dagger_root() / "hw1"
+    body = spec(
+        mode="dagger",
+        task="hw rollout",
+        policy_source="external",
+        return_to_start=False,
+        action_filter={"enabled": False},  # a held arm records every frame
+        online_dagger={"session_name": "hw1"},
+    )
+    r = client.post("/api/session", json=body)
+    assert r.status_code == 200, r.text
+    sid = r.json()["session_id"]
+    session = rt.manager.session
+    cell = cells.cell
+    rt_thread = session.recorder_thread
+    try:
+        loop = session.loop
+        assert isinstance(loop, GatedPolicyExecutor) and loop.session_mode == "dagger"
+        assert loop.workcell_kind == "hardware" and loop.gripper_arms == {"grip"}
+        assert isinstance(session.policy_session, DaggerSession)
+        assert session.online_dagger is not None
+        assert loop.coordinator is session.online_dagger.coordinator
+        assert rt_thread is not None and loop.recorder is rt_thread
+        assert rt_thread.repo_id == "online_dagger/hw1"
+        assert sorted(p.name for p in sdir.iterdir()) == ["rollouts", "session.json"]
+        assert loop.cfg.dq_max_rad == pytest.approx(0.004)  # the speed scale, as in teleop
+        assert _wait(lambda: rt.manager.state is SessionState.RUNNING, 20.0)
+        rows = {d["repo_id"]: d for d in client.get("/api/datasets").json()}
+        row = rows["online_dagger/hw1"]
+        assert row["kind"] == "hardware" and row["in_use"] is True
+        assert row["cameras"] == ["grip_wrist", "view_wrist"]  # the adopted previews
+        # the trainer gate, exactly as in sim: no status yet -> "no trainer"; a trainer that
+        # serves this session but is not ready -> "waiting"; its first `ready` opens rollouts
+        from apollo_mavis_v2_runtime.dagger.online_dagger import NO_TRAINER
+
+        ack = _action(rt, "episode_new")
+        assert ack.ok is False and ack.detail == NO_TRAINER, ack
+        dora.beat("preparing", progress=0.5, detail="offline pool 1/2", session_id=sid)
+        ack = _action(rt, "episode_new")
+        assert ack.ok is False, ack
+        assert ack.detail == "waiting for the trainer to report ready (offline pool 1/2)"
+        dora.beat("ready", session_id=sid)
+        assert _wait(lambda: _action(rt, "episode_new").ok, 5.0)
+        assert _wait(lambda: rt_thread.status().frames >= 10, 15.0), rt_thread.status()
+        assert _action(rt, "episode_save").ok
+        assert _wait(lambda: rt_thread.status().state == "idle", 15.0)
+        saved = rt_thread.last_saved_id
+        assert _wait(lambda: dora.publisher.of("episode_saved"), 5.0)
+        [ev] = dora.publisher.of("episode_saved")
+        assert ev["summary"]["episode_id"] == saved and ev["summary"]["n_frames"] >= 10
+        assert ev["summary"]["n_novice_frames"] == ev["summary"]["n_frames"]  # policy held
+        od = ev["online_dagger"]
+        assert od["episode_id"] == saved and od["rollouts_saved"] == 1
+        assert od["actor_counts"] == {"novice": ev["summary"]["n_frames"], "expert": 0}
+        assert ev["dataset_root"] == str(sdir / "rollouts") and ev["run_id"] == sid[:8]
+        d = sdir / "rollouts" / "episodes" / saved
+        assert sorted(p.name for p in (d / "video").iterdir()) == [
+            "grip_wrist.mp4",
+            "view_wrist.mp4",
+        ]
+        ep = json.loads((d / "episode.json").read_text())
+        assert ep["extrinsics"]["grip_wrist"]["twin_camera"] == "grip_wrist_cam"
+        assert ep["frames"] == ALL_FRAMES and ep["arm_bases"]["grip"]["has_rail"] is True
+    finally:
+        assert client.delete("/api/session").status_code == 204
+    assert cell.stop_calls == 1 and rt.manager.session is None
+    assert (sdir / "session.json").is_file() and (sdir / "rollouts" / "episodes" / saved).is_dir()
+    assert _wait(lambda: not rt.hardware_monitor.paused)
+    assert not rt.manager.hardware_session_active
+    assert client.get("/api/datasets/online_dagger/hw1").json()["in_use"] is False
 
 
 def test_no_hardware_workcell_configured_is_409(tmp_path):

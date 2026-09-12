@@ -142,6 +142,9 @@ def test_workcell_default_and_kinds(client, rt):
     assert by_id["grip"]["gripper"] == "xarm_g2" and by_id["view"]["gripper"] == "none"
     assert by_id["grip"]["gripper_force_capable"] and not by_id["view"]["gripper_force_capable"]
     assert hw["hardware_ready"] is True and ws["hardware_ready"] is True
+    # 2026-09-12: the knob rides the wire - the conftest arms the session but leaves policy_modes
+    # at its default False; the sim workcell is always admitted
+    assert hw["policy_modes"] is False and ws["policy_modes"] is True
     assert all(a["error_code"] == 0 for a in hw["arms"])  # monitor disabled -> 0
     cams = {c["camera_id"]: c for c in hw["cameras"]}
     assert set(cams) == {"camera1", "camera2"}  # no *_align rows: overlay disabled

@@ -133,7 +133,7 @@ from apollo_mavis_v2_core.protocol import (
     SessionSpec,
 )
 
-from ..config import RuntimeConfig
+from ..config import ControlConfig, RuntimeConfig
 from ..control.loop import (
     DEFAULT_ACTIVE_ARM,
     GATE_HOLD_PREFIX,
@@ -255,6 +255,9 @@ def _gripper_arms(scene, arm_ids: list[str]) -> list[str]:
 
 
 MOTION_BUSY = "a planned motion is already running"
+# What a hardware session records, for the "needs at least one live hardware camera" 409
+# (collect since 2026-09-07; dagger rollouts since the policy modes were admitted, 2026-09-12)
+_RECORDING_LABEL = {"collect": "data collection", "dagger": "DAgger rollout recording"}
 # Measured-arrival criterion of a sequentially executed plan (2026-09-08 review): arm k
 # has ARRIVED when every joint of ``workcell.states()[k].q`` is within
 # ``PLAN_ARRIVAL_TOL_RAD`` of its last waypoint and the rail slot within
@@ -1255,8 +1258,11 @@ class SessionManager:
         """The hardware refusal matrix (409 via :class:`SessionError`), evaluated
         BEFORE anything is touched; returns ``(twin_scene, monitor samples)``.
 
-        teleop or collect (phase-09c; data collection since 2026-09-07 - DAgger /
-        inference on hardware stay 409) -> at least one arm, every arm in the hardware
+        teleop or collect (phase-09c; data collection since 2026-09-07); DAgger /
+        inference - policy-driven motion - only with ``hardware_session.policy_modes``
+        (operator decision 2026-09-12; 15-online-dagger D7), their policy resolved
+        (checkpoint / attached external node) before any box is touched -> at least
+        one arm, every arm in the hardware
         config AND in the twin scene, and - phase-09d - EVERY configured arm in
         the session ("hardware sessions include every configured arm") -> a
         resolvable ``digital_twin_scene`` -> no rail homing in flight on ANY arm
@@ -1269,10 +1275,24 @@ class SessionManager:
         """
         self._require_armed()
         if spec.mode not in ("teleop", "collect"):
-            raise SessionError(
-                "hardware sessions support teleop and data collection only "
-                f"({spec.mode} on hardware: not yet)"
-            )
+            # D7 (15-online-dagger), amended 2026-09-12: policy-driven motion on the real
+            # arms is admitted behind the RENDERED config's hardware_session.policy_modes
+            # (repo default false; HARDWARE_POLICY_MODES=true in the lab render)
+            if not self.cfg.hardware_session.policy_modes:
+                raise SessionError(
+                    "hardware sessions support teleop and data collection only "
+                    f"({spec.mode} on hardware: not yet - hardware_session.policy_modes is "
+                    "false; the lab render sets it with HARDWARE_POLICY_MODES=true)"
+                )
+            if spec.policy_source == "external":
+                # the bridge + a fresh policy_spec, checked before a box is enabled; an
+                # Online DAgger body keeps _check_online_dagger's documented 409 order
+                if spec.online_dagger is None:
+                    self._external_hub_or_409()
+            else:
+                from ..dagger.registry import resolve_policy
+
+                resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)  # 409 early
         if not spec.arms:
             raise SessionError("session needs at least one arm")
         ids = [a.id for a in wc.arms]
@@ -1359,11 +1379,12 @@ class SessionManager:
             uncovered = [a for a in spec.arms if a not in profile.arms]
             if uncovered:
                 raise SessionError(f"profile {pid!r} does not cover arms {uncovered}")
-        if spec.mode == "collect" and not self._live_hardware_cameras():
-            # checked HERE, before any box is enabled (2026-09-07 review)
+        if spec.mode in ("collect", "dagger") and not self._live_hardware_cameras():
+            # checked HERE, before any box is enabled (2026-09-07 review); a DAgger rollout
+            # is recorded from the same live wrist cameras as a demonstration (2026-09-12)
             raise SessionError(
-                "data collection needs at least one live hardware camera - none is open "
-                "(see the Hardware tab camera tiles)"
+                f"{_RECORDING_LABEL[spec.mode]} needs at least one live hardware camera - "
+                "none is open (see the Hardware tab camera tiles)"
             )
         return twin_scene, samples
 
@@ -1727,8 +1748,9 @@ class SessionManager:
         self._bringup = progress
         labels = ", ".join(arm_label(a) for a in spec.arms)
         logger.info(
-            "hardware session %s: bring-up of %s at speed scale %.2f (twin %r)",
+            "hardware session %s: %s bring-up of %s at speed scale %.2f (twin %r)",
             session_id,
+            spec.mode,
             labels,
             scale,
             twin_scene,
@@ -1736,6 +1758,8 @@ class SessionManager:
         rig: HardwareRig | None = None
         session: ActiveSession | None = None
         recorder_thread = None
+        policy_session = None
+        started: list = []  # what to stop, in reverse, if the bring-up fails after a start()
         try:
             rig = self.connect_hardware_rig(
                 arms=list(spec.arms),
@@ -1754,13 +1778,18 @@ class SessionManager:
             #      preview cameras (the UVC nodes are open exactly once) and the twin's
             #      kinematics; built before the loop starts so a dataset refusal (409)
             #      never leaves a running loop behind.
-            if spec.mode == "collect":
+            recorder_kwargs = None
+            if spec.mode in ("collect", "dagger"):
                 cams = self._live_hardware_cameras()
                 if not cams:  # re-checked: a preview may have died during the connect
                     raise SessionError(
-                        "data collection needs at least one live hardware camera - none is "
-                        "open (see the Hardware tab camera tiles)"
+                        f"{_RECORDING_LABEL[spec.mode]} needs at least one live hardware camera "
+                        "- none is open (see the Hardware tab camera tiles)"
                     )
+                recorder_kwargs = dict(
+                    kind="hardware", cameras=cams, camera_cfgs={c.id: c for c in wc.cameras}
+                )
+            if spec.mode == "collect":
                 for a in spec.arms:
                     progress.set(a, "recorder", "pending", "opening the dataset writer")
                 recorder_thread = self._build_collect_recorder(
@@ -1769,16 +1798,60 @@ class SessionManager:
                     rig.workcell,
                     rig.twin.scene,
                     session_id,
-                    kind="hardware",
-                    cameras=cams,
-                    camera_cfgs={c.id: c for c in wc.cameras},
+                    **recorder_kwargs,
                 )
                 rig.loop.recorder = recorder_thread
                 for a in spec.arms:
                     progress.set(a, "recorder", "ok", f"recording into {recorder_thread.repo_id}")
+            elif spec.mode in ("dagger", "inference"):
+                # 11c. policy-driven motion (operator decision 2026-09-12, behind
+                #      hardware_session.policy_modes - _validate_hardware admitted it; §11 /
+                #      §12): the SAME stack as sim - GatedPolicyExecutor + policy session
+                #      (+ the rollout recorder for dagger) - over the rig's hardware pieces:
+                #      the speed-scaled, servo-capped control config, the twin-bound IK /
+                #      kinematics / planner, the config's gripper arms and the tracker
+                #      provider the plain loop was built with. The plain (never started)
+                #      ControlLoop is dropped; the executor takes its place in the rig, so
+                #      start_from, return-to-start, the gate-held abort, teardown and the
+                #      telemetry see one loop, exactly as in sim.
+                for a in spec.arms:
+                    progress.set(a, "policy", "pending", f"building the {spec.mode} policy stack")
+                plain = rig.loop
+                loop, recorder_thread, policy_session = self._build_policy_stack(
+                    spec,
+                    rig.session_cfg,
+                    rig.workcell,
+                    rig.twin.scene,
+                    session_id,
+                    plain.ik,
+                    plain.kin,
+                    rig.twin,
+                    rig.supervisor,
+                    control_cfg=plain.cfg,
+                    loop_kwargs=dict(
+                        workcell_kind="hardware",
+                        gripper_arms=sorted(plain.gripper_arms),
+                        tracker=plain.tracker,
+                        speed_scale=rig.speed_scale,
+                    ),
+                    recorder_kwargs=recorder_kwargs,
+                )
+                rig.loop = loop
+                detail = f"{type(loop).__name__} ({spec.mode}, policy_source {spec.policy_source})"
+                if recorder_thread is not None:
+                    detail += f", recording into {recorder_thread.repo_id}"
+                for a in spec.arms:
+                    progress.set(a, "policy", "ok", detail)
+            # the starts sit INSIDE the rollback scope (mirror of _bringup_sim): a start that
+            # raises must stop what came up before it and, for Online DAgger, drop a fresh dir
             rig.loop.start()
+            started.append(rig.loop)
             if recorder_thread is not None:
                 recorder_thread.start()
+                started.append(recorder_thread)
+            if policy_session is not None:
+                policy_session.start()
+                started.append(policy_session)
             loop, workcell = rig.loop, rig.workcell
             session = ActiveSession(
                 session_id=session_id,
@@ -1790,9 +1863,11 @@ class SessionManager:
                 twin=rig.twin,
                 render_service=None,
                 recorder_thread=recorder_thread,
+                policy_session=policy_session,
                 frozen_arms=sorted(rig.frozen),
                 inner_workcell=rig.inner,
                 planned_start=planned,
+                online_dagger=getattr(policy_session, "online_dagger", None),
             )
             self.attach_fault_state(session)
 
@@ -1820,11 +1895,19 @@ class SessionManager:
             logger.info("hardware session %s: bring-up complete (%s)", session_id, labels)
             return session
         except BaseException:
+            if policy_session is not None and policy_session in started:
+                try:
+                    policy_session.stop()  # runner (+ reloader / trainer) before the loop
+                except Exception:  # noqa: BLE001
+                    logger.exception("hardware bring-up abort: policy session stop failed")
             if recorder_thread is not None:
                 try:
                     recorder_thread.stop()  # finalize the (empty) dataset, never half-open
                 except Exception:  # noqa: BLE001
                     logger.exception("hardware bring-up abort: recorder stop failed")
+            online_dagger = getattr(policy_session, "online_dagger", None)
+            if online_dagger is not None:
+                online_dagger.abandon()  # a fresh name stays usable (15-online-dagger §3)
             self._abort_hardware_bringup(
                 rig.loop if rig is not None else None,
                 rig.workcell if rig is not None else None,
@@ -3616,6 +3699,28 @@ class SessionManager:
             return f"the motion was cancelled{where}: {detail}. The arms hold where they are."
         return f"the motion was refused{where}: {detail}."
 
+    def _policy_loop_kwargs(self, spec: SessionSpec, scene, ik, kin, twin, overrides) -> dict:
+        """The ``ControlLoop`` kwargs every ``GatedPolicyExecutor`` gets: the sim defaults
+        derived from the scene (``workcell_kind="sim"``, the scene's gripper arms, a fresh
+        tracker provider, the session's speed scale for goto plans), then the caller's
+        ``overrides`` - the hardware bring-up passes ``workcell_kind="hardware"``, the
+        config's gripper arms, the rig's tracker provider and its speed scale."""
+        overrides = dict(overrides or {})
+        common = dict(
+            ik=ik,
+            kin=kin,
+            planner=twin,
+            profile_store=self.profile_store,
+            workcell_kind="sim",
+            gripper_arms=_gripper_arms(scene, spec.arms),
+            plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
+            speed_scale=spec.speed_scale,
+        )
+        if "tracker" not in overrides:
+            common["tracker"] = self._tracker_provider()
+        common.update(overrides)
+        return common
+
     def _build_policy_stack(
         self,
         spec: SessionSpec,
@@ -3627,8 +3732,22 @@ class SessionManager:
         kin,
         twin,
         supervisor,
+        *,
+        control_cfg: ControlConfig | None = None,
+        loop_kwargs: dict | None = None,
+        recorder_kwargs: dict | None = None,
     ):
-        """DAgger/inference bringup (12-dagger §1): -> (loop, recorder, session)."""
+        """DAgger/inference bringup (12-dagger §1): -> (loop, recorder, session).
+
+        Sim (``_bringup_sim``) passes the nine positional pieces. Hardware
+        (``_bringup_hardware``, admitted behind ``hardware_session.policy_modes`` since
+        2026-09-12) adds what its plain ``ControlLoop`` gets today: ``control_cfg`` = the
+        speed-scaled, servo-capped ``ControlConfig`` (the executor's ``SlewLimits`` and the
+        anchor leash still come from the unscaled ``cfg.control`` - unchanged),
+        ``loop_kwargs`` = ``workcell_kind="hardware"``, the config's ``gripper_arms``, the
+        rig's ``tracker`` provider and ``speed_scale`` (:meth:`_policy_loop_kwargs`), and
+        ``recorder_kwargs`` = ``kind="hardware"`` + the live wrist ``cameras`` and their
+        ``camera_cfgs`` for :meth:`_build_collect_recorder` (dagger rollouts)."""
         import shutil
 
         from apollo_mavis_v2_core.dagger import CheckpointInfo
@@ -3654,9 +3773,24 @@ class SessionManager:
 
         dcfg = self.cfg.dagger
         frames = {a: spec.frames.get(a, f"arm_base:{a}") for a in spec.arms}
+        control_cfg = self.cfg.control if control_cfg is None else control_cfg
+        recorder_kwargs = dict(recorder_kwargs or {})
+        common = self._policy_loop_kwargs(spec, scene, ik, kin, twin, loop_kwargs)
         if spec.policy_source == "external":  # phase-12 (14-dora §6.1)
             return self._build_external_policy_stack(
-                spec, session_cfg, workcell, scene, session_id, ik, kin, twin, supervisor, frames
+                spec,
+                session_cfg,
+                workcell,
+                scene,
+                session_id,
+                ik,
+                kin,
+                twin,
+                supervisor,
+                frames,
+                control_cfg=control_cfg,
+                common=common,
+                recorder_kwargs=recorder_kwargs,
             )
         resolved = resolve_policy(self.cfg.checkpoints_root, spec.mode, spec.policy)
         info = resolved.info
@@ -3693,20 +3827,10 @@ class SessionManager:
             action_space=info.action_space,
             **anchor_leash_kwargs(dcfg, self.cfg.control),
         )
-        common = dict(
-            ik=ik,
-            kin=kin,
-            planner=twin,
-            profile_store=self.profile_store,
-            workcell_kind="sim",
-            gripper_arms=_gripper_arms(scene, spec.arms),
-            tracker=self._tracker_provider(),
-            plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
-        )
         if spec.mode == "inference":
             loop = GatedPolicyExecutor(
                 workcell,
-                self.cfg.control,
+                control_cfg,
                 self.bus,
                 supervisor,
                 list(spec.arms),
@@ -3756,6 +3880,7 @@ class SessionManager:
             scene,
             session_id,
             dagger_ctx={"run_id": run_id, "gate": gate},
+            **recorder_kwargs,
         )
         state_dim = sum(len(arm_state_names(a, r)) for a, r in arms_meta)
         action_dim = sum(len(arm_action_names(a, r, info.action_space)) for a, r in arms_meta)
@@ -3788,7 +3913,7 @@ class SessionManager:
         )
         loop = GatedPolicyExecutor(
             workcell,
-            self.cfg.control,
+            control_cfg,
             self.bus,
             supervisor,
             list(spec.arms),
@@ -3829,7 +3954,21 @@ class SessionManager:
         return hook
 
     def _build_external_policy_stack(
-        self, spec, session_cfg, workcell, scene, session_id, ik, kin, twin, supervisor, frames
+        self,
+        spec,
+        session_cfg,
+        workcell,
+        scene,
+        session_id,
+        ik,
+        kin,
+        twin,
+        supervisor,
+        frames,
+        *,
+        control_cfg: ControlConfig,
+        common: dict,
+        recorder_kwargs: dict,
     ):
         """``policy_source: external`` (phase-12; 14-dora §6.1): the policy node drives
         through the dora bus. Requires the bridge ``attached`` and a fresh ``policy_spec``
@@ -3923,20 +4062,10 @@ class SessionManager:
             action_space=pspec.action_space,
             **anchor_leash_kwargs(dcfg, self.cfg.control),
         )
-        common = dict(
-            ik=ik,
-            kin=kin,
-            planner=twin,
-            profile_store=self.profile_store,
-            workcell_kind="sim",
-            gripper_arms=_gripper_arms(scene, spec.arms),
-            tracker=self._tracker_provider(),
-            plan_gate_hold_s=self.cfg.hardware_session.plan_gate_hold_s,
-        )
         if spec.mode == "inference":
             loop = GatedPolicyExecutor(
                 workcell,
-                self.cfg.control,
+                control_cfg,
                 self.bus,
                 supervisor,
                 list(spec.arms),
@@ -3959,11 +4088,17 @@ class SessionManager:
             dagger_ctx.update(repo_id=online_dagger.repo_id, coordinator=online_dagger.coordinator)
         try:
             recorder_thread = self._build_collect_recorder(
-                spec, session_cfg, workcell, scene, session_id, dagger_ctx=dagger_ctx
+                spec,
+                session_cfg,
+                workcell,
+                scene,
+                session_id,
+                dagger_ctx=dagger_ctx,
+                **recorder_kwargs,
             )
             loop = GatedPolicyExecutor(
                 workcell,
-                self.cfg.control,
+                control_cfg,
                 self.bus,
                 supervisor,
                 list(spec.arms),
@@ -4935,6 +5070,7 @@ class SessionManager:
             cameras=cameras,
             policies_available=bool(scan_policies(self.cfg.checkpoints_root)),
             hardware_ready=bool(probe is not None and probe.hardware_ready),
+            policy_modes=kind != "hardware" or bool(self.cfg.hardware_session.policy_modes),
         )
 
     def _sim_arm_infos(self) -> list:

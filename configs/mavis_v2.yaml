@@ -289,6 +289,9 @@ twin_overlay:
 hardware_session:
   armed: false                # arming switch: real drivers connect / rails home ONLY when true.
                               # Repo default false (tests, dev instances); the lab render sets true.
+  policy_modes: false         # policy-driven motion on the REAL arms (inference / dagger sessions,
+                              # action-column playback); operator decision 2026-09-12. Repo default
+                              # false; the lab render sets it with HARDWARE_POLICY_MODES=true.
   default_speed_scale: 1.0    # 100 % (2026-09-08 evening); 50 % was the 2026-09-07 call
   plan_gate_hold_s: 3.0       # gate-held abort of a running plan (s); 0 = the first held tick
   rail_flip: false

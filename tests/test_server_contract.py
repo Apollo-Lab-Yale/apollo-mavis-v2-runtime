@@ -145,6 +145,7 @@ def test_workcell_and_cameras_pre_session(client):
     ws = client.get("/api/workcell").json()
     assert ws["kind"] == "sim" and ws["available_kinds"] == ["sim"]
     assert ws["hardware_ready"] is False  # no hardware workcell configured
+    assert ws["policy_modes"] is True  # sim: always admitted (2026-09-12)
     arm = ws["arms"][0]
     assert arm["has_rail"] and len(arm["joint_limits"]) == 8
     assert arm["joint_limits"][7] == [0.0, 0.65]
@@ -157,6 +158,7 @@ def test_workcell_and_cameras_pre_session(client):
     hw = client.get("/api/workcell", params={"kind": "hardware"}).json()
     assert hw["kind"] == "hardware" and hw["arms"] == [] and hw["cameras"] == []
     assert hw["available_kinds"] == ["sim"] and hw["hardware_ready"] is False
+    assert hw["policy_modes"] is False  # no hardware block -> the default knob
     assert client.get("/api/workcell", params={"kind": "nope"}).status_code == 422
     # No microphone configured -> empty list, no telemetry block.
     assert client.get("/api/microphones").json() == []
