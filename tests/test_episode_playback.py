@@ -877,7 +877,13 @@ def test_action_replay_is_refused_on_hardware_and_in_policy_sessions(tmp_path):
         return types.SimpleNamespace(spec=types.SimpleNamespace(kind=kind, mode=mode), loop=loop)
 
     refusal = rt.manager._action_replay_refusal  # noqa: SLF001
-    assert refusal(session("hardware"), traj, "delta_ee") == "action replay is admitted in sim only"
+    assert refusal(session("hardware"), traj, "delta_ee").startswith(
+        "action replay is admitted in sim only"
+    )
+    # operator decision 2026-09-12: the lab render admits it with hardware_session.policy_modes
+    rt.manager.cfg.hardware_session.policy_modes = True
+    assert refusal(session("hardware"), traj, "delta_ee") == ""
+    rt.manager.cfg.hardware_session.policy_modes = False
     assert "teleop / collect sessions only" in refusal(session(mode="inference"), traj, "abs_ee")
     assert "backfill_abs_ee" in refusal(session(), traj, "abs_ee")  # the column is missing
     assert "unknown playback source" in refusal(session(), traj, "joint")

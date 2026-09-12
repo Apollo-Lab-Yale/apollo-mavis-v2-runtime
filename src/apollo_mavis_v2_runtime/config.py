@@ -317,6 +317,12 @@ class HardwareSessionConfig(BaseModel):
     # (tests, dev instances, a forgotten render) refuses hardware sessions and
     # home_rail with 409 "hardware not armed". The lab render sets it true.
     armed: bool = False
+    # Operator decision 2026-09-12: admit POLICY-DRIVEN motion on the real arms - inference /
+    # dagger sessions and the action-column playback (delta_ee / abs_ee replay through the
+    # executor). Repo default false (D7: the policy path had never run on hardware); the lab
+    # render sets it with HARDWARE_POLICY_MODES=true. The per-tick twin gate, the leash and the
+    # joint / Cartesian step caps are the safety authority either way.
+    policy_modes: bool = False
     # D2: segments 10 / 50 / 100 %. Default 100 % = operator decision 2026-09-08 evening
     # (50 % was the 2026-09-07 call; 10 % the very-first-run setting). The UI's
     # ``DEFAULT_SPEED_SCALE`` mirrors this value - the two must not drift.

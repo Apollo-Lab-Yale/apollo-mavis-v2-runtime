@@ -3253,11 +3253,12 @@ class SessionManager:
 
         if source not in ACTION_COLUMNS:
             return f"unknown playback source {source!r} (state, delta_ee or abs_ee)"
-        if session.spec.kind == "hardware":
+        if session.spec.kind == "hardware" and not self.cfg.hardware_session.policy_modes:
             # The per-tick gate is the only check an action replay gets - no whole-path
-            # twin verification - and the executor's fidelity is what it MEASURES. Until
-            # the operator has seen it in sim, the real arms do not get it (D7's spirit).
-            return "action replay is admitted in sim only"
+            # twin verification - and the executor's fidelity is what it MEASURES. The real
+            # arms get it only with hardware_session.policy_modes (operator decision
+            # 2026-09-12; the lab render knob HARDWARE_POLICY_MODES).
+            return "action replay is admitted in sim only (hardware_session.policy_modes is false)"
         if session.spec.mode in ("dagger", "inference"):
             return (
                 "action replay runs in teleop / collect sessions only - this session's loop "
