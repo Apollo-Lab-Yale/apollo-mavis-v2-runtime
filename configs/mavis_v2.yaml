@@ -89,26 +89,32 @@ workcells:
     # Both wrist cameras are Intel RealSense D435i used as plain UVC colour
     # cameras (kind v4l2, no depth): addressed by USB serial (sysfs lookup)
     # because the /dev/v4l/by-id symlinks collide between the depth and colour
-    # interfaces, and the colour stream is YUYV only (fourcc). Serial -> arm
-    # mapping CONFIRMED by the user on 2026-09-04 from the Hardware-tab tiles.
+    # interfaces. 2026-09-11: both cameras are opened through librealsense (kind
+    # realsense, addressed by the RealSense DEVICE serial) so the aligned z16 depth stream is
+    # published over dora as `cam_<id>_depth`; the 2026-09-04..09-10 v4l2/YUYV colour-only
+    # opening is history (02-hardware §8). Serial -> arm mapping CONFIRMED by the user on
+    # 2026-09-04 from the Hardware-tab tiles (USB iSerial) and re-derived on 2026-09-11 from
+    # pyrealsense2 physical_port -> sysfs usb serial.
     # intrinsics = the D435i COLOUR imager at 640x480 (`rs-enumerate-devices -c`,
     # Inverse Brown-Conrady, distortion ignored; fovy = 2*atan(240/fy) ~ 43.2 deg,
     # NOT the MJCF fovy 57 which is the depth field of view). The twin overlay
     # (`<id>_align` streams) renders the digital twin with exactly these values.
     cameras:
-      - id: grip_wrist               # Manipulation Arm wrist (USB serial 349643062582 -> RS ASIC 327122074467)
-        kind: v4l2
-        serial: "349643062582"
-        fourcc: YUYV
+      - id: grip_wrist               # Manipulation Arm wrist (RS ASIC serial 327122074467; USB iSerial 349643062582)
+        kind: realsense              # librealsense (pyrealsense2, runtime [hardware] extra): colour rgb8 + z16 depth
+        serial: "327122074467"       # the RealSense DEVICE serial (rs-enumerate-devices), NOT the USB iSerial
         resolution: [640, 480]
         fps: 30
+        depth: true                  # aligned depth -> dora `cam_grip_wrist_depth` (uint16 mm); measured 30.0 fps, 96 % valid pixels (2026-09-11)
+        align_depth_to_color: true
         intrinsics: {fx: 608.19, fy: 608.23, cx: 327.39, cy: 247.90}
-      - id: view_wrist               # Perception Arm wrist (USB serial 322143060792 -> RS ASIC 243522071002)
-        kind: v4l2
-        serial: "322143060792"
-        fourcc: YUYV
+      - id: view_wrist               # Perception Arm wrist (RS ASIC serial 243522071002; USB iSerial 322143060792)
+        kind: realsense
+        serial: "243522071002"
         resolution: [640, 480]
         fps: 30
+        depth: true                  # -> dora `cam_view_wrist_depth`; measured 30.1 fps, 91 % valid pixels (2026-09-11)
+        align_depth_to_color: true
         intrinsics: {fx: 606.36, fy: 606.38, cx: 311.90, cy: 249.45}
     safety:
       enabled: true               # hardware refuses to start without the safety gate
@@ -178,7 +184,7 @@ control:
   # 0 = disabled.
   orphan_session_grace_s: 30
 telemetry_hz: 25
-video: {preview_fps: 15, session_fps: 30, jpeg_quality: 80}
+video: {preview_fps: 30, session_fps: 30, jpeg_quality: 80}  # preview 15 -> 30 (2026-09-11): dora consumers see 30 Hz between sessions too
 egl_device_id: 0
 # Process log (2026-09-07): a rotating file the runtime writes itself, next to the rest of
 # the machine state under ${APOLLO_HOME}/var (gitignored); stderr keeps the same lines for

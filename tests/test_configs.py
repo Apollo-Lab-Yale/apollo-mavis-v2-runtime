@@ -37,9 +37,11 @@ def test_mavis_v2_hardware_workcell_matches_the_lab():
     assert by_id["grip"].collision_sensitivity == by_id["view"].collision_sensitivity == 3
     assert all(a.reduced_tcp_boundary_mm is None and a.expected_sn is None for a in hw.arms)
     assert [c.id for c in hw.cameras] == ["grip_wrist", "view_wrist"]
-    # RealSense D435i colour over UVC: by USB serial (no by-id path), YUYV only.
-    assert all(c.kind == "v4l2" and c.device_path is None and c.serial for c in hw.cameras)
-    assert {c.fourcc for c in hw.cameras} == {"YUYV"}
+    # RealSense D435i through librealsense (2026-09-11): by RealSense DEVICE serial, colour +
+    # aligned depth at 640x480 @ 30 for both wrist cameras.
+    assert all(c.kind == "realsense" and c.device_path is None and c.serial for c in hw.cameras)
+    assert all(c.depth and c.align_depth_to_color and c.fps == 30 for c in hw.cameras)
+    assert {c.serial for c in hw.cameras} == {"327122074467", "243522071002"}
     assert cfg.microphone.enabled and cfg.microphone.mic_id == "mic_view"
     assert cfg.microphone.label == "Perception Arm microphone"
     assert cfg.hardware_probe.enabled and cfg.hardware_probe.port == 502

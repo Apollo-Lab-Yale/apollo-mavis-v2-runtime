@@ -23,7 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 sim = ["apollo-mavis-v2-sim"]
-hardware = ["apollo-mavis-v2-hardware"]
+hardware = ["apollo-mavis-v2-hardware", "pyrealsense2>=2.54"]  # librealsense for the D435i depth (02-hardware §8)
 trainer = []
 # Microphone preview (phase-11): PortAudio over the ALSA `pulse` plugin; lazy-imported
 # in devices/microphone.py only. Needs apt libportaudio2 on the host.
